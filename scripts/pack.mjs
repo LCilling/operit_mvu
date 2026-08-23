@@ -19,6 +19,8 @@ const rootDir = path.resolve(__dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(rootDir, "manifest.json"), "utf8"));
 const version = String(manifest.version);
 const outputPath = path.resolve(rootDir, "release", `operit_mvu-${version}.toolpkg`);
+// 发布包只能包含生产内容；在收集阶段拒绝测试与 QA 文件，避免未来新增文档时误入归档。
+const forbiddenReleasePathPattern = /(^|[\/._-])(tests?|qa|preview|harness)(?=[\/._-]|$)/i;
 
 /** 收集要打包的条目：{ source(相对 rootDir 的规范路径), name(包内正斜杠路径) }。 */
 function collectEntries() {
@@ -34,6 +36,9 @@ function collectEntries() {
     }
     const stat = fs.statSync(abs);
     if (stat.isFile()) {
+      if (forbiddenReleasePathPattern.test(relative)) {
+        throw new Error(`Forbidden non-production package entry: ${relative}`);
+      }
       entries.push({ source: relative, name: relative });
     } else if (stat.isDirectory()) {
       const children = fs.readdirSync(abs, { withFileTypes: true });
