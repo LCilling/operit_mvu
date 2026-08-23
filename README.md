@@ -78,4 +78,4 @@ pnpm run pack
 
 ## 许可证
 
-仓库主体使用 AGPL-3.0 许可证。移植代码和图标等第三方内容按各自上游许可证分发，详见 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) 与 `third_party/`。
+仓库主体使用 [MIT 许可证](LICENSE)。移植代码和图标等第三方内容按各自上游许可证分发，详见 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) 与 `third_party/`。
