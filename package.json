@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "description": "Dynamic character state ToolPkg for OperitAI",
-  "license": "AGPL-3.0-only",
+  "license": "MIT",
   "packageManager": "pnpm@11.19.0",
   "scripts": {
     "audit": "node scripts/audit-web-ui.mjs",
