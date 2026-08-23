@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no"
+    />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f8f8fc" />
+    <title>动态状态</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="embedded">
+    <main class="showcase" id="showcase">
+      <aside class="design-rail" aria-hidden="true">
+        <nav class="screen-nav" id="screenNav"></nav>
+      </aside>
+      <section class="device-stage" aria-label="动态状态">
+        <div class="phone-shell">
+          <div class="phone-screen" id="appRoot" data-phone-screen></div>
+        </div>
+        <div class="screen-caption" id="screenCaption" aria-live="polite"></div>
+      </section>
+    </main>
+    <input class="visually-hidden" id="backgroundPicker" type="file" accept="image/jpeg,image/png,image/webp" aria-label="选择背景图片" tabindex="-1" />
+    <input class="visually-hidden" id="datasetImportPicker" type="file" accept="application/json,.json" aria-label="选择数据集文件" tabindex="-1" />
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
