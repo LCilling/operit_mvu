@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.lcilling.operit_mvu",
+  "version": "0.2.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "动态状态",
+    "en": "Operit MVU",
+    "default": "Operit MVU"
+  },
+  "description": {
+    "zh": "基于 MagVarUpdate(MVU) 的动态状态系统：多作用域字段、阶段、自然/每轮/规则/AI 变化、临时效果与记录。",
+    "en": "MVU dynamic state with scoped fields, stages, timed/turn/rule/AI changes, temporary effects, and records.",
+    "default": "Complete MVU dynamic-state system for Operit."
+  },
+  "enabled_by_default": false,
+  "subpackages": [],
+  "resources": [
+    {
+      "key": "app_html",
+      "path": "app.html",
+      "mime": "text/html"
+    }
+  ],
+  "workflow_templates": [],
+  "workspace_templates": []
+}

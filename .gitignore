@@ -1,0 +1,5 @@
+# 构建与测试输出不进入源码版本；src、tests 与 tsconfig 必须纳入审查。
+dist/
+dist-test/
+node_modules/
+release/
