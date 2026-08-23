@@ -1,13 +1,13 @@
-# MVU Android 真机设计 QA
+# operit_mvu Android 真机设计 QA
 
 本轮报告以用户提供的页面参考图和 Android 真机截图为准。当前可见页面的视觉比较以及 LM Studio 结构化输出的预览、应用与持久化真机闭环均已通过，整体交付门禁通过。
 
 ## 比较目标
 
 - 视觉真值：`D:/Users/MC07CN/Desktop/前端页面/` 下的六张参考图，以及用户补充的无底框汉堡菜单、记录时间轴和抽屉角色名参考图
-- Android 实现：[主界面](../../mvu-final-home-reinstalled.png)、[字段页](../../mvu-final-fields-no-word-split.png)、[记录页](../../mvu-final-records-after-ai.png)、[最终抽屉](../../mvu-final-drawer-role-name-reinstalled.png)、[AI 预览结果](../../mvu-final-ai-preview-result.png)与[AI 应用结果](../../mvu-final-ai-applied-result.png)
-- 运行证据：[AI 应用 logcat](../../mvu-final-ai-apply-logcat.txt)、[最终数据集](../../mvu-final-dataset.json)与[最终重装包返回 Operit 主界面](../../mvu-final-back-to-operit-reinstalled.png)
-- 比较总览：[00-comparison-overview.png](../../mvu-visual-comparisons/00-comparison-overview.png)
+- Android 实现：主界面（证据文件：mvu-final-home-reinstalled.png）、字段页（证据文件：mvu-final-fields-no-word-split.png）、记录页（证据文件：mvu-final-records-after-ai.png）、最终抽屉（证据文件：mvu-final-drawer-role-name-reinstalled.png）、AI 预览结果（证据文件：mvu-final-ai-preview-result.png）与AI 应用结果（证据文件：mvu-final-ai-applied-result.png）
+- 运行证据：AI 应用 logcat（证据文件：mvu-final-ai-apply-logcat.txt）、最终数据集（证据文件：mvu-final-dataset.json）与最终重装包返回 Operit 主界面（证据文件：mvu-final-back-to-operit-reinstalled.png）
+- 比较总览：00-comparison-overview.png（证据文件：mvu-visual-comparisons/00-comparison-overview.png）
 - 当前状态：状态总览、字段设置、亲密度详情、变化记录、抽屉上下文和 AI 判断入口
 
 参考图原始像素包括 `1447 × 1087`、`1448 × 1086` 与 `1024 × 1535`。用户补充的记录参考为 `643 × 803`，抽屉角色名参考为 `1256 × 2760`。
@@ -24,11 +24,11 @@
 
 ## 全视图与聚焦证据
 
-- [主界面对照](../../mvu-visual-comparisons/01-home-reference-vs-device.png)：顶部菜单、角色信息、状态卡片和常驻底栏
-- [字段设置对照](../../mvu-visual-comparisons/02-fields-reference-vs-device.png)：左对齐标题、右侧新建操作、字段卡片和设置态底栏
-- [亲密度详情对照](../../mvu-visual-comparisons/03-detail-reference-vs-device.png)：左对齐标题、右侧编辑操作、阶段轨道和保存动作
-- [记录页对照](../../mvu-visual-comparisons/04-records-reference-vs-device.png)：筛选区、时间轴、记录图标和记录态底栏
-- [抽屉上下文对照](../../mvu-visual-comparisons/05-drawer-context-reference-vs-device.png)：头像、当前角色名、分组菜单和关闭动作
+- 主界面对照（证据文件：mvu-visual-comparisons/01-home-reference-vs-device.png）：顶部菜单、角色信息、状态卡片和常驻底栏
+- 字段设置对照（证据文件：mvu-visual-comparisons/02-fields-reference-vs-device.png）：左对齐标题、右侧新建操作、字段卡片和设置态底栏
+- 亲密度详情对照（证据文件：mvu-visual-comparisons/03-detail-reference-vs-device.png）：左对齐标题、右侧编辑操作、阶段轨道和保存动作
+- 记录页对照（证据文件：mvu-visual-comparisons/04-records-reference-vs-device.png）：筛选区、时间轴、记录图标和记录态底栏
+- 抽屉上下文对照（证据文件：mvu-visual-comparisons/05-drawer-context-reference-vs-device.png）：头像、当前角色名、分组菜单和关闭动作
 
 主界面、字段设置和记录页均使用同一无底框三横线入口。带右侧操作的页面标题仍保持左侧锚点，不再因按钮出现而横向漂移。
 
@@ -45,7 +45,7 @@
 - 抽屉头部在头像右侧显示宿主当前角色名 `Operit`
 - 第二行固定显示“动态状态 · MVU 角色状态插件”，角色身份与插件说明不再混为一个标题
 - 抽屉保留关闭按钮，不包含已经删除的“退出插件”按钮
-- [最终重装抽屉截图](../../mvu-final-drawer-role-name-reinstalled.png)已复核头像、角色名和插件说明的层级；[最终重装包返回宿主截图](../../mvu-final-back-to-operit-reinstalled.png)确认关闭插件后可正常回到 Operit 主界面
+- 最终重装抽屉截图（证据文件：mvu-final-drawer-role-name-reinstalled.png）已复核头像、角色名和插件说明的层级；最终重装包返回宿主截图（证据文件：mvu-final-back-to-operit-reinstalled.png）确认关闭插件后可正常回到 Operit 主界面
 - 抽屉每次打开前重新读取宿主快照，本次 UI 层级同时确认 `Operit头像`、`Operit` 与插件说明；非 `Operit` 角色属于可选的补充数据态截图，不阻塞当前验收
 
 ### 字体与排版
@@ -54,7 +54,7 @@
 - 页面标题、分区标题、卡片标题、正文、辅助文字和微型文字分别采用 `22 / 17 / 16 / 15 / 13 / 12px` 的统一层级
 - 标题与卡片名称使用中高字重，正文保持常规字重；真机截图中未出现不同页面字体风格突变
 - 记录时间保持单行，时间、圆点和竖线在同一轨道上；卡片图标、标题、说明和变化值的基线关系清晰
-- [最终字段页](../../mvu-final-fields-no-word-split.png)中“1 个角色”保持完整；[滚动到底截图](../../mvu-final-fields-max-scroll-reinstalled.png)中最后一张“欲望”卡片完整位于固定底栏上方
+- 最终字段页（证据文件：mvu-final-fields-no-word-split.png）中“1 个角色”保持完整；滚动到底截图（证据文件：mvu-final-fields-max-scroll-reinstalled.png）中最后一张“欲望”卡片完整位于固定底栏上方
 
 ### 背景、颜色与素材
 
@@ -82,9 +82,9 @@
 ### 修正与复核
 
 - 建立统一的 `22 / 17 / 16 / 15 / 13 / 12px` 字体层级，并在五组真机对照中复核标题、正文和微型文字
-- 所有标题回到左侧锚点；[字段设置对照](../../mvu-visual-comparisons/02-fields-reference-vs-device.png)和[亲密度详情对照](../../mvu-visual-comparisons/03-detail-reference-vs-device.png)证明右侧操作不会挤动标题
+- 所有标题回到左侧锚点；字段设置对照（证据文件：mvu-visual-comparisons/02-fields-reference-vs-device.png）和亲密度详情对照（证据文件：mvu-visual-comparisons/03-detail-reference-vs-device.png）证明右侧操作不会挤动标题
 - 底栏统一为状态、设置、记录三项，并在主界面、字段设置、详情、记录和 AI 页面截图中保持同一位置
-- 抽屉头部改为宿主角色头像与 `Operit`，复核证据见[抽屉上下文对照](../../mvu-visual-comparisons/05-drawer-context-reference-vs-device.png)
+- 抽屉头部改为宿主角色头像与 `Operit`，复核证据见抽屉上下文对照（证据文件：mvu-visual-comparisons/05-drawer-context-reference-vs-device.png）
 
 当前视觉复核未发现新的 P0、P1 或 P2 项。
 
@@ -92,21 +92,21 @@
 
 - 模型提供方为 `LMSTUDIO`，测试模型为 `gemma4-12b`
 - 请求使用严格 JSON Schema `response_format`，并设置 `reasoning_effort: none`
-- [预览结果](../../mvu-final-ai-preview-result.png)在 `6.653s` 内返回亲密度 `+8`、置信度 `0.9`，页面保持“仅预览”状态，且“最近 AI 记录”为空
-- [应用结果](../../mvu-final-ai-applied-result.png)在 `4.784s` 内返回并应用同一项变化，亲密度从 `38` 更新为 `46`
-- [最终数据集](../../mvu-final-dataset.json)中的持久化字段值为 `46`；对应记录的 `before / after / delta` 为 `38 / 46 / 8`，`source` 为 `ai`，`confidence` 为 `0.9`
-- [AI 应用 logcat](../../mvu-final-ai-apply-logcat.txt)记录了 HTTP `200`、结构化响应、`38` 到 `46` 的应用过程；日志中未出现 `MVU_AI_RESPONSE_JSON_INVALID`、`Script execution timed out after 15 seconds` 或 `TextEncoder`
+- 预览结果（证据文件：mvu-final-ai-preview-result.png）在 `6.653s` 内返回亲密度 `+8`、置信度 `0.9`，页面保持“仅预览”状态，且“最近 AI 记录”为空
+- 应用结果（证据文件：mvu-final-ai-applied-result.png）在 `4.784s` 内返回并应用同一项变化，亲密度从 `38` 更新为 `46`
+- 最终数据集（证据文件：mvu-final-dataset.json）中的持久化字段值为 `46`；对应记录的 `before / after / delta` 为 `38 / 46 / 8`，`source` 为 `ai`，`confidence` 为 `0.9`
+- AI 应用 logcat（证据文件：mvu-final-ai-apply-logcat.txt）记录了 HTTP `200`、结构化响应、`38` 到 `46` 的应用过程；日志中未出现 `MVU_AI_RESPONSE_JSON_INVALID`、`Script execution timed out after 15 seconds` 或 `TextEncoder`
 
 预览展示、判断并应用、页面反馈、记录生成和数据持久化已逐一对应，LM Studio 结构化输出链路通过真机验收。
 
 ### 最终证据
 
-- [AI 预览结果](../../mvu-final-ai-preview-result.png)
-- [AI 应用结果](../../mvu-final-ai-applied-result.png)
-- [AI 应用 logcat](../../mvu-final-ai-apply-logcat.txt)
-- [最终数据集](../../mvu-final-dataset.json)
-- [抽屉角色名](../../mvu-final-drawer-role-name-reinstalled.png)
-- [最终重装包返回 Operit 主界面](../../mvu-final-back-to-operit-reinstalled.png)
+- AI 预览结果（证据文件：mvu-final-ai-preview-result.png）
+- AI 应用结果（证据文件：mvu-final-ai-applied-result.png）
+- AI 应用 logcat（证据文件：mvu-final-ai-apply-logcat.txt）
+- 最终数据集（证据文件：mvu-final-dataset.json）
+- 抽屉角色名（证据文件：mvu-final-drawer-role-name-reinstalled.png）
+- 最终重装包返回 Operit 主界面（证据文件：mvu-final-back-to-operit-reinstalled.png）
 
 ## Findings
 

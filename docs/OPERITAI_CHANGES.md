@@ -1,4 +1,4 @@
-# 相对于 OperitAI 源码的宿主改动
+# operit_mvu 相对于 OperitAI 源码的宿主改动
 
 `operit_mvu` 的 Release 本身只有 ToolPkg；本页列出为了满足 Issue #998 和插件真机运行而在当前 OperitAI 工作树中加入的通用宿主能力。这里只记录与 `operit_mvu` 直接相关的改动，不把同一工作树中的其他功能开发计入插件依赖。
 
@@ -105,4 +105,4 @@ Compose DSL WebView 增加本地 HTML 文档开始桥接、仅在当前可见页
 - `ToolPkgMainRegistrationScriptParserTest`
 - `ToolPkgAvatarUriAndroidTest`
 
-完整接口形状和边界见 [docs/HOST_INTERFACE_REQUIREMENTS.md](docs/HOST_INTERFACE_REQUIREMENTS.md)。
+完整接口形状和边界见 [HOST_INTERFACE_REQUIREMENTS.md](HOST_INTERFACE_REQUIREMENTS.md)。

@@ -1,4 +1,4 @@
-# MVU_API.md — MVU v2 应用 API
+# MVU v2 应用 API
 
 本页说明 `examples/operit_mvu/src/mvu/app` 的当前应用契约。`src/mvu/core` 保留 MagVarUpdate 命令兼容能力，但不再作为页面或持久化层的直接接口。
 
@@ -93,4 +93,4 @@ MVU 通过 `ToolPkg.systemModel` 调用 Operit 当前默认聊天模型，不选
 - 拒绝危险键、保留路径、过深路径和超预算输入
 - 不执行 JSON Patch `move`，返回 `MVU_MOVE_UNSUPPORTED`
 
-宿主字段与解析规则见 [docs/HOST_INTERFACE_REQUIREMENTS.md](docs/HOST_INTERFACE_REQUIREMENTS.md)。
+宿主字段与解析规则见 [HOST_INTERFACE_REQUIREMENTS.md](HOST_INTERFACE_REQUIREMENTS.md)。
