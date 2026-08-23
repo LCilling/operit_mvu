@@ -1,4 +1,4 @@
-# THIRD_PARTY_NOTICES.md
+# 第三方许可说明
 
 本 ToolPkg 依赖以下第三方作品。涉及源码修改的条目见对应 patch 说明。
 
@@ -9,7 +9,7 @@
 - 版本：beta @ `0a730cd4a9b99689d1135a49b542c780b977c24c`
 - 许可：MIT（完整文本见 `third_party/MagVarUpdate/LICENSE`）
 - 用途：变量状态更新引擎（MvuData / schema / 命令执行 / 事件）。
-- 移植修订：`third_party/MagVarUpdate/PATCHES.md`、`MVU_PORT.md`。
+- 移植修订：[MagVarUpdate_PATCHES.md](MagVarUpdate_PATCHES.md)、[MVU_PORT.md](MVU_PORT.md)。
 
 ## 移植中参考/替换的第三方能力
 
@@ -45,4 +45,4 @@
 
 ## 许可合规
 
-MagVarUpdate 为 MIT，移植产物保留原版权声明（见 `third_party/MagVarUpdate/LICENSE`）。所有源码文件头部未删除原作者信息；对上游的偏离记录在 `third_party/MagVarUpdate/PATCHES.md`，同步与散列校验见 `upstream-lock.json` 与 `scripts/verify-magvarupdate-lock.mjs`。
+MagVarUpdate 为 MIT，移植产物保留原版权声明（见 `third_party/MagVarUpdate/LICENSE`）。所有源码文件头部未删除原作者信息；对上游的偏离记录在 [MagVarUpdate_PATCHES.md](MagVarUpdate_PATCHES.md)，上游仓库与版本说明见 [MagVarUpdate_UPSTREAM.md](MagVarUpdate_UPSTREAM.md)。

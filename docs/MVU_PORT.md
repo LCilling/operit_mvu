@@ -1,6 +1,6 @@
-# MVU_PORT.md — MagVarUpdate 移植说明
+# MagVarUpdate 移植说明
 
-本文说明 SillyTavern MagVarUpdate 核心如何进入 Operit 的独立 MVU ToolPkg，以及上游兼容层与当前 v2 动态状态应用之间的边界。对应 Issue #998 和 [`docs/TODO/issue_998_dynamic_character_state_20260821`](../../docs/TODO/issue_998_dynamic_character_state_20260821/)。
+本文说明 SillyTavern MagVarUpdate 核心如何进入 Operit 的独立 MVU ToolPkg，以及上游兼容层与当前 v2 动态状态应用之间的边界。对应 [Operit Issue #998](https://github.com/AAswordman/Operit/issues/998)。
 
 ## 当前边界
 
@@ -27,7 +27,7 @@ MVU 尚未发布，因此没有 v1 迁移和双格式读取。新数据集不包
 | 许可 | MIT，见 `third_party/MagVarUpdate/LICENSE` |
 | 类型参考 | JS-Slash-Runner `main@e3b18604ed4eabfc1fe6b138c3c065407f8048d5` |
 
-锁定信息和移植文件散列保存在 `third_party/MagVarUpdate/upstream-lock.json`。修改上游兼容核心时应同时核对 `third_party/MagVarUpdate/PATCHES.md` 和第三方许可文件，构建流程不应临时访问网络。
+上游版本信息保存在 [MagVarUpdate_UPSTREAM.md](MagVarUpdate_UPSTREAM.md)。修改上游兼容核心时应同时核对 [MagVarUpdate_PATCHES.md](MagVarUpdate_PATCHES.md) 和 `third_party/MagVarUpdate/LICENSE`，构建流程不应临时访问网络。
 
 ## 源码映射
 
@@ -61,7 +61,7 @@ MVU 尚未发布，因此没有 v1 迁移和双格式读取。新数据集不包
 
 ## 安全修订
 
-`third_party/MagVarUpdate/PATCHES.md` 记录移植 patch，主要包括：
+[MagVarUpdate_PATCHES.md](MagVarUpdate_PATCHES.md) 记录移植 patch，主要包括：
 
 - 将宿主依赖收口为 `MvuPortContext`
 - 删除 `new Function`

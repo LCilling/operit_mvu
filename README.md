@@ -37,7 +37,7 @@ Release 只发布一个 ToolPkg，不发布插件 APK：
 
 插件页面不绘制专用退出按钮。离开页面使用 Android 返回手势、系统返回键或 Operit 自身导航。Operit 原生宿主顶栏始终位于插件 WebView 上方；WebView 内继续保留参考页面自己的背景、三横线、标题和功能按钮。
 
-宿主侧的具体改动见 [OPERITAI_CHANGES.md](OPERITAI_CHANGES.md)，接口契约见 [docs/HOST_INTERFACE_REQUIREMENTS.md](docs/HOST_INTERFACE_REQUIREMENTS.md)。
+宿主侧的具体改动见 [docs/OPERITAI_CHANGES.md](docs/OPERITAI_CHANGES.md)，接口契约见 [docs/HOST_INTERFACE_REQUIREMENTS.md](docs/HOST_INTERFACE_REQUIREMENTS.md)。
 
 ## 数据与安全
 
@@ -59,10 +59,11 @@ src/ui/web_container/       Compose DSL WebView 容器
 static/app_ui/              15 页移动端界面与 QA harness
 tests/                      核心、应用、自动化、安全与宿主上下文测试
 scripts/                    UI 审计、Web 构建与 ToolPkg 打包
+docs/                       API、移植、设计、QA、宿主改动与第三方说明
 third_party/                上游版本、补丁边界与许可证
 ```
 
-上游移植范围见 [MVU_PORT.md](MVU_PORT.md)，应用数据契约见 [MVU_API.md](MVU_API.md)。
+上游移植范围见 [docs/MVU_PORT.md](docs/MVU_PORT.md)，应用数据契约见 [docs/MVU_API.md](docs/MVU_API.md)。
 
 ## 构建与测试
 
@@ -78,4 +79,4 @@ pnpm run pack
 
 ## 许可证
 
-仓库主体使用 AGPL-3.0 许可证。移植代码和图标等第三方内容按各自上游许可证分发，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 `third_party/`。
+仓库主体使用 AGPL-3.0 许可证。移植代码和图标等第三方内容按各自上游许可证分发，详见 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) 与 `third_party/`。
