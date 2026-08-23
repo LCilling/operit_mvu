@@ -71,19 +71,16 @@ MVU 尚未发布，因此没有 v1 迁移和双格式读取。新数据集不包
 - 将初始化数据来源抽象为 `InitSourceAdapter`
 - 使用稳定错误码目录
 
-## 验证
+## 发布检查
 
 ```bash
 pnpm exec tsc -p examples/operit_mvu/tsconfig.json
-pnpm exec tsc -p examples/operit_mvu/tsconfig.test.json
-node --test examples/operit_mvu/dist-test/tests/*.test.js
+node examples/operit_mvu/scripts/audit-web-ui.mjs
 node examples/operit_mvu/scripts/build-web.mjs
 node examples/operit_mvu/scripts/pack.mjs
 ```
 
-核心命令与安全测试位于 `tests/mvu-command-parser.test.ts` 和 `tests/mvu-executor.test.ts`。v2 事务、作用域、规则、消息幂等与 AI 校验测试位于 `tests/mvu-app.test.ts`、`tests/mvu-automation.test.ts` 和 `tests/mvu-system-model.test.ts`。
-
-Android 真机视觉回归和最终 `.toolpkg` 安装验收不属于上游移植单元测试，必须在最终宿主与最终包组合上另行完成。当前尚未完成的项目包括最终包导入、重启持久化、全部按钮、群聊与后台消息、`content://` 头像和参考图视觉对比；这些项目在取得证据前不得记为通过。
+发布仓库不分发测试用例、测试编译配置、QA 预览入口或测试报告。CI 对生产源码执行 UI 静态审计、TypeScript 类型检查、Web 构建和 ToolPkg 打包，并检查最终压缩包的实际条目。
 
 ## 与上游不同的确定行为
 

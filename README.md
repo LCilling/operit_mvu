@@ -56,16 +56,15 @@ src/mvu/port/               Operit 安全移植层
 src/mvu/app/                v2 状态、事务、规则、记录与 AI 应用层
 src/shared/ipc.ts           main runtime 与页面的类型化 IPC
 src/ui/web_container/       Compose DSL WebView 容器
-static/app_ui/              15 页移动端界面与 QA harness
-tests/                      核心、应用、自动化、安全与宿主上下文测试
+static/app_ui/              15 页移动端生产界面
 scripts/                    UI 审计、Web 构建与 ToolPkg 打包
-docs/                       API、移植、设计、QA、宿主改动与第三方说明
+docs/                       API、移植、设计、宿主改动与第三方说明
 third_party/                上游版本、补丁边界与许可证
 ```
 
 上游移植范围见 [docs/MVU_PORT.md](docs/MVU_PORT.md)，应用数据契约见 [docs/MVU_API.md](docs/MVU_API.md)。
 
-## 构建与测试
+## 构建与发布检查
 
 独立仓库克隆后直接在仓库根目录执行；如果源码位于 OperitAI 单仓中，先执行 `cd examples/operit_mvu`：
 
@@ -75,7 +74,7 @@ pnpm run check
 pnpm run pack
 ```
 
-打包结果位于 `release/operit_mvu-0.2.0.toolpkg`。UI 审计锁定 15 个页面、声明动作、20 个原生调用、角色切换、返回栈、常驻底栏、44px 触控面积和趋势图语义；当前后端测试集包含 78 项测试。仓库内的 `types/` 是编译本插件所需的 Operit ToolPkg 类型契约快照，因此独立克隆后不依赖 OperitAI 源码树即可构建。
+打包结果位于 `release/operit_mvu-0.2.0.toolpkg`。`pnpm run check` 执行生产 UI 静态审计和 TypeScript 类型检查；`pnpm run pack` 只把插件运行时、页面、许可证及使用文档写入 ToolPkg。测试用例、测试编译配置、QA 预览页和测试报告不进入公开源码或发布包。仓库内的 `types/` 是编译本插件所需的 Operit ToolPkg 类型契约快照，因此独立克隆后不依赖 OperitAI 源码树即可构建。
 
 ## 许可证
 

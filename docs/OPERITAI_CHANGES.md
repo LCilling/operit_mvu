@@ -93,16 +93,4 @@ Compose DSL WebView 增加本地 HTML 文档开始桥接、仅在当前可见页
 - `ui/features/packages/market/ArtifactLocalInstallSupport.kt`
 - `ui/features/packages/screens/PackageManagerScreen.kt`
 
-## 8. 覆盖测试
-
-宿主改动对应的定向测试包括：
-
-- `ToolPkgChatContextBridgeTest`
-- `ToolPkgChatMessageHookBridgeTest`
-- `ToolPkgSystemModelBridgeTest`
-- `JsToolPkgRegistrationTest`
-- `JsTimeoutConfigTest`
-- `ToolPkgMainRegistrationScriptParserTest`
-- `ToolPkgAvatarUriAndroidTest`
-
 完整接口形状和边界见 [HOST_INTERFACE_REQUIREMENTS.md](HOST_INTERFACE_REQUIREMENTS.md)。

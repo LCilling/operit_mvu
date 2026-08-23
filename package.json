@@ -8,15 +8,12 @@
   "scripts": {
     "audit": "node scripts/audit-web-ui.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "build:test": "tsc -p tsconfig.test.json",
-    "test": "pnpm run build:test && node --test dist-test/tests/*.test.js",
     "build:web": "node scripts/build-web.mjs",
     "build": "pnpm run audit && pnpm run typecheck && pnpm run build:web",
-    "check": "pnpm run audit && pnpm run typecheck && pnpm run test",
+    "check": "pnpm run audit && pnpm run typecheck",
     "pack": "pnpm run build && node scripts/pack.mjs"
   },
   "devDependencies": {
-    "@types/node": "^22.4.1",
     "typescript": "5.9.3"
   }
 }
