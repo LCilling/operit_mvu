@@ -50,6 +50,10 @@ assert.match(appSource, /if \(appState\.screen === screenId\)/,
   "Repeated navigation to the current screen must not add history entries");
 assert.match(appSource, /const actorChanged =[\s\S]*?if \(actorChanged\) \{/,
   "Role changes must invalidate field drafts from the previous actor context");
+assert.match(appSource, /context\.groupId === null \|\| context\.actorId === null/,
+  "Single-character snapshot refreshes must not send a group-member override");
+assert.match(appSource, /MVU_HOST_SELECTED_ACTOR_NOT_IN_ACTIVE_CONTEXT:[\s\S]*?callNative\("snapshot", \{\}\)/,
+  "Stale group-member snapshot requests must recover against the active host context");
 assert.match(appSource, /previousScrollTop[\s\S]*?nextScroll\.scrollTop/,
   "In-page rerenders must preserve long-form scroll position");
 assert.match(appSource, /aria-current="page"/, "Bottom navigation must expose the current page");

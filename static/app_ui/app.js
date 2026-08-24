@@ -2583,8 +2583,32 @@ function clearEditorState() {
 }
 
 function currentSnapshotRequest() {
-  if (appState.snapshot === null || appState.snapshot.activeContext.actorId === null) return {};
-  return { actorId: appState.snapshot.activeContext.actorId };
+  if (appState.snapshot === null) return {};
+  const context = appState.snapshot.activeContext;
+  // actorId is an explicit group-member override in the host contract. Passing the active
+  // character of a one-to-one chat as that override makes the host correctly reject it because
+  // a single-character chat has no member list.
+  if (context.groupId === null || context.actorId === null) return {};
+  return { actorId: context.actorId };
+}
+
+function isStaleActorSelectionError(error) {
+  return error instanceof Error &&
+    error.message.includes("MVU_HOST_SELECTED_ACTOR_NOT_IN_ACTIVE_CONTEXT:");
+}
+
+async function requestSnapshot(snapshotRequest) {
+  try {
+    return await callNative("snapshot", snapshotRequest);
+  } catch (error) {
+    // A group can change, or the host can switch back to a one-to-one chat, between two page
+    // refreshes. Recover against the host's authoritative active context instead of leaving a
+    // completed mutation looking like it failed.
+    if (typeof snapshotRequest.actorId !== "string" || !isStaleActorSelectionError(error)) {
+      throw error;
+    }
+    return callNative("snapshot", {});
+  }
 }
 
 async function reloadSnapshot(request) {
@@ -2592,7 +2616,7 @@ async function reloadSnapshot(request) {
     ? null
     : appState.snapshot.activeContext.actorId;
   const snapshotRequest = request === undefined ? currentSnapshotRequest() : request;
-  const snapshot = await callNative("snapshot", snapshotRequest);
+  const snapshot = await requestSnapshot(snapshotRequest);
   validateSnapshot(snapshot);
   const actorChanged = appState.snapshot !== null &&
     previousActorId !== snapshot.activeContext.actorId;
