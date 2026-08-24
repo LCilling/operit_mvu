@@ -102,7 +102,9 @@ function migrateRule(rule: MvuDataset["autoRules"][number], nowIso: string): Rul
     actions: rule.effects.map((effect) => ({
       kind: "change_field",
       fieldId: effect.fieldId,
-      target: { kind: "all_bound" },
+      // v2 applies auto-rule changes in the event context. A triggerless v3
+      // execution must skip this target rather than broaden it to all bindings.
+      target: { kind: "trigger_actor" },
       delta: effect.delta,
       effectGroupIds: effect.temporaryEffectIds.map(effectGroupId),
     })),

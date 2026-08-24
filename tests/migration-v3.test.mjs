@@ -16,14 +16,14 @@ test("migrates v2 without mutating or overwriting it", () => {
   assert.equal(result.dataset.effectGroups[0].fieldEffects.length, 2);
 });
 
-test("preserves legacy rule field, delta, and effect imports", () => {
+test("preserves a legacy rule change in the triggering actor context", () => {
   const result = migrateDatasetV2ToV3(legacyDatasetFixture(), 2_000_000_000_000);
   const action = result.dataset.rules[0].actions[0];
 
   assert.deepEqual(action, {
     kind: "change_field",
     fieldId: "field_affinity",
-    target: { kind: "all_bound" },
+    target: { kind: "trigger_actor" },
     delta: 4,
     effectGroupIds: ["effect_group_effect_warm"],
   });
