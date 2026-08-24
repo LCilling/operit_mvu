@@ -142,6 +142,12 @@ export interface ConditionDefinition {
   updatedAt: string;
 }
 
+/** Durable per-hour counters retained independently from capped message facts. */
+export interface HourlyMessageBucket {
+  startedAt: number;
+  messageCount: number;
+}
+
 /**
  * The pure migration representation. Runtime/storage integration is intentionally
  * deferred; copied v2 runtime facts stay available until the v3 store owns them.
@@ -165,6 +171,7 @@ export interface MvuDatasetV3 {
   processedMessageIds: string[];
   ruleLastTriggered: Record<string, Record<string, number>>;
   messageFacts: Record<string, MessageFact[]>;
+  hourlyMessageBuckets: Record<string, HourlyMessageBucket[]>;
 }
 
 export interface MigrationResult {

@@ -1,4 +1,9 @@
 import type { AutoRuleCondition, DataTemporaryEffect, DataTemporaryEffectTarget, MvuDataset } from "./model";
+import {
+  hourlyMessageBucketsFromFacts,
+  MAX_MESSAGE_FACTS_PER_SCOPE_V3,
+  MAX_PROCESSED_MESSAGE_IDS_V3,
+} from "./automation";
 import type {
   ActiveEffectInstance,
   ConditionDefinition,
@@ -27,6 +32,14 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
   const conditions = source.autoRules.map((rule) => migrateCondition(rule, nowIso));
   const rules = source.autoRules.map((rule) => migrateRule(rule, nowIso));
   const activeEffects = source.temporaryEffects.filter((effect) => effect.enabled).map(migrateActiveEffect);
+  const hourlyMessageBuckets = Object.fromEntries(Object.entries(source.messageFacts).map(([key, facts]) => [
+    key,
+    hourlyMessageBucketsFromFacts(facts),
+  ]));
+  const messageFacts = Object.fromEntries(Object.entries(source.messageFacts).map(([key, facts]) => [
+    key,
+    cloneJson(facts.slice(-MAX_MESSAGE_FACTS_PER_SCOPE_V3)),
+  ]));
 
   const dataset: MvuDatasetV3 = {
     formatVersion: 3,
@@ -44,9 +57,10 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
     records: cloneJson(source.records),
     lastSettled: cloneJson(source.lastSettled),
     turnCounters: cloneJson(source.turnCounters),
-    processedMessageIds: [...source.processedMessageIds],
+    processedMessageIds: source.processedMessageIds.slice(-MAX_PROCESSED_MESSAGE_IDS_V3),
     ruleLastTriggered: cloneJson(source.ruleLastTriggered),
-    messageFacts: cloneJson(source.messageFacts),
+    messageFacts,
+    hourlyMessageBuckets,
   };
   assertMvuDatasetV3(dataset);
 

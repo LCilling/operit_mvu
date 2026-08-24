@@ -2,10 +2,14 @@
 import type { CommandExecutorHooks } from "../core/command-executor";
 import { klona } from "../port/util";
 import {
+  appendHourlyMessageBucket,
   evaluateAutoRules,
   evaluateLinkRules,
+  MAX_MESSAGE_FACTS_PER_SCOPE_V3,
+  MAX_PROCESSED_MESSAGE_IDS_V3,
   type AutomationMessageFacts,
 } from "./automation";
+import { activateEffectGroup, applyActiveEffects } from "./effect-engine";
 import type {
   AiRuleJudgement,
   DataActor,
@@ -24,6 +28,10 @@ import type {
   StateScopeContext,
   TurnCounter,
 } from "./model";
+import type {
+  MvuDatasetV3,
+  RuleTargetSelector,
+} from "./model-v3";
 import {
   applyMvuCommand,
   buildDeltaCommand,
@@ -40,10 +48,20 @@ import {
   stateValueForField,
 } from "./scope";
 import { temporaryEffectTargetMatchesContext } from "./temporary-effect";
+import {
+  executeRulePlan,
+  planRuleEvaluation,
+  type RuleDiagnostic,
+} from "./rule-engine-v3";
+import type {
+  ConditionJudgementRequest,
+  ConditionJudgementResult,
+} from "./system-model";
 import type { MvuStore } from "./store";
 import { StaleRevisionError } from "./store";
 import {
   assertMvuDataset,
+  assertMvuDatasetV3,
   normalizeMvuDataset,
   validateAutoRule,
   validateConfiguration,
@@ -108,6 +126,25 @@ export interface ProcessPersistedMessageResult {
   matchedRuleIds: string[];
 }
 
+export interface PersistedMessageV3Input extends PersistedMessageIdentity {
+  dataset: MvuDatasetV3;
+  currentActorId: string | null;
+  content: string;
+  role: "user" | "character";
+  occurredAt: number;
+  signals: MessageAutomationSignals;
+  actorNamesById?: Readonly<Record<string, string>>;
+  judgeConditions?: (request: ConditionJudgementRequest) => Promise<ConditionJudgementResult>;
+}
+
+export interface ProcessPersistedMessageV3Result {
+  dataset: MvuDatasetV3;
+  duplicate: boolean;
+  records: DataChangeRecord[];
+  matchedRuleIds: string[];
+  diagnostics: RuleDiagnostic[];
+}
+
 export interface FieldStateProjection {
   definition: DataField;
   bound: boolean;
@@ -124,6 +161,176 @@ interface PendingFieldChange {
   temporaryEffectIds: string[];
   aiReason: string | null;
   aiConfidence: number | null;
+}
+
+/**
+ * Callable v3 message path used before Task 5 supplies an atomic v3 store. It
+ * returns a new dataset and never writes through the production v2 store.
+ */
+export async function processPersistedMessageV3(
+  input: PersistedMessageV3Input,
+): Promise<ProcessPersistedMessageV3Result> {
+  validatePersistedMessageInput({ ...input, aiChanges: [], aiRuleJudgements: [] });
+  assertMvuDatasetV3(input.dataset);
+  const draft = klona(input.dataset);
+  const messageKey = processedMessageKey(input);
+  if (draft.processedMessageIds.includes(messageKey)) {
+    return { dataset: draft, duplicate: true, records: [], matchedRuleIds: [], diagnostics: [] };
+  }
+
+  const eventKey = automationScopeKey(input.context);
+  const fact = messageFact({ ...input, aiChanges: [], aiRuleJudgements: [] });
+  const facts = [...(draft.messageFacts[eventKey] ?? []), fact];
+  draft.messageFacts[eventKey] = facts.slice(-MAX_MESSAGE_FACTS_PER_SCOPE_V3);
+  draft.hourlyMessageBuckets[eventKey] = appendHourlyMessageBucket(
+    draft.hourlyMessageBuckets[eventKey] ?? [],
+    input.occurredAt,
+  );
+
+  const plan = planRuleEvaluation({
+    rules: draft.rules,
+    conditions: draft.conditions,
+    context: {
+      actorId: input.context.actorId,
+      groupId: input.context.groupId,
+      chatId: input.context.chatId,
+      now: input.occurredAt,
+      fieldValues: stateValuesForV3Context(draft, input.context),
+      messageFacts: draft.messageFacts[eventKey],
+      hourlyMessageBuckets: draft.hourlyMessageBuckets[eventKey],
+    },
+    currentActorId: input.currentActorId,
+    lastTriggeredAtByRuleId: draft.ruleLastTriggered[eventKey] ?? {},
+  });
+  const diagnostics = [...plan.diagnostics];
+  const aiSemanticResults: Record<string, { matched: boolean; confidence: number }> = {};
+  if (plan.aiPredicates.length > 0) {
+    try {
+      if (input.judgeConditions === undefined) throw new Error("MVU_AI_CONDITION_JUDGE_UNAVAILABLE");
+      const judged = await input.judgeConditions({
+        predicates: plan.aiPredicates,
+        message: {
+          role: input.role,
+          actorId: input.context.actorId,
+          actorName: input.context.actorName,
+          content: input.content,
+        },
+      });
+      if (!judged.available) throw new Error("MVU_AI_CONDITION_JUDGE_UNAVAILABLE");
+      for (const judgement of judged.judgements) {
+        if (plan.aiPredicates.some((predicate) => predicate.id === judgement.predicateId)) {
+          aiSemanticResults[judgement.predicateId] = {
+            matched: judgement.matched,
+            confidence: judgement.confidence,
+          };
+        }
+      }
+    } catch (error) {
+      diagnostics.push({
+        code: "MVU_RULE_AI_BATCH_FAILED",
+        detail: error instanceof Error ? error.message : "MVU_AI_CONDITION_JUDGE_FAILED",
+      });
+    }
+  }
+
+  const execution = executeRulePlan({ plan, aiSemanticResults });
+  const records: DataChangeRecord[] = [];
+  let recordSequence = 0;
+  for (const executed of execution.actions) {
+    const action = executed.action;
+    if (action.kind === "change_field") {
+      const field = draft.fields.find((candidate) => candidate.id === action.fieldId);
+      if (field === undefined || !field.enabled) {
+        diagnostics.push({ code: "MVU_RULE_FIELD_NOT_FOUND", ruleId: executed.ruleId, actionIndex: executed.actionIndex });
+        continue;
+      }
+      const targets = resolveRuleActionTargets(field, action.target, input.context.actorId);
+      if (targets.length === 0) {
+        diagnostics.push({ code: "MVU_RULE_ACTION_TARGET_EMPTY", ruleId: executed.ruleId, actionIndex: executed.actionIndex });
+        continue;
+      }
+      const selectedGroups = new Set(action.effectGroupIds);
+      const selectedActiveEffects = draft.activeEffects.filter((instance) => selectedGroups.has(instance.definitionId));
+      for (const target of targets) {
+        const record = applyV3RuleChange({
+          draft,
+          field,
+          target,
+          sourceDelta: action.delta,
+          activeEffects: selectedActiveEffects,
+          ruleId: executed.ruleId,
+          ruleName: executed.ruleName,
+          input,
+          recordId: v3RecordId(messageKey, recordSequence),
+        });
+        recordSequence += 1;
+        if (record !== null) records.push(record);
+      }
+      continue;
+    }
+
+    const definition = draft.effectGroups.find((candidate) => candidate.id === action.effectGroupId);
+    if (definition === undefined) {
+      diagnostics.push({ code: "MVU_RULE_EFFECT_GROUP_NOT_FOUND", ruleId: executed.ruleId, actionIndex: executed.actionIndex });
+      continue;
+    }
+    const activation = activateEffectGroup({
+      definition,
+      fields: draft.fields,
+      triggerActorId: input.context.actorId ?? undefined,
+      instanceId: v3EffectInstanceId(messageKey, executed.ruleId, executed.actionIndex),
+      activatedAt: new Date(input.occurredAt).toISOString(),
+      reason: { mode: "template", template: "general" },
+      reasonVariables: {
+        triggerActorName: input.context.actorName,
+        ruleName: executed.ruleName,
+        effectGroupName: definition.name,
+        event: "message",
+      },
+      currentValues: flattenV3StateValues(draft),
+    });
+    for (const diagnostic of activation.diagnostics) {
+      diagnostics.push({ code: "MVU_RULE_ACTION_TARGET_EMPTY", ruleId: executed.ruleId, actionIndex: executed.actionIndex, detail: diagnostic.code });
+    }
+    draft.activeEffects.push(...activation.instances);
+    const resolvedTargets = activation.instances[0]?.resolvedTargets ?? [];
+    const targetUseCount = new Map<string, number>();
+    for (const change of activation.immediateChanges) {
+      const target = takeActivationTarget(resolvedTargets, change.fieldId, change.actorId, targetUseCount);
+      const field = draft.fields.find((candidate) => candidate.id === change.fieldId);
+      if (target === undefined || field === undefined) continue;
+      const record = applyV3ImmediateChange({
+        draft,
+        field,
+        scopeKey: target.scopeKey,
+        actorId: target.actorId,
+        delta: change.delta,
+        effectId: activation.instances[0]?.id ?? null,
+        ruleId: executed.ruleId,
+        ruleName: executed.ruleName,
+        input,
+        recordId: v3RecordId(messageKey, recordSequence),
+      });
+      recordSequence += 1;
+      if (record !== null) records.push(record);
+    }
+  }
+
+  draft.ruleLastTriggered[eventKey] = draft.ruleLastTriggered[eventKey] ?? {};
+  for (const update of execution.cooldownUpdates) {
+    draft.ruleLastTriggered[eventKey][update.ruleId] = update.triggeredAt;
+  }
+  draft.processedMessageIds.push(messageKey);
+  draft.processedMessageIds = draft.processedMessageIds.slice(-MAX_PROCESSED_MESSAGE_IDS_V3);
+  draft.records.push(...records);
+  assertMvuDatasetV3(draft);
+  return {
+    dataset: draft,
+    duplicate: false,
+    records,
+    matchedRuleIds: execution.matchedRuleIds,
+    diagnostics,
+  };
 }
 
 export class MvuService {
@@ -812,6 +1019,210 @@ export class MvuService {
     validateScopeContext(identity.context);
     return (await this.getDataset()).processedMessageIds.includes(processedMessageKey(identity));
   }
+}
+
+interface V3ResolvedRuleTarget {
+  actorId: string | null;
+  scopeKey: string;
+}
+
+function stateValuesForV3Context(
+  dataset: MvuDatasetV3,
+  context: StateScopeContext,
+): Record<string, number> {
+  const values: Record<string, number> = {};
+  for (const field of dataset.fields) {
+    if (!field.enabled || !fieldAppliesToContext(field, context)) continue;
+    const key = scopeKey(field.scope, context);
+    if (key === null) continue;
+    values[field.id] = dataset.stateValues[key]?.[field.id] ?? field.initialValue;
+  }
+  return values;
+}
+
+function resolveRuleActionTargets(
+  field: DataField,
+  selector: RuleTargetSelector,
+  triggerActorId: string | null,
+): V3ResolvedRuleTarget[] {
+  if (selector.kind === "trigger_actor") {
+    if (triggerActorId === null || field.scope !== "character" || !field.bindingIds.includes(triggerActorId)) return [];
+    return [{ actorId: triggerActorId, scopeKey: `character:${triggerActorId}` }];
+  }
+  if (selector.kind === "selected") {
+    if (field.scope !== "character") return [];
+    return selector.actorIds
+      .filter((actorId) => field.bindingIds.includes(actorId))
+      .map((actorId) => ({ actorId, scopeKey: `character:${actorId}` }));
+  }
+  if (field.scope === "global") return [{ actorId: null, scopeKey: "global" }];
+  return field.bindingIds.map((bindingId) => ({
+    actorId: field.scope === "character" ? bindingId : null,
+    scopeKey: `${field.scope}:${bindingId}`,
+  }));
+}
+
+function applyV3RuleChange(input: {
+  draft: MvuDatasetV3;
+  field: DataField;
+  target: V3ResolvedRuleTarget;
+  sourceDelta: number;
+  activeEffects: MvuDatasetV3["activeEffects"];
+  ruleId: string;
+  ruleName: string;
+  input: PersistedMessageV3Input;
+  recordId: string;
+}): DataChangeRecord | null {
+  const before = input.draft.stateValues[input.target.scopeKey]?.[input.field.id] ?? input.field.initialValue;
+  const applied = applyActiveEffects({
+    field: input.field,
+    actorId: input.target.actorId,
+    scopeKey: input.target.scopeKey,
+    source: "rule",
+    sourceDelta: input.sourceDelta,
+    currentValue: before,
+    activeEffects: input.activeEffects,
+    effectGroups: input.draft.effectGroups,
+    occurredAt: new Date(input.input.occurredAt).toISOString(),
+  });
+  if (applied.effectiveDelta === 0) return null;
+  input.draft.stateValues[input.target.scopeKey] = input.draft.stateValues[input.target.scopeKey] ?? {};
+  input.draft.stateValues[input.target.scopeKey][input.field.id] = applied.nextValue;
+  return v3RuleRecord({
+    field: input.field,
+    scopeKey: input.target.scopeKey,
+    actorId: input.target.actorId,
+    before,
+    after: applied.nextValue,
+    requestedDelta: input.sourceDelta,
+    effectiveRequestedDelta: applied.effectiveDelta,
+    effectIds: applied.effectIds,
+    reason: applied.reasons.length === 0
+      ? `规则触发：${input.ruleName}`
+      : `规则触发：${input.ruleName}；效果：${applied.reasons.map((reason) => reason.text).join("、")}`,
+    ruleId: input.ruleId,
+    input: input.input,
+    recordId: input.recordId,
+  });
+}
+
+function applyV3ImmediateChange(input: {
+  draft: MvuDatasetV3;
+  field: DataField;
+  scopeKey: string;
+  actorId: string | null;
+  delta: number;
+  effectId: string | null;
+  ruleId: string;
+  ruleName: string;
+  input: PersistedMessageV3Input;
+  recordId: string;
+}): DataChangeRecord | null {
+  if (input.delta === 0) return null;
+  const before = input.draft.stateValues[input.scopeKey]?.[input.field.id] ?? input.field.initialValue;
+  const after = before + input.delta;
+  input.draft.stateValues[input.scopeKey] = input.draft.stateValues[input.scopeKey] ?? {};
+  input.draft.stateValues[input.scopeKey][input.field.id] = after;
+  return v3RuleRecord({
+    field: input.field,
+    scopeKey: input.scopeKey,
+    actorId: input.actorId,
+    before,
+    after,
+    requestedDelta: input.delta,
+    effectiveRequestedDelta: input.delta,
+    effectIds: input.effectId === null ? [] : [input.effectId],
+    reason: `规则触发：${input.ruleName}；激活效果组`,
+    ruleId: input.ruleId,
+    input: input.input,
+    recordId: input.recordId,
+  });
+}
+
+function v3RuleRecord(input: {
+  field: DataField;
+  scopeKey: string;
+  actorId: string | null;
+  before: number;
+  after: number;
+  requestedDelta: number;
+  effectiveRequestedDelta: number;
+  effectIds: string[];
+  reason: string;
+  ruleId: string;
+  input: PersistedMessageV3Input;
+  recordId: string;
+}): DataChangeRecord {
+  return {
+    id: input.recordId,
+    scope: input.field.scope,
+    scopeKey: input.scopeKey,
+    fieldId: input.field.id,
+    fieldName: input.field.name,
+    actorId: input.actorId,
+    actorName: v3ActorName(input.input, input.actorId),
+    chatId: input.input.context.chatId,
+    groupId: input.input.context.groupId,
+    before: input.before,
+    after: input.after,
+    requestedDelta: input.requestedDelta,
+    effectiveRequestedDelta: input.effectiveRequestedDelta,
+    delta: input.after - input.before,
+    stageBefore: deriveStage(input.field, input.before).id,
+    stageAfter: deriveStage(input.field, input.after).id,
+    reason: input.reason,
+    source: "rule",
+    ruleIds: [input.ruleId],
+    effectIds: input.effectIds,
+    confidence: null,
+    messageId: input.input.messageId,
+    variantId: input.input.variantId,
+    occurredAt: input.input.occurredAt,
+  };
+}
+
+function v3ActorName(input: PersistedMessageV3Input, actorId: string | null): string {
+  if (actorId === null) return input.context.actorName;
+  if (actorId === input.context.actorId) return input.context.actorName;
+  return input.actorNamesById?.[actorId] ?? actorId;
+}
+
+function flattenV3StateValues(dataset: MvuDatasetV3): Record<string, number> {
+  const values: Record<string, number> = {};
+  for (const [key, state] of Object.entries(dataset.stateValues)) {
+    for (const [fieldId, value] of Object.entries(state)) values[`${key}\u0000${fieldId}`] = value;
+  }
+  return values;
+}
+
+function takeActivationTarget(
+  targets: readonly MvuDatasetV3["activeEffects"][number]["resolvedTargets"][number][],
+  fieldId: string,
+  actorId: string | null,
+  useCount: Map<string, number>,
+): MvuDatasetV3["activeEffects"][number]["resolvedTargets"][number] | undefined {
+  const key = `${fieldId}\u0000${actorId ?? ""}`;
+  const matching = targets.filter((target) => target.fieldId === fieldId && target.actorId === actorId);
+  const index = useCount.get(key) ?? 0;
+  useCount.set(key, index + 1);
+  return matching[index];
+}
+
+function v3RecordId(messageKey: string, sequence: number): string {
+  return `record_v3_${encodeURIComponent(messageKey)}_${sequence}`;
+}
+
+function v3EffectInstanceId(messageKey: string, ruleId: string, actionIndex: number): string {
+  return `active_v3_${stableV3IdPart(messageKey)}_${stableV3IdPart(ruleId)}_${actionIndex}`;
+}
+
+function stableV3IdPart(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return `${value.replace(/[^A-Za-z0-9_]/g, "_")}_${(hash >>> 0).toString(16)}`;
 }
 
 function requireField(dataset: MvuDataset, fieldId: string): DataField {

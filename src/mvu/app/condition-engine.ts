@@ -3,6 +3,7 @@ import type {
   ConditionDefinition,
   ConditionExpression,
   ConditionPredicate,
+  HourlyMessageBucket,
 } from "./model-v3";
 import type { MessageFact } from "./model";
 import { buildDefaultConditionLibrary } from "./seed";
@@ -13,12 +14,6 @@ const HOUR_IN_MILLISECONDS = 3_600_000;
 export interface AiSemanticResult {
   matched: boolean;
   confidence: number;
-}
-
-/** Durable per-hour counters, retained independently from the capped fact list. */
-export interface HourlyMessageBucket {
-  startedAt: number;
-  messageCount: number;
 }
 
 export interface ConditionEvaluationContext {

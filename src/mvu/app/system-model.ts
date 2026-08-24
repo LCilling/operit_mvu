@@ -9,6 +9,7 @@ import type {
   FieldStateProjection,
   PersistedAiChange,
 } from "./service";
+import type { AiSemanticPredicate } from "./model-v3";
 
 export interface BackgroundModelProbeResult {
   available: boolean;
@@ -44,10 +45,35 @@ export interface RuleJudgementResult {
   raw: string;
 }
 
+export interface RoleAwareConditionMessage {
+  role: MessageFact["role"];
+  actorId: string | null;
+  actorName: string;
+  content: string;
+}
+
+export interface ConditionJudgementRequest {
+  predicates: readonly AiSemanticPredicate[];
+  message: RoleAwareConditionMessage;
+}
+
+export interface ConditionJudgement {
+  predicateId: string;
+  matched: boolean;
+  confidence: number;
+}
+
+export interface ConditionJudgementResult {
+  available: boolean;
+  judgements: ConditionJudgement[];
+  raw: string;
+}
+
 export interface SystemModelApi {
   probe(): Promise<BackgroundModelProbeResult>;
   judgeState(request: StateJudgementRequest): Promise<StateJudgementResult>;
   judgeRules(request: RuleJudgementRequest): Promise<RuleJudgementResult>;
+  judgeConditions(request: ConditionJudgementRequest): Promise<ConditionJudgementResult>;
 }
 
 type SystemModelHostApi = Pick<ToolPkg.SystemModelApi, "probe" | "complete">;
@@ -58,6 +84,10 @@ interface StrictJudgementDocument {
 
 interface StrictRuleJudgementDocument {
   matches: AiRuleJudgement[];
+}
+
+interface StrictConditionJudgementDocument {
+  judgements: ConditionJudgement[];
 }
 
 const STATE_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
@@ -103,6 +133,30 @@ const RULE_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
             matched: { type: "boolean" },
             confidence: { type: "number", minimum: 0, maximum: 1 },
             reason: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+};
+
+const CONDITION_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
+  name: "mvu_condition_judgement",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["judgements"],
+    properties: {
+      judgements: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["predicateId", "matched", "confidence"],
+          properties: {
+            predicateId: { type: "string" },
+            matched: { type: "boolean" },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
           },
         },
       },
@@ -195,6 +249,41 @@ export class HostSystemModelApi implements SystemModelApi {
       throw error;
     }
   }
+
+  async judgeConditions(request: ConditionJudgementRequest): Promise<ConditionJudgementResult> {
+    if (request.predicates.length === 0) throw new Error("MVU_AI_CONDITIONS_EMPTY");
+    if (request.message.content.trim().length === 0) throw new Error("MVU_AI_CONDITION_MESSAGE_EMPTY");
+    const predicateIds = request.predicates.map((predicate) => predicate.id);
+    if (new Set(predicateIds).size !== predicateIds.length) {
+      throw new Error("MVU_AI_CONDITION_PREDICATE_DUPLICATE");
+    }
+    const capability = await this.probe();
+    if (!capability.available) return { available: false, judgements: [], raw: "" };
+
+    try {
+      const completion = await this.host.complete({
+        systemPrompt: buildConditionJudgementSystemPrompt(request.predicates),
+        userPrompt: JSON.stringify(request.message),
+        jsonSchema: CONDITION_JUDGEMENT_JSON_SCHEMA,
+      });
+      const document = parseStrictConditionJudgement(completion.text);
+      assertConditionJudgementTargets(document.judgements, request.predicates);
+      return { available: true, judgements: document.judgements, raw: completion.text };
+    } catch (error) {
+      console.error("MVU system model condition judgement failed", error);
+      throw error;
+    }
+  }
+}
+
+function buildConditionJudgementSystemPrompt(predicates: readonly AiSemanticPredicate[]): string {
+  return [
+    "你是规则条件判断器，只根据给定的单条角色感知消息判断每个语义条件。",
+    "只输出一个 JSON 对象，禁止 Markdown、代码围栏、解释或字段修改命令。",
+    'JSON 必须严格符合：{"judgements":[{"predicateId":"条件ID","matched":true或false,"confidence":0到1数字}]}。',
+    "每个候选条件必须恰好返回一次，不得添加、遗漏或改写 predicateId。",
+    `候选条件：${JSON.stringify(predicates)}`,
+  ].join("\n");
 }
 
 function buildJudgementSystemPrompt(
@@ -355,6 +444,40 @@ function parseStrictRuleJudgement(raw: string): StrictRuleJudgementDocument {
   return { matches };
 }
 
+function parseStrictConditionJudgement(raw: string): StrictConditionJudgementDocument {
+  const text = raw.trim();
+  if (text.length === 0) throw new Error("MVU_AI_CONDITION_RESPONSE_EMPTY");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    console.error("MVU system model returned invalid condition JSON", error);
+    throw new Error("MVU_AI_CONDITION_RESPONSE_JSON_INVALID");
+  }
+  if (!isRecord(parsed) || !hasExactKeys(parsed, ["judgements"]) || !Array.isArray(parsed.judgements)) {
+    throw new Error("MVU_AI_CONDITION_RESPONSE_SHAPE_INVALID");
+  }
+  const judgements = parsed.judgements.map((judgement, index): ConditionJudgement => {
+    if (!isRecord(judgement) ||
+      !hasExactKeys(judgement, ["predicateId", "matched", "confidence"]) ||
+      typeof judgement.predicateId !== "string" || judgement.predicateId.length === 0 ||
+      typeof judgement.matched !== "boolean" ||
+      typeof judgement.confidence !== "number" || !Number.isFinite(judgement.confidence) ||
+      judgement.confidence < 0 || judgement.confidence > 1) {
+      throw new Error(`MVU_AI_CONDITION_RESPONSE_JUDGEMENT_INVALID:${index}`);
+    }
+    return {
+      predicateId: judgement.predicateId,
+      matched: judgement.matched,
+      confidence: judgement.confidence,
+    };
+  });
+  if (new Set(judgements.map((judgement) => judgement.predicateId)).size !== judgements.length) {
+    throw new Error("MVU_AI_CONDITION_RESPONSE_DUPLICATE_PREDICATE");
+  }
+  return { judgements };
+}
+
 function assertJudgementTargets(
   changes: readonly PersistedAiChange[],
   fields: readonly FieldStateProjection[]
@@ -382,6 +505,19 @@ function assertRuleJudgementTargets(
   for (const judgement of judgements) {
     if (!ruleIds.has(judgement.ruleId)) {
       throw new Error(`MVU_AI_RULE_RESPONSE_RULE_NOT_ALLOWED:${judgement.ruleId}`);
+    }
+  }
+}
+
+function assertConditionJudgementTargets(
+  judgements: readonly ConditionJudgement[],
+  predicates: readonly AiSemanticPredicate[],
+): void {
+  const predicateIds = new Set(predicates.map((predicate) => predicate.id));
+  if (judgements.length !== predicates.length) throw new Error("MVU_AI_CONDITION_RESPONSE_INCOMPLETE");
+  for (const judgement of judgements) {
+    if (!predicateIds.has(judgement.predicateId)) {
+      throw new Error(`MVU_AI_CONDITION_RESPONSE_PREDICATE_NOT_ALLOWED:${judgement.predicateId}`);
     }
   }
 }
