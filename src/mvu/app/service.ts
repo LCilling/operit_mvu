@@ -232,7 +232,18 @@ export class MvuService {
   async updateField(id: string, patch: Partial<Omit<DataField, "id">>): Promise<void> {
     await this.mutate((draft) => {
       const field = requireField(draft, id);
-      Object.assign(field, klona(patch));
+      const nextPatch = klona(patch);
+      const nextMinimum = nextPatch.minimum ?? field.minimum;
+      const nextMaximum = nextPatch.maximum ?? field.maximum;
+      if (nextMinimum !== field.minimum || nextMaximum !== field.maximum) {
+        // Range is a unit definition shared by values, stages and rule thresholds. Updating only
+        // the two bounds leaves a structurally invalid field or silently drops runtime values.
+        // Remap every dependent quantity in the same transaction to preserve relative meaning.
+        remapFieldRange(draft, field, nextMinimum, nextMaximum);
+        delete nextPatch.minimum;
+        delete nextPatch.maximum;
+      }
+      Object.assign(field, nextPatch);
       if (Object.prototype.hasOwnProperty.call(patch, "bindingIds") ||
         Object.prototype.hasOwnProperty.call(patch, "scope")) {
         draft.pendingBootstrapFieldIds = draft.pendingBootstrapFieldIds.filter(
@@ -762,6 +773,101 @@ function requireField(dataset: MvuDataset, fieldId: string): DataField {
   const field = dataset.fields.find((candidate) => candidate.id === fieldId);
   if (field === undefined) throw new Error(`MVU_FIELD_NOT_FOUND:${fieldId}`);
   return field;
+}
+
+function remapFieldRange(
+  dataset: MvuDataset,
+  field: DataField,
+  nextMinimum: number,
+  nextMaximum: number
+): void {
+  if (!Number.isFinite(nextMinimum) || !Number.isFinite(nextMaximum) ||
+    nextMinimum >= nextMaximum) {
+    throw new Error(`MVU_FIELD_RANGE_INVALID:${field.id}`);
+  }
+
+  const previousMinimum = field.minimum;
+  const previousMaximum = field.maximum;
+  const previousSpan = previousMaximum - previousMinimum;
+  const nextSpan = nextMaximum - nextMinimum;
+  const scale = nextSpan / previousSpan;
+  if (!Number.isFinite(previousSpan) || previousSpan <= 0 ||
+    !Number.isFinite(nextSpan) || nextSpan <= 0 ||
+    !Number.isFinite(scale) || scale <= 0) {
+    throw new Error(`MVU_FIELD_RANGE_SCALE_INVALID:${field.id}`);
+  }
+
+  const mapPosition = (value: number, label: string): number => {
+    let mapped: number;
+    if (value === previousMinimum) mapped = nextMinimum;
+    else if (value === previousMaximum) mapped = nextMaximum;
+    else mapped = nextMinimum + ((value - previousMinimum) / previousSpan) * nextSpan;
+    if (!Number.isFinite(mapped)) {
+      throw new Error(`MVU_FIELD_RANGE_POSITION_OVERFLOW:${field.id}:${label}`);
+    }
+    return mapped;
+  };
+  const mapDelta = (value: number, label: string): number => {
+    const mapped = value * scale;
+    if (!Number.isFinite(mapped)) {
+      throw new Error(`MVU_FIELD_RANGE_DELTA_OVERFLOW:${field.id}:${label}`);
+    }
+    return mapped;
+  };
+
+  field.minimum = nextMinimum;
+  field.maximum = nextMaximum;
+  field.initialValue = mapPosition(field.initialValue, "initial");
+  field.step = mapDelta(field.step, "step");
+  field.ai.maxDelta = mapDelta(field.ai.maxDelta, "ai_max_delta");
+  field.naturalChange.amount = mapDelta(field.naturalChange.amount, "natural_amount");
+  field.perTurnChange.amount = mapDelta(field.perTurnChange.amount, "per_turn_amount");
+  for (const stage of field.stages) {
+    stage.threshold = mapPosition(stage.threshold, `stage_${stage.id}`);
+  }
+
+  for (const [scope, values] of Object.entries(dataset.stateValues)) {
+    const value = values[field.id];
+    if (value !== undefined) values[field.id] = mapPosition(value, `state_${scope}`);
+  }
+  for (const record of dataset.records) {
+    if (record.fieldId !== field.id) continue;
+    record.before = mapPosition(record.before, `record_${record.id}_before`);
+    record.after = mapPosition(record.after, `record_${record.id}_after`);
+    record.requestedDelta = mapDelta(record.requestedDelta, `record_${record.id}_requested`);
+    record.effectiveRequestedDelta = mapDelta(
+      record.effectiveRequestedDelta,
+      `record_${record.id}_effective`
+    );
+    record.delta = mapDelta(record.delta, `record_${record.id}_delta`);
+  }
+
+  for (const rule of dataset.rules) {
+    if (rule.sourceFieldId === field.id) {
+      rule.sourceThreshold = mapPosition(rule.sourceThreshold, `link_${rule.id}_threshold`);
+    }
+    if (rule.targetFieldId === field.id && rule.effect.kind === "delta") {
+      rule.effect.value = mapDelta(rule.effect.value, `link_${rule.id}_delta`);
+    }
+  }
+  for (const rule of dataset.autoRules) {
+    if (rule.condition.kind === "stateThreshold" && rule.condition.fieldId === field.id) {
+      rule.condition.threshold = mapPosition(
+        rule.condition.threshold,
+        `auto_${rule.id}_threshold`
+      );
+    }
+    for (const effect of rule.effects) {
+      if (effect.fieldId === field.id) {
+        effect.delta = mapDelta(effect.delta, `auto_${rule.id}_delta`);
+      }
+    }
+  }
+  for (const effect of dataset.temporaryEffects) {
+    if (effect.targetFieldId === field.id && effect.mode === "additive") {
+      effect.value = mapDelta(effect.value, `temporary_${effect.id}_delta`);
+    }
+  }
 }
 
 function requireApplicableField(

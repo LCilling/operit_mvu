@@ -54,6 +54,14 @@ assert.match(appSource, /previousScrollTop[\s\S]*?nextScroll\.scrollTop/,
   "In-page rerenders must preserve long-form scroll position");
 assert.match(appSource, /aria-current="page"/, "Bottom navigation must expose the current page");
 assert.match(appSource, /role="tab" aria-selected=/, "Segmented tabs must expose selected state");
+assert.match(appSource, /data-range-card=/,
+  "Field settings must render inline range cards");
+assert.match(appSource, /data-range-number="minimum"[\s\S]*?data-range-number="maximum"/,
+  "Every inline range card must expose lower and upper bound inputs");
+assert.match(appSource, /action === "save-field-range"/,
+  "Inline range saving must have a UI action handler");
+assert.match(appSource, /patch: \{ minimum: draft\.minimum, maximum: draft\.maximum \}/,
+  "Inline range saving must persist both bounds atomically");
 assert.match(appSource, /<canvas class="trend-canvas" role="img"/, "Trend canvases need image semantics");
 assert.match(styleSource, /\.switch\s*\{[\s\S]*?width:\s*44px;[\s\S]*?height:\s*44px;/,
   "Switch touch targets must be at least 44 by 44 pixels");
