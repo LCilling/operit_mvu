@@ -7,6 +7,7 @@
 ## 功能
 
 - 按角色、角色组、全局或当前聊天管理数值状态
+- 在字段设置一级页直接自定义每个字段的上下限，并同步换算现有状态与规则
 - 字段阶段、自然变化、每轮变化和状态联动
 - 基于明确消息事实的自动规则和多效果执行
 - 按时间、轮次或持续生效的临时效果
@@ -29,7 +30,7 @@ Release 只发布一个 ToolPkg，不发布插件 APK：
 
 - `ToolPkg.chatContext.snapshot({ chatId? })`
 - 带权威消息身份和角色上下文的 `message_persisted`
-- `ToolPkg.systemModel.probe()` 与 `ToolPkg.systemModel.complete(...)`
+- `ToolPkg.systemModel.probe()` 与带必填 `maxOutputChars` 的 `ToolPkg.systemModel.complete(...)`
 - 保留 Operit 完整系统提示词的普通聊天 Prompt Hook
 - ToolPkg main/UI IPC、宿主顶栏和受控 `content://` 资源读取
 
@@ -45,7 +46,7 @@ Release 只发布一个 ToolPkg，不发布插件 APK：
 
 消息幂等键由宿主持久化结果中的 `chatId`、`messageId` 和 `variantId` 组成。角色卡、角色组、当前聊天、头像和系统模型均以宿主返回的权威事实为准；插件不会猜测歧义身份。
 
-AI 判断使用宿主原生严格 JSON Schema。返回文本还会经过整段 `JSON.parse`、目标字段授权、置信度和单次幅度校验，校验完成后才允许提交状态事务。
+AI 判断只在 `systemModel.probe()` 同时确认普通补全和严格 Schema 通道后执行。MVU 每次请求显式提交 `maxOutputChars: 65536`；宿主契约要求该字段为 `1..200000` 的整数，并在流式累计将越界时以 `TOOLPKG_SYSTEM_MODEL_OUTPUT_TOO_LARGE` 终止。返回文本还会经过整段 `JSON.parse`、目标字段授权、置信度和单次幅度校验，校验完成后才允许提交状态事务。自定义端点的实际 Schema 支持由首次请求验证，失败或输出超限时不会提交状态。
 
 ## 源码结构
 

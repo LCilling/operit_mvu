@@ -103,6 +103,7 @@ const appState = {
   settingsDraft: null,
   manualValue: Number.NaN,
   manualOriginalValue: null,
+  fieldRangeDrafts: {},
   fieldSearch: "",
   recordFilters: {
     actorId: "all",
@@ -418,6 +419,63 @@ function projectedStage(field) {
     throw new Error("MVU_FIELD_CURRENT_STAGE_INVALID:" + field.id);
   }
   return stage;
+}
+
+function fieldRangeDraft(field) {
+  let draft = appState.fieldRangeDrafts[field.id];
+  if (!draft) {
+    draft = { minimum: field.minimum, maximum: field.maximum };
+    appState.fieldRangeDrafts[field.id] = draft;
+  }
+  return draft;
+}
+
+function mapRangePosition(value, field, draft) {
+  if (value === field.minimum) return draft.minimum;
+  if (value === field.maximum) return draft.maximum;
+  return draft.minimum + ((value - field.minimum) / (field.maximum - field.minimum)) *
+    (draft.maximum - draft.minimum);
+}
+
+function validateFieldRangeDraft(field, draft) {
+  const changed = draft.minimum !== field.minimum || draft.maximum !== field.maximum;
+  if (!Number.isFinite(draft.minimum) || !Number.isFinite(draft.maximum)) {
+    return { changed: changed, error: "请输入有效的上下限数值", previewValue: null };
+  }
+  if (draft.minimum >= draft.maximum) {
+    return { changed: changed, error: "下限必须小于上限", previewValue: null };
+  }
+  const previousSpan = field.maximum - field.minimum;
+  const nextSpan = draft.maximum - draft.minimum;
+  const scale = nextSpan / previousSpan;
+  if (!Number.isFinite(previousSpan) || previousSpan <= 0 ||
+      !Number.isFinite(nextSpan) || nextSpan <= 0 ||
+      !Number.isFinite(scale) || scale <= 0 ||
+      !Number.isFinite(field.step * scale) || field.step * scale <= 0) {
+    return { changed: changed, error: "范围跨度超出可换算精度", previewValue: null };
+  }
+  let previousThreshold = Number.NEGATIVE_INFINITY;
+  for (const stage of field.stages) {
+    const threshold = mapRangePosition(stage.threshold, field, draft);
+    if (!Number.isFinite(threshold) || threshold <= previousThreshold) {
+      return { changed: changed, error: "范围过窄，无法保留现有阶段间隔", previewValue: null };
+    }
+    previousThreshold = threshold;
+  }
+  const currentValue = projectedValue(field);
+  const sourceValue = currentValue === null ? field.initialValue : currentValue;
+  const previewValue = mapRangePosition(sourceValue, field, draft);
+  if (!Number.isFinite(previewValue)) {
+    return { changed: changed, error: "当前值换算后超出数值范围", previewValue: null };
+  }
+  return { changed: changed, error: "", previewValue: previewValue };
+}
+
+function rangePreviewPosition(field, draft, previewValue) {
+  if (!Number.isFinite(previewValue)) return 0;
+  return Math.max(0, Math.min(100,
+    ((previewValue - draft.minimum) / (draft.maximum - draft.minimum)) * 100
+  ));
 }
 
 function scopeContext() {
@@ -945,28 +1003,55 @@ function fieldMatchesSearch(field) {
 }
 
 function fieldCard(field) {
-  const value = projectedValue(field);
+  const rangeDraft = fieldRangeDraft(field);
+  const rangeValidation = validateFieldRangeDraft(field, rangeDraft);
+  const previewPosition = rangePreviewPosition(field, rangeDraft, rangeValidation.previewValue);
   const scopeLabel = SCOPE_LABELS[field.scope];
   if (!scopeLabel) throw new Error("MVU_FIELD_SCOPE_INVALID:" + field.id);
   const boundText = field.scope === "character"
     ? field.bindingIds.length + " 个角色"
     : scopeLabel;
-  const metadata = [
-    "数值 " + numberText(field.minimum) + "–" + numberText(field.maximum),
-    field.stages.length + " 个阶段",
-    boundText
-  ];
-  if (value !== null) metadata.push("当前 " + numberText(value));
-  return '<button class="field-card" data-edit-field="' + escapeHtml(field.id) +
+  const message = rangeValidation.error ||
+    (rangeValidation.changed
+      ? "保存后同步换算当前值、阶段与关联规则"
+      : "可直接修改上下限，无需进入二级页面");
+  return '<article class="field-card field-range-card" data-range-card="' + escapeHtml(field.id) +
     '" data-search-haystack="' + escapeHtml((field.name + " " + field.description).toLocaleLowerCase("zh-CN")) +
     '" style="--tone:' + requireThemeColor(field) + ";--tone-soft:" +
-    softThemeColor(requireThemeColor(field)) + '">' +
-    stateIcon(field, true) + '<span><strong>' + escapeHtml(field.name) +
+    softThemeColor(requireThemeColor(field)) + ';--range-position:' + previewPosition + '%">' +
+    '<header class="field-range-header">' + stateIcon(field, true) +
+    '<span class="field-range-identity"><strong>' + escapeHtml(field.name) +
     '</strong><span class="description">' + escapeHtml(field.description || "未填写描述") +
-    '</span><span class="meta field-meta">' + metadata.map(function (item) {
-      return "<span>" + escapeHtml(item) + "</span>";
-    }).join("") + '</span></span><span class="status-pill ' + (field.enabled ? "good" : "warn") + '">' +
-    (field.enabled ? "已启用" : "已停用") + "</span>" + mi("chevron_right") + "</button>";
+    '</span><span class="meta field-meta"><span>' + escapeHtml(field.stages.length + " 个阶段") +
+    '</span><span>' + escapeHtml(boundText) + '</span><span class="' +
+    (field.enabled ? "range-status-good" : "range-status-warn") + '">' +
+    (field.enabled ? "已启用" : "已停用") + '</span></span></span>' +
+    '<button type="button" class="field-detail-button" data-edit-field="' + escapeHtml(field.id) +
+    '" aria-label="打开' + escapeHtml(field.name) + '的详细设置">' + mi("tune") +
+    '<span>详细</span></button></header>' +
+    '<div class="field-range-visual" aria-label="' + escapeHtml(field.name) + '范围预览">' +
+    '<div class="field-range-track"><span></span><i></i></div>' +
+    '<div class="field-range-scale"><output data-range-lower-output>' +
+    (Number.isFinite(rangeDraft.minimum) ? numberText(rangeDraft.minimum) : "—") +
+    '</output><output class="field-range-current" data-range-current-output>' +
+    (rangeValidation.previewValue === null ? "当前 —" : "换算后 " + numberText(rangeValidation.previewValue)) +
+    '</output><output data-range-upper-output>' +
+    (Number.isFinite(rangeDraft.maximum) ? numberText(rangeDraft.maximum) : "—") + "</output></div></div>" +
+    '<div class="field-range-inputs"><label><span>下限</span><input class="number-input ' +
+    (rangeValidation.error ? "invalid" : "") + '" type="number" inputmode="decimal" data-range-number="minimum" ' +
+    'data-range-field-id="' + escapeHtml(field.id) + '" value="' + numberAttribute(rangeDraft.minimum) +
+    '" aria-invalid="' + Boolean(rangeValidation.error) + '"></label><span class="range-separator" aria-hidden="true">—</span>' +
+    '<label><span>上限</span><input class="number-input ' + (rangeValidation.error ? "invalid" : "") +
+    '" type="number" inputmode="decimal" data-range-number="maximum" data-range-field-id="' +
+    escapeHtml(field.id) + '" value="' + numberAttribute(rangeDraft.maximum) + '" aria-invalid="' +
+    Boolean(rangeValidation.error) + '"></label></div>' +
+    '<footer class="field-range-footer"><p class="field-range-message ' +
+    (rangeValidation.error ? "error" : rangeValidation.changed ? "changed" : "") +
+    '" data-range-message aria-live="polite">' + escapeHtml(message) + '</p>' +
+    '<button type="button" class="field-range-save" data-action="save-field-range" data-field-range-id="' +
+    escapeHtml(field.id) + '"' +
+    (!rangeValidation.changed || rangeValidation.error ? " disabled" : "") + ">" +
+    mi("sync_alt") + "保存范围</button></footer></article>";
 }
 
 function renderFields() {
@@ -1085,6 +1170,14 @@ function nonCharacterBindingSummary(draft) {
 function renderEdit() {
   const draft = requireFieldDraft();
   const title = appState.editingFieldId ? "编辑字段" : "新建字段";
+  const rangeConfiguration = appState.editingFieldId
+    ? '<div class="range-managed-inline">' + mi("straighten") +
+      '<span><strong>' + numberText(draft.minimum) + " — " + numberText(draft.maximum) +
+      '</strong><small>上下限已移至字段设置一级页，可在字段卡内直接修改。</small></span></div>'
+    : '<label class="field-label">数值范围</label><div class="number-row">' +
+      '<label>下限<input class="number-input" data-field-number="minimum" type="number" value="' +
+      numberAttribute(draft.minimum) + '"></label><label>上限<input class="number-input" data-field-number="maximum" type="number" value="' +
+      numberAttribute(draft.maximum) + '"></label></div>';
   const persistedConfigurationLinks = appState.editingFieldId
     ? '<button class="setting-row" data-action="open-change-settings"><span>' + mi("schedule") +
       '<strong>自然与每轮变化</strong><span class="description">配置自动增减和状态联动</span></span><span class="value">' +
@@ -1111,10 +1204,7 @@ function renderEdit() {
     escapeHtml(draft.description) + "</textarea>" +
     '<label class="field-label">字段类型</label><div class="static-type-row">' +
     mi("123") + "<span><strong>数值型</strong><small>插件仅创建可计算的数值字段</small></span></div>" +
-    '<label class="field-label">数值范围</label><div class="number-row">' +
-    '<label>最小值<input class="number-input" data-field-number="minimum" type="number" value="' +
-    numberAttribute(draft.minimum) + '"></label><label>最大值<input class="number-input" data-field-number="maximum" type="number" value="' +
-    numberAttribute(draft.maximum) + '"></label></div>' +
+    rangeConfiguration +
     '<div class="number-row"><label>初始值<input class="number-input" data-field-number="initialValue" type="number" value="' +
     numberAttribute(draft.initialValue) + '"></label><label>步进<input class="number-input" data-field-number="step" type="number" min="0.000001" value="' +
     numberAttribute(draft.step) + '"></label></div>' +
@@ -2570,6 +2660,53 @@ function syncManualSaveButton() {
   button.disabled = !changed;
 }
 
+function fieldRangeCardElement(fieldId) {
+  return Array.from(appRoot.querySelectorAll("[data-range-card]")).find(function (card) {
+    return card.dataset.rangeCard === fieldId;
+  }) || null;
+}
+
+function syncFieldRangeCard(fieldId) {
+  const field = requireField(fieldId);
+  const draft = fieldRangeDraft(field);
+  const validation = validateFieldRangeDraft(field, draft);
+  const card = fieldRangeCardElement(fieldId);
+  if (!(card instanceof HTMLElement)) return;
+
+  card.style.setProperty(
+    "--range-position",
+    rangePreviewPosition(field, draft, validation.previewValue) + "%"
+  );
+  const lowerOutput = card.querySelector("[data-range-lower-output]");
+  const upperOutput = card.querySelector("[data-range-upper-output]");
+  const currentOutput = card.querySelector("[data-range-current-output]");
+  if (lowerOutput) lowerOutput.textContent = numberText(draft.minimum);
+  if (upperOutput) upperOutput.textContent = numberText(draft.maximum);
+  if (currentOutput) {
+    currentOutput.textContent = validation.previewValue === null
+      ? "当前 —"
+      : "换算后 " + numberText(validation.previewValue);
+  }
+
+  card.querySelectorAll("[data-range-number]").forEach(function (input) {
+    input.classList.toggle("invalid", Boolean(validation.error));
+    input.setAttribute("aria-invalid", String(Boolean(validation.error)));
+  });
+  const message = card.querySelector("[data-range-message]");
+  if (message) {
+    message.textContent = validation.error ||
+      (validation.changed
+        ? "保存后同步换算当前值、阶段与关联规则"
+        : "可直接修改上下限，无需进入二级页面");
+    message.classList.toggle("error", Boolean(validation.error));
+    message.classList.toggle("changed", !validation.error && validation.changed);
+  }
+  const button = card.querySelector('[data-action="save-field-range"]');
+  if (button instanceof HTMLButtonElement) {
+    button.disabled = !validation.changed || Boolean(validation.error);
+  }
+}
+
 function handleFormMutation(event) {
   const target = event.target;
   if (!(target instanceof HTMLInputElement) &&
@@ -2590,13 +2727,34 @@ function handleFormMutation(event) {
     return;
   }
 
+  if (target.matches("[data-range-number][data-range-field-id]")) {
+    const fieldId = target.dataset.rangeFieldId;
+    const property = target.dataset.rangeNumber;
+    const field = requireField(fieldId);
+    if (property !== "minimum" && property !== "maximum") {
+      throw new Error("MVU_FIELD_RANGE_PROPERTY_INVALID:" + property);
+    }
+    fieldRangeDraft(field)[property] = numericInputValue(target);
+    syncFieldRangeCard(fieldId);
+    return;
+  }
+
   if (target.matches("[data-field-input]")) {
     requireFieldDraft()[target.dataset.fieldInput] = target.value;
     return;
   }
 
   if (target.matches("[data-field-number]")) {
-    requireFieldDraft()[target.dataset.fieldNumber] = numericInputValue(target);
+    const draft = requireFieldDraft();
+    const property = target.dataset.fieldNumber;
+    const value = numericInputValue(target);
+    draft[property] = value;
+    if (!appState.editingFieldId && property === "minimum" &&
+        Number.isFinite(value) && draft.stages.length > 0) {
+      // A new field has no list card yet. Keep its first stage anchored to the entered lower
+      // bound so creation remains valid without sending the user through another editor.
+      draft.stages[0].threshold = value;
+    }
     return;
   }
 
@@ -3107,6 +3265,31 @@ async function saveFieldAction(button) {
   });
 }
 
+async function saveFieldRangeAction(button) {
+  const fieldId = button.dataset.fieldRangeId;
+  if (typeof fieldId !== "string" || fieldId.length === 0) {
+    throw new Error("MVU_FIELD_RANGE_ID_MISSING");
+  }
+  const field = requireField(fieldId);
+  const draft = fieldRangeDraft(field);
+  const validation = validateFieldRangeDraft(field, draft);
+  if (validation.error) throw formError(validation.error);
+  if (!validation.changed) {
+    showToast("范围未变化，无需保存");
+    return;
+  }
+  await withBusy(button, "save-field-range:" + fieldId, async function () {
+    await callNative("updateField", {
+      id: fieldId,
+      patch: { minimum: draft.minimum, maximum: draft.maximum }
+    });
+    delete appState.fieldRangeDrafts[fieldId];
+    await reloadSnapshot();
+    render();
+    showToast(field.name + "的数值范围已更新");
+  });
+}
+
 async function saveStagesAction(button) {
   const payload = validateFieldPayload(requireFieldDraft());
   appState.fieldDraft.stages = cloneJson(payload.stages);
@@ -3613,6 +3796,8 @@ async function handleAppClick(event) {
     const input = appRoot.querySelector("[data-manual-value]");
     if (input instanceof HTMLInputElement) input.value = appState.manualValue;
     syncManualSaveButton();
+  } else if (action === "save-field-range") {
+    await saveFieldRangeAction(actionTarget);
   } else if (action === "save-field") {
     await saveFieldAction(actionTarget);
   } else if (action === "save-stages") {
