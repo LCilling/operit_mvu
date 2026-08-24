@@ -12,7 +12,17 @@ import type {
   MvuSettings,
   TurnCounter,
 } from "./model";
-import type { ConditionDefinition, ConditionExpression, ConditionPredicate, MvuDatasetV3 } from "./model-v3";
+import type {
+  ActiveEffectInstance,
+  ConditionDefinition,
+  ConditionExpression,
+  ConditionPredicate,
+  EffectActorSelector,
+  EffectDuration,
+  EffectGroupDefinition,
+  EffectOperation,
+  MvuDatasetV3,
+} from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
 } from "./temporary-effect";
@@ -602,8 +612,8 @@ export function assertMvuDataset(value: unknown): asserts value is MvuDataset {
 }
 
 /**
- * Lightweight boundary validation for Task 1's pure conversion. Detailed v3
- * entity validation grows with the condition and effect engines in later tasks.
+ * Boundary validation for the pure v3 conversion. Runtime/storage integration
+ * remains deferred, but reusable effects and active snapshots are strict here.
  */
 export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV3 {
   if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.fields) ||
@@ -624,11 +634,16 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     }
     conditionIds.add(condition.id);
   }
+  const fields = value.fields.map((field) => {
+    assertDataFieldShape(field);
+    return field;
+  });
   const effectGroupIds = new Set<string>();
   for (const effectGroup of value.effectGroups) {
     if (!isRecord(effectGroup) || typeof effectGroup.id !== "string" || effectGroupIds.has(effectGroup.id)) {
       fail("INVALID_MVU_V3_EFFECT_GROUP");
     }
+    assertEffectGroupDefinitionShape(effectGroup, fields);
     effectGroupIds.add(effectGroup.id);
   }
   for (const rule of value.rules) {
@@ -650,10 +665,131 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
       }
     }
   }
+  const activeEffectIds = new Set<string>();
   for (const instance of value.activeEffects) {
     if (!isRecord(instance) || typeof instance.definitionId !== "string" ||
       !effectGroupIds.has(instance.definitionId)) fail("INVALID_MVU_V3_ACTIVE_EFFECT");
+    if (typeof instance.id !== "string" || activeEffectIds.has(instance.id)) fail("INVALID_MVU_V3_ACTIVE_EFFECT");
+    assertActiveEffectInstanceShape(instance, fields);
+    activeEffectIds.add(instance.id);
   }
+}
+
+function assertEffectGroupDefinitionShape(
+  value: unknown,
+  fields: readonly DataField[],
+): asserts value is EffectGroupDefinition {
+  if (!isRecord(value) || typeof value.id !== "string" || !STABLE_ID.test(value.id) || typeof value.name !== "string" ||
+    value.name.trim().length === 0 || typeof value.description !== "string" || typeof value.enabled !== "boolean" ||
+    !Array.isArray(value.fieldEffects) || value.fieldEffects.length === 0 ||
+    !isIsoTimestamp(value.createdAt) || !isIsoTimestamp(value.updatedAt)) {
+    fail("INVALID_MVU_V3_EFFECT_GROUP");
+  }
+  if (value.defaultDuration !== undefined) assertEffectDurationShape(value.defaultDuration);
+
+  const fieldIds = new Set<string>();
+  const fieldEffectIds = new Set<string>();
+  for (const fieldEffect of value.fieldEffects) {
+    if (!isRecord(fieldEffect) || typeof fieldEffect.id !== "string" || !STABLE_ID.test(fieldEffect.id) ||
+      typeof fieldEffect.fieldId !== "string" || fieldEffectIds.has(fieldEffect.id) ||
+      !Array.isArray(fieldEffect.operations) || fieldEffect.operations.length === 0) {
+      fail("MVU_V3_EFFECT_FIELD_INVALID");
+    }
+    const field = fields.find((candidate) => candidate.id === fieldEffect.fieldId);
+    if (field === undefined) fail("MVU_V3_EFFECT_FIELD_NOT_FOUND");
+    if (fieldIds.has(fieldEffect.fieldId)) fail("MVU_V3_EFFECT_FIELD_DUPLICATE");
+    assertEffectActorSelectorShape(fieldEffect.actorSelector, field);
+    for (const operation of fieldEffect.operations) assertEffectOperationShape(operation);
+    fieldIds.add(fieldEffect.fieldId);
+    fieldEffectIds.add(fieldEffect.id);
+  }
+}
+
+function assertEffectActorSelectorShape(
+  value: unknown,
+  field: DataField,
+): asserts value is EffectActorSelector {
+  if (!isRecord(value) || typeof value.kind !== "string") fail("MVU_V3_EFFECT_ACTOR_SELECTOR_INVALID");
+  if (value.kind === "all_bound" || value.kind === "trigger_actor") return;
+  if (value.kind !== "selected" || field.scope !== "character" || !Array.isArray(value.actorIds) ||
+    value.actorIds.length === 0 || !value.actorIds.every((id) => typeof id === "string") ||
+    value.actorIds.some((id) => !field.bindingIds.includes(id))) {
+    fail("MVU_V3_EFFECT_ACTOR_SELECTOR_INVALID");
+  }
+  requireUnique(value.actorIds, "MVU_V3_EFFECT_ACTOR_SELECTOR_DUPLICATE");
+}
+
+function assertEffectOperationShape(value: unknown): asserts value is EffectOperation {
+  if (!isRecord(value) || typeof value.kind !== "string" || !isFiniteNumber(value.value)) {
+    fail("MVU_V3_EFFECT_OPERATION_INVALID");
+  }
+  if (value.kind === "immediate_delta") return;
+  if (value.kind !== "fixed_adjustment" && value.kind !== "positive_multiplier" &&
+    value.kind !== "negative_multiplier" && value.kind !== "all_multiplier") {
+    fail("MVU_V3_EFFECT_OPERATION_INVALID");
+  }
+  if ((value.kind === "positive_multiplier" || value.kind === "negative_multiplier" || value.kind === "all_multiplier") && value.value < 0) {
+    fail("MVU_V3_EFFECT_OPERATION_INVALID");
+  }
+  if (!Array.isArray(value.sources) || value.sources.length === 0 ||
+    !value.sources.every((source) => source === "manual" || source === "natural" || source === "per_turn" || source === "rule" || source === "ai")) {
+    fail("MVU_V3_EFFECT_OPERATION_INVALID");
+  }
+  requireUnique(value.sources, "MVU_V3_EFFECT_OPERATION_SOURCE_DUPLICATE");
+}
+
+function assertActiveEffectInstanceShape(
+  value: unknown,
+  fields: readonly DataField[],
+): asserts value is ActiveEffectInstance {
+  if (!isRecord(value) || typeof value.id !== "string" || !STABLE_ID.test(value.id) ||
+    (value.triggerActorId !== undefined && typeof value.triggerActorId !== "string") ||
+    !Array.isArray(value.resolvedTargets) || value.resolvedTargets.length === 0 ||
+    !isIsoTimestamp(value.activatedAt) || !isRecord(value.reason)) {
+    fail("INVALID_MVU_V3_ACTIVE_EFFECT");
+  }
+  assertEffectDurationShape(value.duration);
+  const targetKeys = new Set<string>();
+  for (const target of value.resolvedTargets) {
+    if (!isRecord(target) || typeof target.fieldId !== "string" || typeof target.scopeKey !== "string" ||
+      (target.scope !== "character" && target.scope !== "group" && target.scope !== "chat" && target.scope !== "global") ||
+      !(target.actorId === null || typeof target.actorId === "string")) {
+      fail("MVU_V3_ACTIVE_EFFECT_TARGET_INVALID");
+    }
+    const field = fields.find((candidate) => candidate.id === target.fieldId);
+    if (field === undefined || field.scope !== target.scope || !resolvedTargetMatchesField(target, field)) {
+      fail("MVU_V3_ACTIVE_EFFECT_TARGET_INVALID");
+    }
+    const key = `${target.fieldId}\u0000${target.scopeKey}`;
+    if (targetKeys.has(key)) fail("MVU_V3_ACTIVE_EFFECT_TARGET_DUPLICATE");
+    targetKeys.add(key);
+  }
+  if ((value.reason.mode !== "template" && value.reason.mode !== "custom") ||
+    (value.reason.template !== "general" && value.reason.template !== "positive" && value.reason.template !== "negative" &&
+      value.reason.template !== "environment" && value.reason.template !== "relationship") ||
+    typeof value.reason.text !== "string" || value.reason.text.trim().length === 0) {
+    fail("MVU_V3_ACTIVE_EFFECT_REASON_INVALID");
+  }
+}
+
+function assertEffectDurationShape(value: unknown): asserts value is EffectDuration {
+  if (!isRecord(value) || !(value.expiresAt === null || isIsoTimestamp(value.expiresAt)) ||
+    !(value.remainingTurns === null || (isFiniteNumber(value.remainingTurns) && Number.isInteger(value.remainingTurns) && value.remainingTurns >= 0))) {
+    fail("MVU_V3_EFFECT_DURATION_INVALID");
+  }
+}
+
+function resolvedTargetMatchesField(target: unknown, field: DataField): boolean {
+  if (!isRecord(target) || typeof target.scopeKey !== "string") return false;
+  if (field.scope === "global") return target.scopeKey === "global" && target.actorId === null;
+  if (!target.scopeKey.startsWith(`${field.scope}:`)) return false;
+  const bindingId = target.scopeKey.slice(field.scope.length + 1);
+  if (!field.bindingIds.includes(bindingId)) return false;
+  return field.scope === "character" ? target.actorId === bindingId : target.actorId === null;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
 /** Validates reusable expressions before they are persisted or evaluated. */
