@@ -12,6 +12,7 @@ import type {
   MvuSettings,
   TurnCounter,
 } from "./model";
+import type { MvuDatasetV3 } from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
 } from "./temporary-effect";
@@ -598,4 +599,53 @@ export function assertMvuDataset(value: unknown): asserts value is MvuDataset {
   validatePendingBootstrapFields(dataset);
   assertRuntimeFieldMaps(dataset);
   requireUnique(dataset.processedMessageIds, "MVU_PROCESSED_MESSAGE_DUPLICATE");
+}
+
+/**
+ * Lightweight boundary validation for Task 1's pure conversion. Detailed v3
+ * entity validation grows with the condition and effect engines in later tasks.
+ */
+export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV3 {
+  if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.fields) ||
+    !Array.isArray(value.linkRules) || !Array.isArray(value.conditions) ||
+    !Array.isArray(value.rules) || !Array.isArray(value.effectGroups) ||
+    !Array.isArray(value.activeEffects)) fail("INVALID_MVU_V3_DATASET");
+
+  const conditionIds = new Set<string>();
+  for (const condition of value.conditions) {
+    if (!isRecord(condition) || typeof condition.id !== "string" || conditionIds.has(condition.id)) {
+      fail("INVALID_MVU_V3_CONDITION");
+    }
+    conditionIds.add(condition.id);
+  }
+  const effectGroupIds = new Set<string>();
+  for (const effectGroup of value.effectGroups) {
+    if (!isRecord(effectGroup) || typeof effectGroup.id !== "string" || effectGroupIds.has(effectGroup.id)) {
+      fail("INVALID_MVU_V3_EFFECT_GROUP");
+    }
+    effectGroupIds.add(effectGroup.id);
+  }
+  for (const rule of value.rules) {
+    if (!isRecord(rule) || typeof rule.conditionId !== "string" || !conditionIds.has(rule.conditionId) ||
+      !Array.isArray(rule.actions)) fail("INVALID_MVU_V3_RULE");
+    for (const action of rule.actions) {
+      if (!isRecord(action)) fail("INVALID_MVU_V3_RULE_ACTION");
+      if (action.kind === "change_field") {
+        if (!Array.isArray(action.effectGroupIds) ||
+          !action.effectGroupIds.every((id) => typeof id === "string" && effectGroupIds.has(id))) {
+          fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
+        }
+      } else if (action.kind === "activate_effect_group") {
+        if (typeof action.effectGroupId !== "string" || !effectGroupIds.has(action.effectGroupId)) {
+          fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
+        }
+      } else {
+        fail("INVALID_MVU_V3_RULE_ACTION");
+      }
+    }
+  }
+  for (const instance of value.activeEffects) {
+    if (!isRecord(instance) || typeof instance.definitionId !== "string" ||
+      !effectGroupIds.has(instance.definitionId)) fail("INVALID_MVU_V3_ACTIVE_EFFECT");
+  }
 }
