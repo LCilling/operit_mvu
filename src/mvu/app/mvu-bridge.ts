@@ -17,6 +17,11 @@ import {
   stateValueForField,
 } from "./scope";
 import { resolveTemporaryEffectReason } from "./temporary-effect";
+import {
+  applyActiveEffects,
+  type AppliedFieldDelta,
+  type ApplyActiveEffectsInput,
+} from "./effect-engine";
 
 export interface ApplyCommandAudit {
   reason: string;
@@ -34,6 +39,11 @@ export interface ApplyCommandAudit {
 export interface ApplyResult {
   changed: boolean;
   record?: DataChangeRecord;
+}
+
+/** Explicit v3 compatibility seam; the v2 command path below remains unchanged. */
+export function applyV3ActiveEffects(input: ApplyActiveEffectsInput): AppliedFieldDelta {
+  return applyActiveEffects(input);
 }
 
 export function buildMvuData(dataset: MvuDataset, context: StateScopeContext): MvuData {

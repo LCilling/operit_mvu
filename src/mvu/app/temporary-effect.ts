@@ -16,6 +16,30 @@ export const TEMPORARY_EFFECT_REASON_TEMPLATES: Readonly<
   relationship: "关系事件",
 };
 
+/** Variables are deliberately enumerated: reason rendering never evaluates expressions. */
+export interface EffectReasonVariables {
+  triggerActorName?: string;
+  ruleName?: string;
+  effectGroupName?: string;
+  fieldName?: string;
+  event?: string;
+}
+
+const REASON_VARIABLE_NAMES = [
+  "triggerActorName",
+  "ruleName",
+  "effectGroupName",
+  "fieldName",
+  "event",
+] as const;
+
+export function renderEffectReasonText(template: string, variables: EffectReasonVariables = {}): string {
+  return template.replace(/\{\{([A-Za-z]+)\}\}/g, (token, name: string) => {
+    if (!REASON_VARIABLE_NAMES.includes(name as (typeof REASON_VARIABLE_NAMES)[number])) return token;
+    return variables[name as keyof EffectReasonVariables] ?? "";
+  });
+}
+
 export function temporaryEffectTargetMatchesContext(
   target: DataTemporaryEffectTarget,
   context: StateScopeContext

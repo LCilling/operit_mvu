@@ -6,6 +6,8 @@ const { createRuntime } = require("../dist/mvu/app/index.js");
 const { buildSeedDataset } = require("../dist/mvu/app/seed.js");
 const { InMemoryMvuStore } = require("../dist/mvu/app/store.js");
 const { normalizeMvuDataset } = require("../dist/mvu/app/validation.js");
+const { migrateDatasetV2ToV3 } = require("../dist/mvu/app/migration-v3.js");
+const { applyActiveEffects } = require("../dist/mvu/app/effect-engine.js");
 const { evaluateAutoRules } = require("../dist/mvu/app/automation.js");
 const { HostSystemModelApi } = require("../dist/mvu/app/system-model.js");
 
@@ -59,6 +61,20 @@ seed.temporaryEffects = [{
   reason: "雨夜散步带来的放松效果",
   createdAt: occurredAt - 100,
 }];
+
+const migratedV3 = migrateDatasetV2ToV3(seed, occurredAt).dataset;
+const v3EffectApplication = applyActiveEffects({
+  field: firstField,
+  actorId,
+  source: "rule",
+  sourceDelta: 3,
+  currentValue: firstField.initialValue,
+  activeEffects: migratedV3.activeEffects,
+  effectGroups: migratedV3.effectGroups,
+  occurredAt: new Date(occurredAt).toISOString(),
+});
+assert.equal(v3EffectApplication.effectiveDelta, 6);
+assert.deepEqual(v3EffectApplication.effectIds, ["active_effect_effect_multi_rule_audit"]);
 
 const runtime = createRuntime({ store: new InMemoryMvuStore(seed) });
 const result = await runtime.processPersistedMessage({
@@ -178,6 +194,7 @@ console.log(JSON.stringify({
   matchedRuleIds: result.matchedRuleIds,
   changedFields: result.records.map((record) => record.fieldId),
   migratedLegacyTargets: migrated.temporaryEffects[0].targets.length,
+  v3EffectiveDelta: v3EffectApplication.effectiveDelta,
   aiRuleMatches: aiEvaluation.matchedRules.length,
   result: "PASS",
 }, null, 2));
