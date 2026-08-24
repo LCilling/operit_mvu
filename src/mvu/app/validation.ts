@@ -612,11 +612,16 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     !Array.isArray(value.activeEffects)) fail("INVALID_MVU_V3_DATASET");
 
   const conditionIds = new Set<string>();
+  const aiPredicateIds = new Set<string>();
   for (const condition of value.conditions) {
     if (!isRecord(condition) || typeof condition.id !== "string" || conditionIds.has(condition.id)) {
       fail("INVALID_MVU_V3_CONDITION");
     }
     assertConditionDefinitionShape(condition);
+    for (const aiPredicateId of conditionAiPredicateIds(condition.expression)) {
+      if (aiPredicateIds.has(aiPredicateId)) fail("MVU_V3_CONDITION_AI_ID_DUPLICATE");
+      aiPredicateIds.add(aiPredicateId);
+    }
     conditionIds.add(condition.id);
   }
   const effectGroupIds = new Set<string>();
@@ -654,11 +659,13 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
 /** Validates reusable expressions before they are persisted or evaluated. */
 export function validateConditionExpression(expression: ConditionExpression): void {
   assertConditionExpressionShape(expression, 0);
+  assertUniqueAiPredicateIds(expression);
 }
 
 /** Validates reusable condition metadata and its bounded expression tree. */
 export function validateConditionDefinition(condition: ConditionDefinition): void {
   assertConditionDefinitionShape(condition);
+  assertUniqueAiPredicateIds(condition.expression);
 }
 
 function assertConditionDefinitionShape(value: unknown): asserts value is ConditionDefinition {
@@ -723,9 +730,10 @@ function assertConditionPredicateShape(value: unknown): asserts value is Conditi
       }
       return;
     case "keywords":
-      assertStringArray(value.include, "MVU_V3_CONDITION_KEYWORDS_INVALID");
+      assertStringArray(value.includeAny, "MVU_V3_CONDITION_KEYWORDS_INVALID");
+      assertStringArray(value.includeAll, "MVU_V3_CONDITION_KEYWORDS_INVALID");
       assertStringArray(value.exclude, "MVU_V3_CONDITION_KEYWORDS_INVALID");
-      if (value.include.length + value.exclude.length > 100 ||
+      if (value.includeAny.length + value.includeAll.length + value.exclude.length > 100 ||
         (value.windowHours !== undefined && !isFiniteNonNegative(value.windowHours)) ||
         (value.caseSensitive !== undefined && typeof value.caseSensitive !== "boolean")) {
         fail("MVU_V3_CONDITION_KEYWORDS_INVALID");
@@ -750,7 +758,7 @@ function assertConditionPredicateShape(value: unknown): asserts value is Conditi
       }
       return;
     case "ai_semantic":
-      if ((value.id !== undefined && (typeof value.id !== "string" || value.id.length === 0)) || typeof value.triggerType !== "string" ||
+      if (typeof value.id !== "string" || !STABLE_ID.test(value.id) || typeof value.triggerType !== "string" ||
         value.triggerType.trim().length === 0 || typeof value.requirement !== "string" ||
         value.requirement.trim().length === 0 || !isFiniteNumber(value.minimumConfidence) ||
         value.minimumConfidence < 0 || value.minimumConfidence > 1) {
@@ -759,6 +767,23 @@ function assertConditionPredicateShape(value: unknown): asserts value is Conditi
       return;
     default:
       fail("MVU_V3_CONDITION_PREDICATE_INVALID");
+  }
+}
+
+function assertUniqueAiPredicateIds(expression: ConditionExpression): void {
+  const seen = new Set<string>();
+  for (const id of conditionAiPredicateIds(expression)) {
+    if (seen.has(id)) fail("MVU_V3_CONDITION_AI_ID_DUPLICATE");
+    seen.add(id);
+  }
+}
+
+function conditionAiPredicateIds(expression: ConditionExpression): string[] {
+  switch (expression.kind) {
+    case "predicate": return expression.predicate.kind === "ai_semantic" ? [expression.predicate.id] : [];
+    case "not": return conditionAiPredicateIds(expression.child);
+    case "and":
+    case "or": return expression.children.flatMap(conditionAiPredicateIds);
   }
 }
 

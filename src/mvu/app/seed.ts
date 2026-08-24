@@ -209,7 +209,7 @@ export function buildDefaultConditionLibrary(now: string | number = Date.now()):
     conditionAsset("condition_auto_inactive", "长时间未交流", "超过一天没有交流。", { kind: "long_inactive", hours: 24 }, timestamp),
     conditionAsset("condition_auto_care", "主动关心", "用户主动关心角色。", { kind: "user_care" }, timestamp),
     conditionAsset("condition_auto_special", "特别的日子", "角色的重要纪念日。", { kind: "special_day" }, timestamp),
-    conditionAsset("condition_auto_high_frequency", "高频互动", "一天内产生大量消息。", { kind: "high_frequency", messages: 20 }, timestamp),
+    conditionAsset("condition_auto_high_frequency", "高频互动", "一天内产生大量消息。", { kind: "high_frequency", messages: 20, bucketHours: 1 }, timestamp),
   ];
 }
 

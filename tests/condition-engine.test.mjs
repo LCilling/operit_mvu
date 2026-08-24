@@ -22,6 +22,7 @@ function contextFor(actorId = "actor_t", overrides = {}) {
     now: NOW,
     fieldValues: { field_affinity: 30, field_excite: 20 },
     messageFacts: [],
+    hourlyMessageBuckets: [],
     aiSemanticResults: {},
     ...overrides,
   };
@@ -87,7 +88,7 @@ test("evaluates nested AND OR and NOT expressions", () => {
   });
 });
 
-test("evaluates field comparisons, count windows, and keyword inclusion and exclusion", () => {
+test("evaluates field comparisons, count windows, and keyword include-any/include-all/exclusion", () => {
   const facts = [
     fact({ messageId: "recent_1", content: "I care about you." }),
     fact({ messageId: "recent_2", occurredAt: NOW_MS - 30 * 60_000, content: "Please help me." }),
@@ -104,11 +105,15 @@ test("evaluates field comparisons, count windows, and keyword inclusion and excl
     context,
   ).matched, true);
   assert.equal(evaluateCondition(
-    { kind: "predicate", predicate: { kind: "keywords", include: ["care", "help"], exclude: ["stop"], windowHours: 1 } },
+    { kind: "predicate", predicate: { kind: "keywords", includeAny: ["care", "missing"], includeAll: ["care", "help"], exclude: ["stop"], windowHours: 1 } },
     context,
   ).matched, true);
   assert.equal(evaluateCondition(
-    { kind: "predicate", predicate: { kind: "keywords", include: ["care"], exclude: ["stop"], windowHours: 4 } },
+    { kind: "predicate", predicate: { kind: "keywords", includeAny: [], includeAll: ["care"], exclude: ["stop"], windowHours: 4 } },
+    context,
+  ).matched, false);
+  assert.equal(evaluateCondition(
+    { kind: "predicate", predicate: { kind: "keywords", includeAny: ["care"], includeAll: ["missing"], exclude: [], windowHours: 1 } },
     context,
   ).matched, false);
 });
@@ -128,7 +133,7 @@ test("evaluates sender, actor, group, inactivity, and concrete and repeating dat
   }
 });
 
-test("uses hourly buckets for high-frequency checks", () => {
+test("uses durable independent hourly buckets for high-frequency checks", () => {
   const facts = [
     fact({ messageId: "a", occurredAt: NOW_MS - 5 * 60_000 }),
     fact({ messageId: "b", occurredAt: NOW_MS - 20 * 60_000 }),
@@ -140,10 +145,38 @@ test("uses hourly buckets for high-frequency checks", () => {
     predicate: { kind: "high_frequency", messages: 3, windowHours: 2, bucketHours: 1 },
   };
 
-  assert.equal(evaluateCondition(expression, contextFor("actor_t", { messageFacts: facts })).matched, true);
   assert.equal(evaluateCondition(expression, contextFor("actor_t", {
-    messageFacts: facts.map((entry, index) => ({ ...entry, occurredAt: NOW_MS - (index + 1) * HOUR })),
+    messageFacts: [],
+    hourlyMessageBuckets: [
+      { startedAt: NOW_MS - HOUR, messageCount: 3 },
+      { startedAt: NOW_MS - 2 * HOUR, messageCount: 1 },
+    ],
+  })).matched, true);
+  assert.equal(evaluateCondition(expression, contextFor("actor_t", {
+    messageFacts: facts,
+    hourlyMessageBuckets: [
+      { startedAt: NOW_MS - HOUR, messageCount: 1 },
+      { startedAt: NOW_MS - 2 * HOUR, messageCount: 1 },
+    ],
   })).matched, false);
+  assert.equal(evaluateCondition(
+    { kind: "predicate", predicate: { kind: "high_frequency", messages: 2, windowHours: 3 } },
+    contextFor("actor_t", {
+      hourlyMessageBuckets: [
+        { startedAt: NOW_MS - HOUR, messageCount: 1 },
+        { startedAt: NOW_MS - 2 * HOUR, messageCount: 1 },
+        { startedAt: NOW_MS - 3 * HOUR, messageCount: 1 },
+      ],
+    }),
+  ).matched, false);
+});
+
+test("does not match a character sender predicate without a message fact", () => {
+  const result = evaluateCondition(
+    { kind: "predicate", predicate: { kind: "sender", senders: ["character"] } },
+    contextFor(),
+  );
+  assert.deepEqual(result, { matched: false, pendingAiPredicateIds: [], diagnostics: [] });
 });
 
 test("filters actor before evaluating an AI predicate", () => {
@@ -205,35 +238,86 @@ test("validates expression limits and exposes restorable legacy condition assets
     "condition_auto_special",
     "condition_auto_high_frequency",
   ]);
+  assert.deepEqual(library[4].expression, {
+    kind: "predicate",
+    predicate: { kind: "high_frequency", messages: 20, bucketHours: 1 },
+  });
   assert.notEqual(buildDefaultConditionLibrary(NOW), library);
 });
 
-test("rejects expressions beyond depth 12, more than 100 keywords, and invalid AI confidence", () => {
+test("uses required collision-safe AI IDs and deterministic migration IDs", () => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules[0].condition = {
+    kind: "aiJudgement",
+    triggerType: "care",
+    requirement: "The user expresses care.",
+    minimumConfidence: 0.8,
+  };
+  const migrated = migrateDatasetV2ToV3(legacy, NOW_MS).dataset;
+  assert.equal(migrated.conditions[0].expression.predicate.id, "condition_auto_positive_ai_0");
+
+  const duplicateIds = structuredClone(migrated);
+  duplicateIds.conditions[0].expression = {
+    kind: "and",
+    children: [
+      { kind: "predicate", predicate: { kind: "ai_semantic", id: "ai_unique", triggerType: "care", requirement: "First.", minimumConfidence: 0 } },
+      { kind: "predicate", predicate: { kind: "ai_semantic", id: "ai_unique", triggerType: "care", requirement: "Second.", minimumConfidence: 1 } },
+    ],
+  };
+  assert.throws(() => assertMvuDatasetV3(duplicateIds), /MVU_V3_CONDITION_AI_ID_DUPLICATE/);
+
+  const missingId = structuredClone(migrated);
+  delete missingId.conditions[0].expression.predicate.id;
+  assert.throws(() => assertMvuDatasetV3(missingId), /MVU_V3_CONDITION_AI_SEMANTIC_INVALID/);
+});
+
+test("enforces exact expression, keyword, and AI confidence boundaries", () => {
   const migrated = migrateDatasetV2ToV3(legacyDatasetFixture(), NOW_MS).dataset;
-  let deeplyNested = { kind: "predicate", predicate: { kind: "user_care" } };
-  for (let index = 0; index < 13; index += 1) deeplyNested = { kind: "not", child: deeplyNested };
+  const emptyOr = structuredClone(migrated);
+  emptyOr.conditions[0].expression = { kind: "or", children: [] };
+  assert.throws(() => assertMvuDatasetV3(emptyOr), /MVU_V3_CONDITION_OR_EMPTY/);
+
+  let depthTwelve = { kind: "predicate", predicate: { kind: "user_care" } };
+  for (let index = 0; index < 12; index += 1) depthTwelve = { kind: "not", child: depthTwelve };
+  const acceptedDepth = structuredClone(migrated);
+  acceptedDepth.conditions[0].expression = depthTwelve;
+  assert.doesNotThrow(() => assertMvuDatasetV3(acceptedDepth));
+
+  let depthThirteen = { kind: "predicate", predicate: { kind: "user_care" } };
+  for (let index = 0; index < 13; index += 1) depthThirteen = { kind: "not", child: depthThirteen };
 
   const tooDeep = structuredClone(migrated);
-  tooDeep.conditions[0].expression = deeplyNested;
+  tooDeep.conditions[0].expression = depthThirteen;
   assert.throws(() => assertMvuDatasetV3(tooDeep), /MVU_V3_CONDITION_DEPTH_EXCEEDED/);
+
+  const oneHundredKeywords = structuredClone(migrated);
+  oneHundredKeywords.conditions[0].expression = {
+    kind: "predicate",
+    predicate: { kind: "keywords", includeAny: Array.from({ length: 100 }, (_, index) => `word_${index}`), includeAll: [], exclude: [] },
+  };
+  assert.doesNotThrow(() => assertMvuDatasetV3(oneHundredKeywords));
 
   const tooManyKeywords = structuredClone(migrated);
   tooManyKeywords.conditions[0].expression = {
     kind: "predicate",
-    predicate: { kind: "keywords", include: Array.from({ length: 101 }, (_, index) => `word_${index}`), exclude: [] },
+    predicate: { kind: "keywords", includeAny: Array.from({ length: 101 }, (_, index) => `word_${index}`), includeAll: [], exclude: [] },
   };
   assert.throws(() => assertMvuDatasetV3(tooManyKeywords), /MVU_V3_CONDITION_KEYWORDS_INVALID/);
 
-  const invalidConfidence = structuredClone(migrated);
-  invalidConfidence.conditions[0].expression = {
-    kind: "predicate",
-    predicate: {
-      kind: "ai_semantic",
-      id: "semantic_invalid",
-      triggerType: "care",
-      requirement: "The user expresses care.",
-      minimumConfidence: 1.01,
-    },
-  };
-  assert.throws(() => assertMvuDatasetV3(invalidConfidence), /MVU_V3_CONDITION_AI_SEMANTIC_INVALID/);
+  for (const confidence of [0, 1]) {
+    const acceptedConfidence = structuredClone(migrated);
+    acceptedConfidence.conditions[0].expression = {
+      kind: "predicate",
+      predicate: { kind: "ai_semantic", id: `ai_confidence_${confidence}`, triggerType: "care", requirement: "The user expresses care.", minimumConfidence: confidence },
+    };
+    assert.doesNotThrow(() => assertMvuDatasetV3(acceptedConfidence));
+  }
+  for (const confidence of [-0.01, 1.01]) {
+    const rejectedConfidence = structuredClone(migrated);
+    rejectedConfidence.conditions[0].expression = {
+      kind: "predicate",
+      predicate: { kind: "ai_semantic", id: "ai_invalid_confidence", triggerType: "care", requirement: "The user expresses care.", minimumConfidence: confidence },
+    };
+    assert.throws(() => assertMvuDatasetV3(rejectedConfidence), /MVU_V3_CONDITION_AI_SEMANTIC_INVALID/);
+  }
 });
