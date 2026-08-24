@@ -12,7 +12,7 @@ import type {
   MvuSettings,
   TurnCounter,
 } from "./model";
-import type { MvuDatasetV3 } from "./model-v3";
+import type { ConditionDefinition, ConditionExpression, ConditionPredicate, MvuDatasetV3 } from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
 } from "./temporary-effect";
@@ -616,6 +616,7 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     if (!isRecord(condition) || typeof condition.id !== "string" || conditionIds.has(condition.id)) {
       fail("INVALID_MVU_V3_CONDITION");
     }
+    assertConditionDefinitionShape(condition);
     conditionIds.add(condition.id);
   }
   const effectGroupIds = new Set<string>();
@@ -648,4 +649,139 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     if (!isRecord(instance) || typeof instance.definitionId !== "string" ||
       !effectGroupIds.has(instance.definitionId)) fail("INVALID_MVU_V3_ACTIVE_EFFECT");
   }
+}
+
+/** Validates reusable expressions before they are persisted or evaluated. */
+export function validateConditionExpression(expression: ConditionExpression): void {
+  assertConditionExpressionShape(expression, 0);
+}
+
+/** Validates reusable condition metadata and its bounded expression tree. */
+export function validateConditionDefinition(condition: ConditionDefinition): void {
+  assertConditionDefinitionShape(condition);
+}
+
+function assertConditionDefinitionShape(value: unknown): asserts value is ConditionDefinition {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" ||
+    typeof value.description !== "string" || typeof value.enabled !== "boolean" ||
+    typeof value.createdAt !== "string" || typeof value.updatedAt !== "string") {
+    fail("INVALID_MVU_V3_CONDITION");
+  }
+  assertConditionExpressionShape(value.expression, 0);
+}
+
+function assertConditionExpressionShape(value: unknown, depth: number): asserts value is ConditionExpression {
+  if (!isRecord(value) || typeof value.kind !== "string") fail("MVU_V3_CONDITION_EXPRESSION_INVALID");
+  if (depth > 12) fail("MVU_V3_CONDITION_DEPTH_EXCEEDED");
+  switch (value.kind) {
+    case "predicate":
+      assertConditionPredicateShape(value.predicate);
+      return;
+    case "not":
+      assertConditionExpressionShape(value.child, depth + 1);
+      return;
+    case "and":
+    case "or":
+      if (!Array.isArray(value.children) || value.children.length === 0) {
+        fail(`MVU_V3_CONDITION_${value.kind.toUpperCase()}_EMPTY`);
+      }
+      for (const child of value.children) assertConditionExpressionShape(child, depth + 1);
+      return;
+    default:
+      fail("MVU_V3_CONDITION_EXPRESSION_INVALID");
+  }
+}
+
+function assertConditionPredicateShape(value: unknown): asserts value is ConditionPredicate {
+  if (!isRecord(value) || typeof value.kind !== "string") fail("MVU_V3_CONDITION_PREDICATE_INVALID");
+  switch (value.kind) {
+    case "recent_positive":
+      requireNonNegativeUnknown(value.count, "MVU_V3_CONDITION_RECENT_POSITIVE_INVALID");
+      return;
+    case "long_inactive":
+      requireNonNegativeUnknown(value.hours, "MVU_V3_CONDITION_INACTIVITY_INVALID");
+      return;
+    case "user_care":
+    case "special_day":
+      return;
+    case "high_frequency":
+      requireNonNegativeUnknown(value.messages, "MVU_V3_CONDITION_HIGH_FREQUENCY_INVALID");
+      optionalNonNegativeUnknown(value.windowHours, "MVU_V3_CONDITION_HIGH_FREQUENCY_INVALID");
+      optionalPositiveUnknown(value.bucketHours, "MVU_V3_CONDITION_HIGH_FREQUENCY_INVALID");
+      return;
+    case "field_comparison":
+      if (typeof value.fieldId !== "string" || !isFiniteNumber(value.value) ||
+        (value.operator !== ">=" && value.operator !== "<=" && value.operator !== ">" && value.operator !== "<" && value.operator !== "==")) {
+        fail("MVU_V3_CONDITION_FIELD_COMPARISON_INVALID");
+      }
+      return;
+    case "message_count":
+      requireNonNegativeUnknown(value.count, "MVU_V3_CONDITION_MESSAGE_COUNT_INVALID");
+      requireNonNegativeUnknown(value.windowHours, "MVU_V3_CONDITION_MESSAGE_COUNT_INVALID");
+      if (value.sender !== undefined && value.sender !== "user" && value.sender !== "character") {
+        fail("MVU_V3_CONDITION_MESSAGE_COUNT_INVALID");
+      }
+      return;
+    case "keywords":
+      assertStringArray(value.include, "MVU_V3_CONDITION_KEYWORDS_INVALID");
+      assertStringArray(value.exclude, "MVU_V3_CONDITION_KEYWORDS_INVALID");
+      if (value.include.length + value.exclude.length > 100 ||
+        (value.windowHours !== undefined && !isFiniteNonNegative(value.windowHours)) ||
+        (value.caseSensitive !== undefined && typeof value.caseSensitive !== "boolean")) {
+        fail("MVU_V3_CONDITION_KEYWORDS_INVALID");
+      }
+      return;
+    case "sender":
+      assertSenderArray(value.senders, "MVU_V3_CONDITION_SENDER_INVALID");
+      return;
+    case "actor":
+      assertStringArray(value.actorIds, "MVU_V3_CONDITION_ACTOR_INVALID");
+      return;
+    case "group":
+      assertStringArray(value.groupIds, "MVU_V3_CONDITION_GROUP_INVALID");
+      return;
+    case "concrete_date":
+      assertStringArray(value.dates, "MVU_V3_CONDITION_CONCRETE_DATE_INVALID");
+      return;
+    case "repeating_date":
+      if (typeof value.month !== "number" || !Number.isInteger(value.month) || value.month < 1 || value.month > 12 ||
+        typeof value.day !== "number" || !Number.isInteger(value.day) || value.day < 1 || value.day > 31) {
+        fail("MVU_V3_CONDITION_REPEATING_DATE_INVALID");
+      }
+      return;
+    case "ai_semantic":
+      if ((value.id !== undefined && (typeof value.id !== "string" || value.id.length === 0)) || typeof value.triggerType !== "string" ||
+        value.triggerType.trim().length === 0 || typeof value.requirement !== "string" ||
+        value.requirement.trim().length === 0 || !isFiniteNumber(value.minimumConfidence) ||
+        value.minimumConfidence < 0 || value.minimumConfidence > 1) {
+        fail("MVU_V3_CONDITION_AI_SEMANTIC_INVALID");
+      }
+      return;
+    default:
+      fail("MVU_V3_CONDITION_PREDICATE_INVALID");
+  }
+}
+
+function requireNonNegativeUnknown(value: unknown, code: string): void {
+  if (!isFiniteNonNegative(value)) fail(code);
+}
+
+function optionalNonNegativeUnknown(value: unknown, code: string): void {
+  if (value !== undefined && !isFiniteNonNegative(value)) fail(code);
+}
+
+function optionalPositiveUnknown(value: unknown, code: string): void {
+  if (value !== undefined && (!isFiniteNumber(value) || value <= 0)) fail(code);
+}
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0;
+}
+
+function assertStringArray(value: unknown, code: string): asserts value is string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) fail(code);
+}
+
+function assertSenderArray(value: unknown, code: string): void {
+  if (!Array.isArray(value) || !value.every((entry) => entry === "user" || entry === "character")) fail(code);
 }

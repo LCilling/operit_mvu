@@ -99,15 +99,32 @@ export interface ActiveEffectInstance {
   reason: EffectReasonSnapshot;
 }
 
-/** The initial condition vocabulary retains every v2 condition without coupling rules to it. */
+export type ConditionSender = MessageFact["role"];
+
+export interface AiSemanticPredicate {
+  /** Optional caller-owned key; the evaluator derives one for legacy-compatible predicates. */
+  id?: string;
+  triggerType: string;
+  requirement: string;
+  minimumConfidence: number;
+}
+
+/** The condition vocabulary retains every v2 condition while allowing reusable compositions. */
 export type ConditionPredicate =
   | { kind: "recent_positive"; count: number }
   | { kind: "long_inactive"; hours: number }
   | { kind: "user_care" }
   | { kind: "special_day" }
-  | { kind: "high_frequency"; messages: number }
+  | { kind: "high_frequency"; messages: number; windowHours?: number; bucketHours?: number }
   | { kind: "field_comparison"; fieldId: string; operator: ">=" | "<=" | ">" | "<" | "=="; value: number }
-  | { kind: "ai_semantic"; triggerType: string; requirement: string; minimumConfidence: number };
+  | { kind: "message_count"; count: number; windowHours: number; sender?: ConditionSender }
+  | { kind: "keywords"; include: string[]; exclude: string[]; windowHours?: number; caseSensitive?: boolean }
+  | { kind: "sender"; senders: ConditionSender[] }
+  | { kind: "actor"; actorIds: string[] }
+  | { kind: "group"; groupIds: string[] }
+  | { kind: "concrete_date"; dates: string[] }
+  | { kind: "repeating_date"; month: number; day: number }
+  | ({ kind: "ai_semantic" } & AiSemanticPredicate);
 
 export type ConditionExpression =
   | { kind: "and"; children: ConditionExpression[] }
