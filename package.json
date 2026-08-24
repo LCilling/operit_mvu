@@ -9,9 +9,10 @@
     "audit": "node scripts/audit-web-ui.mjs",
     "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
+    "test:v3": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "build:web": "node scripts/build-web.mjs",
     "build": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run build:web",
-    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects",
+    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run test:v3",
     "pack": "pnpm run build && node scripts/pack.mjs"
   },
   "devDependencies": {

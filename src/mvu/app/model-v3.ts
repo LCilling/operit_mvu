@@ -1,0 +1,162 @@
+import type {
+  DataChangeRecord,
+  DataField,
+  DataLinkRule,
+  MessageFact,
+  MvuSettings,
+  TemporaryEffectReasonTemplate,
+  TurnCounter,
+} from "./model";
+
+/** Sources that can produce a field change and be filtered by an effect operation. */
+export type ChangeSource = "manual" | "natural" | "per_turn" | "rule" | "ai";
+
+export type RuleActorSelector =
+  | { kind: "any" }
+  | { kind: "current_actor" }
+  | { kind: "selected"; actorIds: string[] }
+  | { kind: "group"; groupIds: string[] };
+
+export type RuleTargetSelector =
+  | { kind: "trigger_actor" }
+  | { kind: "all_bound" }
+  | { kind: "selected"; actorIds: string[] };
+
+export type RuleActionV3 =
+  | { kind: "change_field"; fieldId: string; target: RuleTargetSelector; delta: number; effectGroupIds: string[] }
+  | { kind: "activate_effect_group"; effectGroupId: string };
+
+export interface RuleDefinitionV3 {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  triggerActorSelector: RuleActorSelector;
+  conditionId: string;
+  actions: RuleActionV3[];
+  cooldownHours: number;
+  executionOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type EffectActorSelector =
+  | { kind: "all_bound" }
+  | { kind: "trigger_actor" }
+  | { kind: "selected"; actorIds: string[] };
+
+export type EffectOperation =
+  | { kind: "immediate_delta"; value: number }
+  | { kind: "fixed_adjustment"; value: number; sources: ChangeSource[] }
+  | { kind: "positive_multiplier"; value: number; sources: ChangeSource[] }
+  | { kind: "negative_multiplier"; value: number; sources: ChangeSource[] }
+  | { kind: "all_multiplier"; value: number; sources: ChangeSource[] };
+
+export interface FieldEffectDefinition {
+  id: string;
+  fieldId: string;
+  actorSelector: EffectActorSelector;
+  operations: EffectOperation[];
+}
+
+/** An absolute active-effect lifetime. Definitions omit this when no reusable default exists. */
+export interface EffectDuration {
+  expiresAt: string | null;
+  remainingTurns: number | null;
+}
+
+export interface EffectGroupDefinition {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  fieldEffects: FieldEffectDefinition[];
+  defaultDuration?: EffectDuration;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ResolvedEffectTarget {
+  fieldId: string;
+  actorId: string | null;
+  scope: DataField["scope"];
+  scopeKey: string;
+}
+
+export interface EffectReasonSnapshot {
+  mode: "template" | "custom";
+  template: TemporaryEffectReasonTemplate;
+  text: string;
+}
+
+export interface ActiveEffectInstance {
+  id: string;
+  definitionId: string;
+  triggerActorId?: string;
+  resolvedTargets: ResolvedEffectTarget[];
+  duration: EffectDuration;
+  activatedAt: string;
+  reason: EffectReasonSnapshot;
+}
+
+/** The initial condition vocabulary retains every v2 condition without coupling rules to it. */
+export type ConditionPredicate =
+  | { kind: "recent_positive"; count: number }
+  | { kind: "long_inactive"; hours: number }
+  | { kind: "user_care" }
+  | { kind: "special_day" }
+  | { kind: "high_frequency"; messages: number }
+  | { kind: "field_comparison"; fieldId: string; operator: ">=" | "<=" | ">" | "<" | "=="; value: number }
+  | { kind: "ai_semantic"; triggerType: string; requirement: string; minimumConfidence: number };
+
+export type ConditionExpression =
+  | { kind: "and"; children: ConditionExpression[] }
+  | { kind: "or"; children: ConditionExpression[] }
+  | { kind: "not"; child: ConditionExpression }
+  | { kind: "predicate"; predicate: ConditionPredicate };
+
+export interface ConditionDefinition {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  expression: ConditionExpression;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The pure migration representation. Runtime/storage integration is intentionally
+ * deferred; copied v2 runtime facts stay available until the v3 store owns them.
+ */
+export interface MvuDatasetV3 {
+  formatVersion: 3;
+  createdAt: string;
+  revision: number;
+  settings: MvuSettings;
+  fields: DataField[];
+  pendingBootstrapFieldIds: string[];
+  linkRules: DataLinkRule[];
+  conditions: ConditionDefinition[];
+  rules: RuleDefinitionV3[];
+  effectGroups: EffectGroupDefinition[];
+  activeEffects: ActiveEffectInstance[];
+  stateValues: Record<string, Record<string, number>>;
+  records: DataChangeRecord[];
+  lastSettled: Record<string, Record<string, number>>;
+  turnCounters: Record<string, Record<string, TurnCounter>>;
+  processedMessageIds: string[];
+  ruleLastTriggered: Record<string, Record<string, number>>;
+  messageFacts: Record<string, MessageFact[]>;
+}
+
+export interface MigrationResult {
+  dataset: MvuDatasetV3;
+  report: {
+    migratedFields: number;
+    migratedRules: number;
+    migratedConditions: number;
+    migratedEffectGroups: number;
+    warnings: string[];
+  };
+}
