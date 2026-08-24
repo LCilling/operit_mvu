@@ -476,6 +476,8 @@ Assert exactly four bottom items (`状态/配置/规则/高级`), menu icons onl
 
 Assert trend canvases receive the field minimum, maximum, stage thresholds, and stage colors used by the stage strip. The drawing code must not derive an independent Y range from recent samples.
 
+Assert the field-detail content stack uses one `12px` gap for value, stage, trend, and following cards; reject negative margins or a stage/trend-specific collapsed gap.
+
 Update the existing `audit-web-ui.mjs` assertions that encode the old five-item navigation and monolithic function boundaries. Keep its accessibility, bridge-action, field-range, effect-import, reason, and transition guarantees. Add `audit:v3` to `package.json` and make `audit` run both audit scripts.
 
 - [ ] **Step 3: Run UI audit RED**
@@ -502,6 +504,8 @@ window.MvuUi = {
 Inline scripts in dependency order through `build-web.mjs`. Use an app-screen grid with rows `auto minmax(0, 1fr) auto auto`; keep actions and nav in normal flow. Preserve browser history and restore child routes to their owning root.
 
 Render trend Y positions from `(value - field.minimum) / (field.maximum - field.minimum)`, draw lightweight stage bands or threshold lines from the same thresholds used by the stage strip, and reuse stage colors. Improve small-delta readability through points/current-value labels, never through independent Y-axis autoscaling.
+
+Use a shared field-detail stack with `gap: 12px`; remove negative margins and one-off selectors that collapse the stage/trend seam. Recover compactness inside cards without changing body font size.
 
 - [ ] **Step 5: Run UI audit and build GREEN**
 
@@ -695,7 +699,7 @@ Expected: PASS and a new `release/operit_mvu-3.0.0.toolpkg`.
 
 - [ ] **Step 5: Perform visual verification**
 
-Build the local app and inspect 320/360/393/430 widths plus 130% text sizing. Capture bounded evidence for four-nav routing, unframed back arrows, no bottom overlap, 5/5/10 pagination, picker search/counts, condition CRUD, effect-group actor controls, and identical relative value placement between the stage strip and trend chart.
+Build the local app and inspect 320/360/393/430 widths plus 130% text sizing. Capture bounded evidence for four-nav routing, unframed back arrows, no bottom overlap, 5/5/10 pagination, picker search/counts, condition CRUD, effect-group actor controls, identical relative value placement between the stage strip and trend chart, and a uniform 12px detail-card gap.
 
 - [ ] **Step 6: Test in the modified OperitAI APK**
 
