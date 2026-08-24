@@ -15,6 +15,12 @@ export interface AiSemanticResult {
   confidence: number;
 }
 
+/** Durable per-hour counters, retained independently from the capped fact list. */
+export interface HourlyMessageBucket {
+  startedAt: number;
+  messageCount: number;
+}
+
 export interface ConditionEvaluationContext {
   actorId: string | null;
   groupId: string | null;
@@ -22,6 +28,7 @@ export interface ConditionEvaluationContext {
   now: string | number;
   fieldValues: Readonly<Record<string, number>>;
   messageFacts: readonly MessageFact[];
+  hourlyMessageBuckets: readonly HourlyMessageBucket[];
   aiSemanticResults?: Readonly<Record<string, AiSemanticResult | undefined>>;
 }
 
@@ -77,13 +84,7 @@ export function collectAiPredicates(condition: ConditionExpression | ConditionDe
   }
   const collected: AiSemanticPredicate[] = [];
   collect(conditionExpression(condition), collected);
-  const seen = new Set<string>();
-  return collected.filter((predicate) => {
-    const id = semanticPredicateId(predicate);
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
+  return collected;
 }
 
 export { buildDefaultConditionLibrary };
@@ -143,12 +144,15 @@ function evaluatePredicate(
     }
     case "user_care": return matches(context.messageFacts.some((fact) => fact.userCareDetected === true));
     case "special_day": return matches(context.messageFacts.some((fact) => fact.specialDayDetected === true));
-    case "high_frequency": return matches(matchesHighFrequency(predicate, context.messageFacts, now));
+    case "high_frequency": return matches(matchesHighFrequency(predicate, context.hourlyMessageBuckets, now));
     case "field_comparison": return matches(compare(context.fieldValues[predicate.fieldId], predicate.operator, predicate.value));
     case "message_count": return matches(factsWithin(context.messageFacts, now, predicate.windowHours)
       .filter((fact) => predicate.sender === undefined || fact.role === predicate.sender).length >= predicate.count);
     case "keywords": return matches(matchesKeywords(predicate, context.messageFacts, now));
-    case "sender": return matches(predicate.senders.includes(latestFact(context.messageFacts)?.role ?? "character"));
+    case "sender": {
+      const fact = latestFact(context.messageFacts);
+      return matches(fact !== undefined && predicate.senders.includes(fact.role));
+    }
     case "actor": return matches(context.actorId !== null && predicate.actorIds.includes(context.actorId));
     case "group": return matches(context.groupId !== null && predicate.groupIds.includes(context.groupId));
     case "concrete_date": return matches(predicate.dates.includes(utcDate(now)));
@@ -157,9 +161,8 @@ function evaluatePredicate(
       return matches(date.getUTCMonth() + 1 === predicate.month && date.getUTCDate() === predicate.day);
     }
     case "ai_semantic": {
-      const id = semanticPredicateId(predicate);
-      const result = context.aiSemanticResults?.[id];
-      if (result === undefined) return { state: "pending", pendingAiPredicateIds: [id] };
+      const result = context.aiSemanticResults?.[predicate.id];
+      if (result === undefined) return { state: "pending", pendingAiPredicateIds: [predicate.id] };
       return matches(result.matched && Number.isFinite(result.confidence) && result.confidence >= predicate.minimumConfidence);
     }
   }
@@ -167,18 +170,21 @@ function evaluatePredicate(
 
 function matchesHighFrequency(
   predicate: Extract<ConditionPredicate, { kind: "high_frequency" }>,
-  facts: readonly MessageFact[],
+  hourlyBuckets: readonly HourlyMessageBucket[],
   now: number,
 ): boolean {
   const windowHours = predicate.windowHours ?? 24;
-  const bucketHours = predicate.bucketHours ?? windowHours;
+  const bucketHours = predicate.bucketHours ?? 1;
   const bucketMilliseconds = bucketHours * HOUR_IN_MILLISECONDS;
-  const buckets = new Map<number, number>();
-  for (const fact of factsWithin(facts, now, windowHours)) {
-    const index = Math.floor((now - fact.occurredAt) / bucketMilliseconds);
-    buckets.set(index, (buckets.get(index) ?? 0) + 1);
+  const cutoff = now - windowHours * HOUR_IN_MILLISECONDS;
+  const counts = new Map<number, number>();
+  for (const bucket of hourlyBuckets) {
+    if (!Number.isFinite(bucket.startedAt) || !Number.isFinite(bucket.messageCount) || bucket.messageCount < 0 ||
+      bucket.startedAt > now || bucket.startedAt + HOUR_IN_MILLISECONDS <= cutoff) continue;
+    const index = Math.floor((now - bucket.startedAt) / bucketMilliseconds);
+    counts.set(index, (counts.get(index) ?? 0) + bucket.messageCount);
   }
-  return [...buckets.values()].some((count) => count >= predicate.messages);
+  return [...counts.values()].some((count) => count >= predicate.messages);
 }
 
 function matchesKeywords(
@@ -190,7 +196,9 @@ function matchesKeywords(
     predicate.caseSensitive ? fact.content : fact.content.toLocaleLowerCase()
   );
   const normalize = (entry: string): string => predicate.caseSensitive ? entry : entry.toLocaleLowerCase();
-  return predicate.include.every((entry) => source.some((content) => content.includes(normalize(entry)))) &&
+  return (predicate.includeAny.length === 0 || predicate.includeAny.some((entry) =>
+    source.some((content) => content.includes(normalize(entry)))
+  )) && predicate.includeAll.every((entry) => source.some((content) => content.includes(normalize(entry)))) &&
     predicate.exclude.every((entry) => source.every((content) => !content.includes(normalize(entry))));
 }
 
@@ -228,7 +236,7 @@ function collect(expression: ConditionExpression, output: AiSemanticPredicate[])
     case "predicate":
       if (expression.predicate.kind === "ai_semantic") {
         const { triggerType, requirement, minimumConfidence } = expression.predicate;
-        output.push({ id: semanticPredicateId(expression.predicate), triggerType, requirement, minimumConfidence });
+        output.push({ id: expression.predicate.id, triggerType, requirement, minimumConfidence });
       }
       return;
     case "not":
@@ -260,10 +268,6 @@ function utcDate(value: number): string {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-function semanticPredicateId(predicate: AiSemanticPredicate): string {
-  return predicate.id ?? `ai_semantic:${predicate.triggerType}:${predicate.requirement}`;
 }
 
 function invalidEvaluation(diagnostic: string): ConditionEvaluation {

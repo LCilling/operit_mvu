@@ -102,8 +102,8 @@ export interface ActiveEffectInstance {
 export type ConditionSender = MessageFact["role"];
 
 export interface AiSemanticPredicate {
-  /** Optional caller-owned key; the evaluator derives one for legacy-compatible predicates. */
-  id?: string;
+  /** Stable canonical key used to associate an AI result with exactly one predicate. */
+  id: string;
   triggerType: string;
   requirement: string;
   minimumConfidence: number;
@@ -118,7 +118,7 @@ export type ConditionPredicate =
   | { kind: "high_frequency"; messages: number; windowHours?: number; bucketHours?: number }
   | { kind: "field_comparison"; fieldId: string; operator: ">=" | "<=" | ">" | "<" | "=="; value: number }
   | { kind: "message_count"; count: number; windowHours: number; sender?: ConditionSender }
-  | { kind: "keywords"; include: string[]; exclude: string[]; windowHours?: number; caseSensitive?: boolean }
+  | { kind: "keywords"; includeAny: string[]; includeAll: string[]; exclude: string[]; windowHours?: number; caseSensitive?: boolean }
   | { kind: "sender"; senders: ConditionSender[] }
   | { kind: "actor"; actorIds: string[] }
   | { kind: "group"; groupIds: string[] }

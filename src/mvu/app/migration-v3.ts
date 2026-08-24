@@ -68,13 +68,13 @@ function migrateCondition(rule: MvuDataset["autoRules"][number], nowIso: string)
     name: `${rule.name} condition`,
     description: rule.description,
     enabled: true,
-    expression: { kind: "predicate", predicate: migrateConditionPredicate(rule.condition) },
+    expression: { kind: "predicate", predicate: migrateConditionPredicate(rule.condition, conditionId(rule.id)) },
     createdAt: nowIso,
     updatedAt: nowIso,
   };
 }
 
-function migrateConditionPredicate(condition: AutoRuleCondition): ConditionPredicate {
+function migrateConditionPredicate(condition: AutoRuleCondition, conditionIdValue: string): ConditionPredicate {
   switch (condition.kind) {
     case "recentPositive": return { kind: "recent_positive", count: condition.count };
     case "longInactive": return { kind: "long_inactive", hours: condition.hours };
@@ -85,7 +85,7 @@ function migrateConditionPredicate(condition: AutoRuleCondition): ConditionPredi
       kind: "field_comparison", fieldId: condition.fieldId, operator: condition.operator, value: condition.threshold,
     };
     case "aiJudgement": return {
-      kind: "ai_semantic", triggerType: condition.triggerType,
+      kind: "ai_semantic", id: `${conditionIdValue}_ai_0`, triggerType: condition.triggerType,
       requirement: condition.requirement, minimumConfidence: condition.minimumConfidence,
     };
   }
