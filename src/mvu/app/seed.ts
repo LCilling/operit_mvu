@@ -8,6 +8,7 @@ import type {
   DataStage,
   MvuDataset,
 } from "./model";
+import type { ConditionDefinition, ConditionPredicate } from "./model-v3";
 
 /** No demo identity may enter production state. */
 export const DEFAULT_ACTORS: DataActor[] = [];
@@ -195,6 +196,40 @@ export const DEFAULT_AUTO_RULES: DataAutoRule[] = [
     effects: [{ fieldId: "field_excite", delta: 5, temporaryEffectIds: [] }], cooldownMs: 24 * 3_600_000, order: 5,
   },
 ];
+
+/**
+ * Returns editable v3 condition assets for an explicit restore action. The v2
+ * startup seed intentionally does not consume this library, so deleting a
+ * condition is never undone by a later startup.
+ */
+export function buildDefaultConditionLibrary(now: string | number = Date.now()): ConditionDefinition[] {
+  const timestamp = typeof now === "string" ? now : new Date(now).toISOString();
+  return [
+    conditionAsset("condition_auto_positive", "连续积极互动", "最近对话持续积极互动。", { kind: "recent_positive", count: 6 }, timestamp),
+    conditionAsset("condition_auto_inactive", "长时间未交流", "超过一天没有交流。", { kind: "long_inactive", hours: 24 }, timestamp),
+    conditionAsset("condition_auto_care", "主动关心", "用户主动关心角色。", { kind: "user_care" }, timestamp),
+    conditionAsset("condition_auto_special", "特别的日子", "角色的重要纪念日。", { kind: "special_day" }, timestamp),
+    conditionAsset("condition_auto_high_frequency", "高频互动", "一天内产生大量消息。", { kind: "high_frequency", messages: 20 }, timestamp),
+  ];
+}
+
+function conditionAsset(
+  id: string,
+  name: string,
+  description: string,
+  predicate: ConditionPredicate,
+  timestamp: string,
+): ConditionDefinition {
+  return {
+    id,
+    name,
+    description,
+    enabled: true,
+    expression: { kind: "predicate", predicate },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
 
 export function buildSeedDataset(createdAt: number = Date.now()): MvuDataset {
   return {
