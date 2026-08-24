@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "toolpkg_id": "com.lcilling.operit_mvu",
-  "version": "0.2.0",
+  "version": "2.0.1",
   "main": "dist/main.js",
   "display_name": {
     "zh": "动态状态",

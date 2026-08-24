@@ -1,6 +1,6 @@
 {
   "name": "operit_mvu",
-  "version": "0.2.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Dynamic character state ToolPkg for OperitAI",
   "license": "MIT",

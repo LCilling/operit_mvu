@@ -1,8 +1,8 @@
 # operit_mvu
 
-`operit_mvu` 是面向 [OperitAI](https://github.com/AAswordman/Operit) 的动态角色状态 ToolPkg，也是 [Issue #998](https://github.com/AAswordman/Operit/issues/998) 的完整插件实现。它把页面、MVU v2 状态引擎、作用域字段、规则、变化记录、AI 判断和私有存储封装在单一 `operit_mvu-0.2.0.toolpkg` 中。
+`operit_mvu` 是面向 [OperitAI](https://github.com/AAswordman/Operit) 的动态角色状态 ToolPkg，也是 [Issue #998](https://github.com/AAswordman/Operit/issues/998) 的完整插件实现。它把页面、MVU v2 状态引擎、作用域字段、规则、变化记录、AI 判断和私有存储封装在单一 `operit_mvu-2.0.1.toolpkg` 中。
 
-插件标识为 `com.lcilling.operit_mvu`。当前 v0.2.0 是首次公开发布，直接使用严格的 `formatVersion: 2` 数据契约，不包含演示角色、演示消息或旧格式迁移代码。
+插件标识为 `com.lcilling.operit_mvu`。当前 v2.0.1 使用严格的 `formatVersion: 2` 数据契约，不包含演示角色、演示消息或旧格式迁移代码。
 
 ## 功能
 
@@ -21,7 +21,7 @@
 
 Release 只发布一个 ToolPkg，不发布插件 APK：
 
-1. 下载 [Releases](https://github.com/LCilling/operit_mvu/releases) 中的 `operit_mvu-0.2.0.toolpkg`。
+1. 下载 [Releases](https://github.com/LCilling/operit_mvu/releases) 中的 `operit_mvu-2.0.1.toolpkg`。
 2. 把文件复制到手机可访问的位置。
 3. 在 Operit 的“包管理”中选择“导入”，只选择该 ToolPkg。
 4. 启用“动态状态”，然后从 Operit 主侧边栏的插件区域打开。
@@ -75,7 +75,7 @@ pnpm run check
 pnpm run pack
 ```
 
-打包结果位于 `release/operit_mvu-0.2.0.toolpkg`。`pnpm run check` 执行生产 UI 静态审计和 TypeScript 类型检查；`pnpm run pack` 只把插件运行时、页面、许可证及使用文档写入 ToolPkg。测试用例、测试编译配置、QA 预览页和测试报告不进入公开源码或发布包。仓库内的 `types/` 是编译本插件所需的 Operit ToolPkg 类型契约快照，因此独立克隆后不依赖 OperitAI 源码树即可构建。
+打包结果位于 `release/operit_mvu-2.0.1.toolpkg`。`pnpm run check` 执行生产 UI 静态审计和 TypeScript 类型检查；`pnpm run pack` 只把插件运行时、页面、许可证及使用文档写入 ToolPkg。测试用例、测试编译配置、QA 预览页和测试报告不进入公开源码或发布包。仓库内的 `types/` 是编译本插件所需的 Operit ToolPkg 类型契约快照，因此独立克隆后不依赖 OperitAI 源码树即可构建。
 
 ## 许可证
 

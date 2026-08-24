@@ -2,7 +2,7 @@
 
 本文记录 Issue #998 在当前 Operit 宿主中实现的 ToolPkg 契约。它不是未来接口提案，也不是 MVU 自建的宿主替身。
 
-角色卡、角色组、聊天绑定、数据库消息身份和系统默认模型都属于 Operit 私有事实，必须由新版宿主提供。用户首次安装一次包含这些接口的 Operit 版本后，当前 MVU 只通过单一外部 `operit_mvu-0.2.0.toolpkg` 安装；后续更新也只替换这一外部 ToolPkg，不需要辅助 APK、第二个接口包或独立前端目录。MVU 不随宿主 APK 内置。
+角色卡、角色组、聊天绑定、数据库消息身份和系统默认模型都属于 Operit 私有事实，必须由新版宿主提供。用户首次安装一次包含这些接口的 Operit 版本后，当前 MVU 只通过单一外部 `operit_mvu-2.0.1.toolpkg` 安装；后续更新也只替换这一外部 ToolPkg，不需要辅助 APK、第二个接口包或独立前端目录。MVU 不随宿主 APK 内置。
 
 ## 接口总览
 
@@ -167,4 +167,4 @@ MVU 使用 `registerSystemPromptComposeHook`，但只接受 `promptFunctionType 
 - Android 真机验证后台消息、群聊、编辑和变体事件
 - 最终 `.toolpkg` 的导入、同 ID 更新、重启持久化、完整按钮矩阵和视觉回归
 
-正式用户链路仍是先更新一次满足上述契约的 Operit，再只导入单一外部 `operit_mvu-0.2.0.toolpkg`。MVU 页面不提供专用退出按钮，离开插件统一使用 Android 返回手势、系统返回键或 Operit 自身导航。
+正式用户链路仍是先更新一次满足上述契约的 Operit，再只导入单一外部 `operit_mvu-2.0.1.toolpkg`。MVU 页面不提供专用退出按钮，离开插件统一使用 Android 返回手势、系统返回键或 Operit 自身导航。
