@@ -177,6 +177,15 @@ export async function processPersistedMessageV3(
   if (draft.processedMessageIds.includes(messageKey)) {
     return { dataset: draft, duplicate: true, records: [], matchedRuleIds: [], diagnostics: [] };
   }
+  if (input.context.actorId === null) {
+    return {
+      dataset: draft,
+      duplicate: false,
+      records: [],
+      matchedRuleIds: [],
+      diagnostics: [{ code: "MVU_RULE_TRIGGER_ACTOR_MISSING" }],
+    };
+  }
 
   const eventKey = automationScopeKey(input.context);
   const fact = messageFact({ ...input, aiChanges: [], aiRuleJudgements: [] });
@@ -198,6 +207,7 @@ export async function processPersistedMessageV3(
       fieldValues: stateValuesForV3Context(draft, input.context),
       messageFacts: draft.messageFacts[eventKey],
       hourlyMessageBuckets: draft.hourlyMessageBuckets[eventKey],
+      currentMessage: fact,
     },
     currentActorId: input.currentActorId,
     lastTriggeredAtByRuleId: draft.ruleLastTriggered[eventKey] ?? {},
