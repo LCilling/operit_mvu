@@ -1,4 +1,4 @@
-import type { AutoRuleCondition, DataTemporaryEffect, MvuDataset } from "./model";
+import type { AutoRuleCondition, DataTemporaryEffect, DataTemporaryEffectTarget, MvuDataset } from "./model";
 import type {
   ActiveEffectInstance,
   ConditionDefinition,
@@ -117,15 +117,21 @@ function migrateRule(rule: MvuDataset["autoRules"][number], nowIso: string): Rul
 
 function migrateEffectGroup(effect: DataTemporaryEffect): EffectGroupDefinition {
   const createdAt = isoTimestamp(effect.createdAt);
+  const targetsByField = new Map<string, DataTemporaryEffectTarget[]>();
+  for (const target of effect.targets) {
+    const targets = targetsByField.get(target.fieldId);
+    if (targets === undefined) targetsByField.set(target.fieldId, [target]);
+    else targets.push(target);
+  }
   return {
     id: effectGroupId(effect.id),
     name: `Migrated effect ${effect.id}`,
     description: effect.reasonMode === "custom" ? effect.reason : effect.reasonTemplate,
     enabled: effect.enabled,
-    fieldEffects: effect.targets.map((target, index) => ({
+    fieldEffects: [...targetsByField.entries()].map(([fieldId, targets], index) => ({
       id: `field_effect_${effect.id}_${index}`,
-      fieldId: target.fieldId,
-      actorSelector: actorSelectorForTarget(target.scope, target.scopeKey),
+      fieldId,
+      actorSelector: actorSelectorForTargets(targets),
       operations: [effect.mode === "additive"
         ? { kind: "fixed_adjustment", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }
         : { kind: "all_multiplier", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }],
@@ -154,9 +160,12 @@ function migrateActiveEffect(effect: DataTemporaryEffect): ActiveEffectInstance 
   };
 }
 
-function actorSelectorForTarget(scope: ResolvedEffectTarget["scope"], scopeKey: string): EffectActorSelector {
-  const actorId = actorIdFromTarget(scope, scopeKey);
-  return actorId === null ? { kind: "all_bound" } : { kind: "selected", actorIds: [actorId] };
+function actorSelectorForTargets(targets: readonly DataTemporaryEffectTarget[]): EffectActorSelector {
+  const actorIds = targets.map((target) => actorIdFromTarget(target.scope, target.scopeKey));
+  if (actorIds.every((actorId): actorId is string => actorId !== null)) {
+    return { kind: "selected", actorIds: [...new Set(actorIds)] };
+  }
+  return { kind: "all_bound" };
 }
 
 function actorIdFromTarget(scope: ResolvedEffectTarget["scope"] | undefined, scopeKey: string | undefined): string | null {

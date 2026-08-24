@@ -102,6 +102,85 @@ test("missing trigger actor skips dynamic targets and emits a diagnostic instead
   }]);
 });
 
+test("a missing trigger actor cancels an entire mixed-selector group activation", () => {
+  const fields = [
+    characterField(),
+    characterField({ id: "B", name: "Calm" }),
+    characterField({ id: "C", name: "Focus" }),
+  ];
+  const definition = group([
+    {
+      id: "field_effect_all_bound",
+      fieldId: "A",
+      actorSelector: { kind: "all_bound" },
+      operations: [{ kind: "immediate_delta", value: 5 }],
+    },
+    {
+      id: "field_effect_selected",
+      fieldId: "B",
+      actorSelector: { kind: "selected", actorIds: ["T", "U"] },
+      operations: [{ kind: "immediate_delta", value: 7 }],
+    },
+    {
+      id: "field_effect_required_trigger",
+      fieldId: "C",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [{ kind: "immediate_delta", value: -30 }],
+    },
+  ]);
+
+  const activation = activateEffectGroup({
+    definition, fields, instanceId: "active_atomic_missing", activatedAt: NOW,
+    reason: { mode: "template", template: "general" },
+  });
+
+  assert.deepEqual(activation.instances, []);
+  assert.deepEqual(activation.immediateChanges, []);
+  assert.deepEqual(activation.diagnostics, [{
+    code: "MVU_EFFECT_TRIGGER_ACTOR_MISSING",
+    definitionId: "effect_group_desire",
+    fieldEffectId: "field_effect_required_trigger",
+  }]);
+});
+
+test("activates one multi-field group with independent per-field selectors and operations", () => {
+  const desire = characterField();
+  const calm = characterField({ id: "B", name: "Calm" });
+  const definition = group([
+    {
+      id: "field_effect_desire_trigger",
+      fieldId: "A",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [
+        { kind: "immediate_delta", value: -30 },
+        { kind: "positive_multiplier", value: 0.5, sources: ["rule"] },
+      ],
+    },
+    {
+      id: "field_effect_calm_all",
+      fieldId: "B",
+      actorSelector: { kind: "all_bound" },
+      operations: [{ kind: "fixed_adjustment", value: 2, sources: ["rule"] }],
+    },
+  ]);
+  const activation = activateEffectGroup({
+    definition, fields: [desire, calm], triggerActorId: "T", instanceId: "active_multi_field", activatedAt: NOW,
+    reason: { mode: "template", template: "general" },
+  });
+
+  assert.deepEqual(activation.immediateChanges, [{ actorId: "T", fieldId: "A", delta: -30 }]);
+  assert.deepEqual(activation.instances[0].resolvedTargets, [
+    { fieldId: "A", actorId: "T", scope: "character", scopeKey: "character:T" },
+    { fieldId: "B", actorId: "T", scope: "character", scopeKey: "character:T" },
+    { fieldId: "B", actorId: "U", scope: "character", scopeKey: "character:U" },
+    { fieldId: "B", actorId: "V", scope: "character", scopeKey: "character:V" },
+  ]);
+  assert.equal(applyFor("T", 10, activation.instances, definition, desire).effectiveDelta, 5);
+  assert.equal(applyFor("U", 10, activation.instances, definition, desire).effectiveDelta, 10);
+  assert.equal(applyFor("T", 10, activation.instances, definition, calm).effectiveDelta, 12);
+  assert.equal(applyFor("U", 10, activation.instances, definition, calm).effectiveDelta, 12);
+});
+
 test("resolves all-bound non-character fields to exact scope keys", () => {
   const field = characterField({ scope: "group", bindingIds: ["G"], initialValue: 20 });
   const definition = group([{
@@ -243,6 +322,41 @@ test("renders template and custom reasons as immutable safe snapshots", () => {
     template: "general",
     text: "T: Rain walk → Desire (message) {{constructor}}",
   });
+});
+
+test("rejects blank custom reason text before activating an effect instance", () => {
+  assert.throws(() => activateEffectGroup({
+    definition: triggerActorGroup(),
+    fields: [characterField()],
+    triggerActorId: "T",
+    instanceId: "active_blank_reason",
+    activatedAt: NOW,
+    reason: { mode: "custom", template: "general", text: "  " },
+  }), /MVU_EFFECT_REASON_EMPTY/);
+});
+
+test("migrates same-field multi-actor v2 effects into one field-first definition", () => {
+  const legacy = legacyDatasetFixture();
+  legacy.fields[0].bindingIds = ["actor_t", "actor_u"];
+  legacy.temporaryEffects[0].targets = [
+    { fieldId: "field_affinity", scope: "character", scopeKey: "character:actor_t" },
+    { fieldId: "field_affinity", scope: "character", scopeKey: "character:actor_u" },
+  ];
+
+  const first = migrateDatasetV2ToV3(legacy, Date.parse(NOW)).dataset;
+  const retry = migrateDatasetV2ToV3(legacy, Date.parse(NOW)).dataset;
+
+  assert.deepEqual(first, retry);
+  assert.deepEqual(first.effectGroups[0].fieldEffects, [{
+    id: "field_effect_effect_warm_0",
+    fieldId: "field_affinity",
+    actorSelector: { kind: "selected", actorIds: ["actor_t", "actor_u"] },
+    operations: [{ kind: "all_multiplier", value: 1.25, sources: ["manual", "natural", "per_turn", "rule", "ai"] }],
+  }]);
+  assert.deepEqual(first.activeEffects[0].resolvedTargets, [
+    { fieldId: "field_affinity", actorId: "actor_t", scope: "character", scopeKey: "character:actor_t" },
+    { fieldId: "field_affinity", actorId: "actor_u", scope: "character", scopeKey: "character:actor_u" },
+  ]);
 });
 
 test("validates field-first effect operations and resolved active targets", () => {
