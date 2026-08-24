@@ -81,6 +81,8 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
   const diagnostics: EffectDiagnostic[] = [];
   const resolvedTargets: ResolvedEffectTarget[] = [];
   const immediateChanges: ImmediateFieldChange[] = [];
+  const reason = resolveEffectReason({ reason: input.reason, variables: input.reasonVariables });
+  let activationBlocked = false;
 
   if (!input.definition.enabled) return { instances: [], immediateChanges, diagnostics };
 
@@ -88,6 +90,7 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
     const field = input.fields.find((candidate) => candidate.id === fieldEffect.fieldId);
     if (field === undefined || !field.enabled) continue;
     const targets = resolveTargets(field, fieldEffect.actorSelector, input.triggerActorId, input.definition.id, fieldEffect.id, diagnostics);
+    if (fieldEffect.actorSelector.kind === "trigger_actor" && targets.length === 0) activationBlocked = true;
     for (const target of targets) {
       resolvedTargets.push(target);
       const immediateDelta = fieldEffect.operations
@@ -101,8 +104,7 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
     }
   }
 
-  if (resolvedTargets.length === 0) return { instances: [], immediateChanges, diagnostics };
-  const reason = resolveEffectReason({ reason: input.reason, variables: input.reasonVariables });
+  if (activationBlocked || resolvedTargets.length === 0) return { instances: [], immediateChanges: [], diagnostics };
   return {
     instances: [{
       id: input.instanceId,
@@ -163,6 +165,9 @@ export function resolveEffectReason(input: {
   reason: EffectReasonInput;
   variables?: EffectReasonVariables;
 }): EffectReasonSnapshot {
+  if (input.reason.mode === "custom" && (input.reason.text?.trim().length ?? 0) === 0) {
+    throw new Error("MVU_EFFECT_REASON_EMPTY");
+  }
   const sourceText = input.reason.mode === "custom"
     ? input.reason.text?.trim() ?? ""
     : TEMPORARY_EFFECT_REASON_TEMPLATES[input.reason.template];

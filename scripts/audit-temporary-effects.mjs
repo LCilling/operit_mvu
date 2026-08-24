@@ -76,6 +76,31 @@ const v3EffectApplication = applyActiveEffects({
 assert.equal(v3EffectApplication.effectiveDelta, 6);
 assert.deepEqual(v3EffectApplication.effectIds, ["active_effect_effect_multi_rule_audit"]);
 
+const sameFieldActorsLegacy = structuredClone(seed);
+const secondActorId = "actor_effect_audit_u";
+sameFieldActorsLegacy.fields[0].bindingIds = [actorId, secondActorId];
+sameFieldActorsLegacy.autoRules[0].effects = [
+  { fieldId: firstField.id, delta: 3, temporaryEffectIds: ["effect_multi_rule_audit"] },
+];
+sameFieldActorsLegacy.temporaryEffects[0].targets = [
+  { fieldId: firstField.id, scope: firstField.scope, scopeKey: `character:${actorId}` },
+  { fieldId: firstField.id, scope: firstField.scope, scopeKey: `character:${secondActorId}` },
+];
+const sameFieldActorsV3 = migrateDatasetV2ToV3(sameFieldActorsLegacy, occurredAt).dataset;
+assert.equal(sameFieldActorsV3.effectGroups[0].fieldEffects.length, 1);
+assert.deepEqual(sameFieldActorsV3.effectGroups[0].fieldEffects[0].actorSelector, {
+  kind: "selected", actorIds: [actorId, secondActorId],
+});
+assert.deepEqual(sameFieldActorsV3.activeEffects[0].resolvedTargets.map((target) => target.scopeKey), [
+  `character:${actorId}`,
+  `character:${secondActorId}`,
+]);
+assert.equal(applyActiveEffects({
+  field: sameFieldActorsLegacy.fields[0], actorId: secondActorId, source: "rule", sourceDelta: 3,
+  currentValue: firstField.initialValue, activeEffects: sameFieldActorsV3.activeEffects,
+  effectGroups: sameFieldActorsV3.effectGroups, occurredAt: new Date(occurredAt).toISOString(),
+}).effectiveDelta, 6);
+
 const runtime = createRuntime({ store: new InMemoryMvuStore(seed) });
 const result = await runtime.processPersistedMessage({
   context,
@@ -195,6 +220,7 @@ console.log(JSON.stringify({
   changedFields: result.records.map((record) => record.fieldId),
   migratedLegacyTargets: migrated.temporaryEffects[0].targets.length,
   v3EffectiveDelta: v3EffectApplication.effectiveDelta,
+  sameFieldActorTargets: sameFieldActorsV3.activeEffects[0].resolvedTargets.length,
   aiRuleMatches: aiEvaluation.matchedRules.length,
   result: "PASS",
 }, null, 2));
