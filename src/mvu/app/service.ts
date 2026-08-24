@@ -7,6 +7,7 @@ import {
   type AutomationMessageFacts,
 } from "./automation";
 import type {
+  AiRuleJudgement,
   DataActor,
   DataAutoRule,
   DataChangeRecord,
@@ -14,6 +15,7 @@ import type {
   DataLinkRule,
   DataStage,
   DataTemporaryEffect,
+  DataTemporaryEffectTarget,
   MessageAutomationSignals,
   MessageFact,
   MvuConfiguration,
@@ -37,10 +39,12 @@ import {
   scopeKey,
   stateValueForField,
 } from "./scope";
+import { temporaryEffectTargetMatchesContext } from "./temporary-effect";
 import type { MvuStore } from "./store";
 import { StaleRevisionError } from "./store";
 import {
   assertMvuDataset,
+  normalizeMvuDataset,
   validateAutoRule,
   validateConfiguration,
   validateDataField,
@@ -82,6 +86,7 @@ export interface PersistedMessageInput extends PersistedMessageIdentity {
   occurredAt: number;
   signals: MessageAutomationSignals;
   aiChanges: readonly PersistedAiChange[];
+  aiRuleJudgements: readonly AiRuleJudgement[];
 }
 
 export interface PersistedAiChange {
@@ -115,6 +120,8 @@ interface PendingFieldChange {
   delta: number;
   perTurn: boolean;
   autoRuleIds: string[];
+  autoRuleReasons: string[];
+  temporaryEffectIds: string[];
   aiReason: string | null;
   aiConfidence: number | null;
 }
@@ -219,6 +226,20 @@ export class MvuService {
     });
   }
 
+  async getApplicableAiRules(
+    context: StateScopeContext,
+    occurredAt: number
+  ): Promise<DataAutoRule[]> {
+    if (!Number.isFinite(occurredAt)) throw new Error("MVU_AI_RULE_TIME_INVALID");
+    const dataset = await this.getDataset();
+    const lastTriggered = dataset.ruleLastTriggered[automationScopeKey(context)] ?? {};
+    return klona(applicableAutoRules(dataset, context).filter((rule) => {
+      if (!rule.enabled || rule.condition.kind !== "aiJudgement") return false;
+      const last = lastTriggered[rule.id];
+      return last === undefined || occurredAt - last >= rule.cooldownMs;
+    }));
+  }
+
   async addField(field: Omit<DataField, "id" | "order">): Promise<DataField> {
     const created: DataField = { ...klona(field), id: makeId("field"), order: Date.now() };
     validateDataField(created);
@@ -250,9 +271,11 @@ export class MvuService {
           (fieldId) => fieldId !== id
         );
       }
-      draft.temporaryEffects = draft.temporaryEffects.filter((effect) =>
-        effect.targetFieldId !== id || temporaryEffectAppliesToField(effect, field)
+      draft.temporaryEffects = reconcileTemporaryEffectsForField(
+        draft.temporaryEffects,
+        field
       );
+      reconcileAutoRuleEffectImports(draft);
       validateConfiguration(draft);
       cleanRuntimeForConfiguration(draft);
     });
@@ -275,7 +298,8 @@ export class MvuService {
           effects: rule.effects.filter((effect) => effect.fieldId !== id),
         }))
         .filter((rule) => rule.effects.length > 0);
-      draft.temporaryEffects = draft.temporaryEffects.filter((effect) => effect.targetFieldId !== id);
+      draft.temporaryEffects = removeFieldFromTemporaryEffects(draft.temporaryEffects, id);
+      reconcileAutoRuleEffectImports(draft);
       removeFieldFromRuntimeMaps(draft, id);
       validateConfiguration(draft);
     });
@@ -310,7 +334,7 @@ export class MvuService {
   async addAutoRule(rule: Omit<DataAutoRule, "id">): Promise<DataAutoRule> {
     const created: DataAutoRule = { ...klona(rule), id: makeId("auto") };
     await this.mutate((draft) => {
-      validateAutoRule(created, draft.fields);
+      validateAutoRule(created, draft.fields, draft.temporaryEffects);
       draft.autoRules.push(created);
       validateConfiguration(draft);
     });
@@ -354,6 +378,7 @@ export class MvuService {
       const effect = draft.temporaryEffects.find((candidate) => candidate.id === id);
       if (effect === undefined) throw new Error(`MVU_EFFECT_NOT_FOUND:${id}`);
       Object.assign(effect, klona(patch));
+      reconcileAutoRuleEffectImports(draft);
       validateConfiguration(draft);
     });
   }
@@ -364,6 +389,7 @@ export class MvuService {
         throw new Error(`MVU_EFFECT_NOT_FOUND:${id}`);
       }
       draft.temporaryEffects = draft.temporaryEffects.filter((effect) => effect.id !== id);
+      reconcileAutoRuleEffectImports(draft);
     });
   }
 
@@ -394,8 +420,7 @@ export class MvuService {
 
   /** Import one complete v2 document while keeping the local CAS revision authoritative. */
   async replaceDataset(dataset: MvuDataset): Promise<void> {
-    const next = klona(dataset);
-    assertMvuDataset(next);
+    const next = normalizeMvuDataset(klona(dataset));
     await this.mutate((draft) => {
       const currentRevision = draft.revision;
       Object.assign(draft, next);
@@ -433,6 +458,7 @@ export class MvuService {
           source: input.source,
           requestedDelta: input.value - before,
           ruleIds: input.ruleIds,
+          temporaryEffectIds: [],
           confidence: input.confidence,
           messageId: input.messageId,
           variantId: input.variantId,
@@ -527,6 +553,7 @@ export class MvuService {
           source: "natural",
           requestedDelta,
           ruleIds: [],
+          temporaryEffectIds: null,
           confidence: null,
           messageId,
           variantId,
@@ -556,6 +583,7 @@ export class MvuService {
       }
 
       validateAiChangesForDataset(draft, input.context, input.aiChanges);
+      validateAiRuleJudgementsForDataset(draft, input.aiRuleJudgements);
       expireTemporaryEffects(draft, input.occurredAt);
       const records = await this.settleNaturalDraft(
         draft,
@@ -570,11 +598,20 @@ export class MvuService {
       const eventKey = automationScopeKey(input.context);
       const autoResult = evaluateAutoRules({
         rules: applicableAutoRules(draft, input.context),
-        facts: automationFacts(input, stateValues),
+        facts: automationFacts(input, stateValues, input.aiRuleJudgements),
         lastTriggeredAtByRuleId: draft.ruleLastTriggered[eventKey] ?? {},
       });
       for (const effect of autoResult.effects) {
-        addPendingDelta(pending, effect.fieldId, effect.delta, false, effect.ruleId);
+        addPendingDelta(
+          pending,
+          effect.fieldId,
+          effect.delta,
+          false,
+          effect.ruleId,
+          effect.temporaryEffectIds,
+          effect.triggerReason,
+          effect.triggerConfidence
+        );
       }
 
       records.push(...await this.applyPendingChangesDraft(
@@ -648,7 +685,11 @@ export class MvuService {
       }
       if (ruleIds.length > 0) {
         source = "rule";
-        reason = aiReason === null ? "消息规则结算" : `${aiReason}；消息规则结算`;
+        const ruleReasons = pendingChange?.autoRuleReasons ?? [];
+        const ruleReason = ruleReasons.length > 0
+          ? `AI 触发：${ruleReasons.join("、")}`
+          : "消息规则结算";
+        reason = aiReason === null ? ruleReason : `${aiReason}；${ruleReason}`;
       }
       const result = await applyMvuCommand(
         draft,
@@ -660,6 +701,9 @@ export class MvuService {
           source,
           requestedDelta: change.finalDelta,
           ruleIds,
+          temporaryEffectIds: ruleIds.length > 0
+            ? pendingChange?.temporaryEffectIds ?? []
+            : null,
           confidence: pendingChange?.aiConfidence ?? null,
           messageId,
           variantId,
@@ -711,6 +755,7 @@ export class MvuService {
           source: "rule",
           requestedDelta: linkedDelta,
           ruleIds: uniqueStrings(change.triggeredRuleIds),
+          temporaryEffectIds: [],
           confidence: null,
           messageId,
           variantId,
@@ -864,7 +909,7 @@ function remapFieldRange(
     }
   }
   for (const effect of dataset.temporaryEffects) {
-    if (effect.targetFieldId === field.id && effect.mode === "additive") {
+    if (effect.targets.some((target) => target.fieldId === field.id) && effect.mode === "additive") {
       effect.value = mapDelta(effect.value, `temporary_${effect.id}_delta`);
     }
   }
@@ -928,9 +973,12 @@ function cleanRuntimeForConfiguration(dataset: MvuDataset): void {
   for (const triggers of Object.values(dataset.ruleLastTriggered)) {
     for (const ruleId of Object.keys(triggers)) if (!ruleIds.has(ruleId)) delete triggers[ruleId];
   }
-  dataset.temporaryEffects = dataset.temporaryEffects.filter((effect) =>
-    fieldsById.has(effect.targetFieldId)
-  );
+  dataset.temporaryEffects = dataset.temporaryEffects
+    .map((effect) => ({
+      ...effect,
+      targets: effect.targets.filter((target) => fieldsById.has(target.fieldId)),
+    }))
+    .filter((effect) => effect.targets.length > 0);
 }
 
 function runtimeKeyAppliesToField(key: string, field: DataField): boolean {
@@ -940,15 +988,52 @@ function runtimeKeyAppliesToField(key: string, field: DataField): boolean {
   return field.bindingIds.includes(key.slice(prefix.length));
 }
 
-function temporaryEffectAppliesToField(
-  effect: DataTemporaryEffect,
+function temporaryEffectTargetAppliesToField(
+  target: DataTemporaryEffectTarget,
   field: DataField
 ): boolean {
-  if (effect.scope !== field.scope) return false;
-  if (field.scope === "global") return effect.scopeKey === "global";
+  if (target.fieldId !== field.id || target.scope !== field.scope) return false;
+  if (field.scope === "global") return target.scopeKey === "global";
   const prefix = `${field.scope}:`;
-  return effect.scopeKey.startsWith(prefix) &&
-    field.bindingIds.includes(effect.scopeKey.slice(prefix.length));
+  return target.scopeKey.startsWith(prefix) &&
+    field.bindingIds.includes(target.scopeKey.slice(prefix.length));
+}
+
+function reconcileTemporaryEffectsForField(
+  effects: readonly DataTemporaryEffect[],
+  field: DataField
+): DataTemporaryEffect[] {
+  return effects
+    .map((effect) => ({
+      ...effect,
+      targets: effect.targets.filter((target) =>
+        target.fieldId !== field.id || temporaryEffectTargetAppliesToField(target, field)
+      ),
+    }))
+    .filter((effect) => effect.targets.length > 0);
+}
+
+function removeFieldFromTemporaryEffects(
+  effects: readonly DataTemporaryEffect[],
+  fieldId: string
+): DataTemporaryEffect[] {
+  return effects
+    .map((effect) => ({
+      ...effect,
+      targets: effect.targets.filter((target) => target.fieldId !== fieldId),
+    }))
+    .filter((effect) => effect.targets.length > 0);
+}
+
+function reconcileAutoRuleEffectImports(dataset: MvuDataset): void {
+  const effectsById = new Map(dataset.temporaryEffects.map((effect) => [effect.id, effect]));
+  for (const rule of dataset.autoRules) {
+    for (const result of rule.effects) {
+      result.temporaryEffectIds = result.temporaryEffectIds.filter((effectId) =>
+        effectsById.get(effectId)?.targets.some((target) => target.fieldId === result.fieldId) === true
+      );
+    }
+  }
 }
 
 function counterValue(counter: TurnCounter, field: DataField): number {
@@ -987,6 +1072,9 @@ function collectPerTurnDeltas(
       field.id,
       units * field.perTurnChange.amount,
       true,
+      null,
+      [],
+      null,
       null
     );
   }
@@ -998,13 +1086,18 @@ function addPendingDelta(
   fieldId: string,
   delta: number,
   perTurn: boolean,
-  autoRuleId: string | null
+  autoRuleId: string | null,
+  temporaryEffectIds: readonly string[],
+  autoRuleReason: string | null,
+  autoRuleConfidence: number | null
 ): void {
   if (!Number.isFinite(delta)) throw new Error(`MVU_PENDING_DELTA_INVALID:${fieldId}`);
   const current = pending.get(fieldId) ?? {
     delta: 0,
     perTurn: false,
     autoRuleIds: [],
+    autoRuleReasons: [],
+    temporaryEffectIds: [],
     aiReason: null,
     aiConfidence: null,
   };
@@ -1012,6 +1105,17 @@ function addPendingDelta(
   current.perTurn = current.perTurn || perTurn;
   if (autoRuleId !== null && !current.autoRuleIds.includes(autoRuleId)) {
     current.autoRuleIds.push(autoRuleId);
+  }
+  for (const effectId of temporaryEffectIds) {
+    if (!current.temporaryEffectIds.includes(effectId)) current.temporaryEffectIds.push(effectId);
+  }
+  if (autoRuleReason !== null && !current.autoRuleReasons.includes(autoRuleReason)) {
+    current.autoRuleReasons.push(autoRuleReason);
+  }
+  if (autoRuleConfidence !== null) {
+    current.aiConfidence = current.aiConfidence === null
+      ? autoRuleConfidence
+      : Math.max(current.aiConfidence, autoRuleConfidence);
   }
   if (!Number.isFinite(current.delta)) throw new Error(`MVU_PENDING_DELTA_OVERFLOW:${fieldId}`);
   pending.set(fieldId, current);
@@ -1029,6 +1133,8 @@ function collectAiDeltas(
       delta: 0,
       perTurn: false,
       autoRuleIds: [],
+      autoRuleReasons: [],
+      temporaryEffectIds: [],
       aiReason: null,
       aiConfidence: null,
     };
@@ -1060,6 +1166,23 @@ function validateAiChangesForDataset(
     }
     if (Math.abs(change.delta) > field.ai.maxDelta) {
       throw new Error(`MVU_AI_DELTA_EXCEEDED:${field.id}`);
+    }
+  }
+}
+
+function validateAiRuleJudgementsForDataset(
+  dataset: MvuDataset,
+  judgements: readonly AiRuleJudgement[]
+): void {
+  const seenRuleIds = new Set<string>();
+  for (const judgement of judgements) {
+    if (seenRuleIds.has(judgement.ruleId)) {
+      throw new Error(`MVU_AI_RULE_JUDGEMENT_DUPLICATE:${judgement.ruleId}`);
+    }
+    seenRuleIds.add(judgement.ruleId);
+    const rule = dataset.autoRules.find((candidate) => candidate.id === judgement.ruleId);
+    if (rule === undefined || rule.condition.kind !== "aiJudgement") {
+      throw new Error(`MVU_AI_RULE_JUDGEMENT_NOT_ALLOWED:${judgement.ruleId}`);
     }
   }
 }
@@ -1102,7 +1225,8 @@ function applicableLinkRules(dataset: MvuDataset, context: StateScopeContext): D
 
 function automationFacts(
   input: PersistedMessageInput,
-  stateValues: Readonly<Record<string, number>>
+  stateValues: Readonly<Record<string, number>>,
+  aiRuleJudgements: readonly AiRuleJudgement[]
 ): AutomationMessageFacts {
   return {
     occurredAt: input.occurredAt,
@@ -1122,6 +1246,10 @@ function automationFacts(
     specialDayDetected: input.signals.specialDayDetected === null
       ? undefined
       : input.signals.specialDayDetected,
+    aiRuleJudgements: Object.fromEntries(aiRuleJudgements.map((judgement) => [
+      judgement.ruleId,
+      judgement,
+    ])),
   };
 }
 
@@ -1151,6 +1279,7 @@ function validatePersistedMessageInput(input: PersistedMessageInput): void {
   if (!Number.isFinite(input.occurredAt)) throw new Error("MVU_MESSAGE_TIME_INVALID");
   validateScopeContext(input.context);
   validateAiChangeList(input.aiChanges);
+  validateAiRuleJudgementList(input.aiRuleJudgements);
   const numericSignals = [
     input.signals.recentPositiveCount,
     input.signals.lastInteractionAt,
@@ -1181,6 +1310,19 @@ function validateAiChangeList(changes: readonly PersistedAiChange[]): void {
       !Number.isFinite(change.delta) || !Number.isFinite(change.confidence) ||
       change.confidence < 0 || change.confidence > 1) {
       throw new Error("MVU_AI_CHANGE_INVALID");
+    }
+  }
+}
+
+function validateAiRuleJudgementList(judgements: readonly AiRuleJudgement[]): void {
+  if (!Array.isArray(judgements)) throw new Error("MVU_AI_RULE_JUDGEMENTS_INVALID");
+  for (const judgement of judgements) {
+    if (typeof judgement.ruleId !== "string" || judgement.ruleId.length === 0 ||
+      typeof judgement.matched !== "boolean" ||
+      !Number.isFinite(judgement.confidence) || judgement.confidence < 0 ||
+      judgement.confidence > 1 || typeof judgement.reason !== "string" ||
+      judgement.reason.trim().length === 0) {
+      throw new Error("MVU_AI_RULE_JUDGEMENT_INVALID");
     }
   }
 }
@@ -1221,16 +1363,7 @@ function expireTemporaryEffects(dataset: MvuDataset, occurredAt: number): void {
 }
 
 function effectMatchesContext(effect: DataTemporaryEffect, context: StateScopeContext): boolean {
-  switch (effect.scope) {
-    case "global":
-      return effect.scopeKey === "global";
-    case "character":
-      return context.actorId !== null && effect.scopeKey === `character:${context.actorId}`;
-    case "group":
-      return context.groupId !== null && effect.scopeKey === `group:${context.groupId}`;
-    case "chat":
-      return context.chatId !== null && effect.scopeKey === `chat:${context.chatId}`;
-  }
+  return effect.targets.some((target) => temporaryEffectTargetMatchesContext(target, context));
 }
 
 function consumeTemporaryEffectTurns(dataset: MvuDataset, context: StateScopeContext): void {

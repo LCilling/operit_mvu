@@ -16,12 +16,15 @@ import {
   scopeKey,
   stateValueForField,
 } from "./scope";
+import { resolveTemporaryEffectReason } from "./temporary-effect";
 
 export interface ApplyCommandAudit {
   reason: string;
   source: DataChangeRecord["source"];
   requestedDelta: number | null;
   ruleIds: readonly string[];
+  /** null selects every current matching effect; an array is an explicit result-level import. */
+  temporaryEffectIds: readonly string[] | null;
   confidence: number | null;
   messageId: string | null;
   variantId: string | null;
@@ -84,12 +87,23 @@ export async function applyMvuCommand(
   }
   const requestedDelta = audit.requestedDelta === null ? round(raw - before) : round(audit.requestedDelta);
   if (requestedDelta === 0) return { changed: false };
+  if (audit.source === "manual" && audit.temporaryEffectIds === null) {
+    throw new Error("MVU_MANUAL_EFFECT_SELECTION_REQUIRED");
+  }
+  const selectedEffectIds = audit.temporaryEffectIds === null
+    ? null
+    : new Set(audit.temporaryEffectIds);
+  if (selectedEffectIds !== null && selectedEffectIds.size !== audit.temporaryEffectIds?.length) {
+    throw new Error("MVU_EFFECT_SELECTION_DUPLICATE");
+  }
   const activeEffects = dataset.temporaryEffects.filter((effect) =>
-    audit.source !== "manual" &&
+    (selectedEffectIds === null || selectedEffectIds.has(effect.id)) &&
     effect.enabled &&
-    effect.targetFieldId === field.id &&
-    effect.scope === field.scope &&
-    effect.scopeKey === scopeKey(field.scope, context) &&
+    effect.targets.some((target) =>
+      target.fieldId === field.id &&
+      target.scope === field.scope &&
+      target.scopeKey === scopeKey(field.scope, context)
+    ) &&
     (effect.expiresAt === null || effect.expiresAt > audit.occurredAt) &&
     (effect.remainingTurns === null || effect.remainingTurns > 0)
   );
@@ -112,6 +126,10 @@ export async function applyMvuCommand(
   dataset.stateValues[key][field.id] = after;
   const stageBefore = deriveStage(field, before);
   const stageAfter = deriveStage(field, after);
+  const effectReasons = [...new Set(activeEffects.map(resolveTemporaryEffectReason))];
+  const recordReason = effectReasons.length === 0
+    ? audit.reason
+    : `${audit.reason}；临时效果：${effectReasons.join("、")}`;
   const record: DataChangeRecord = {
     id: makeRecordId(audit.occurredAt),
     scope: field.scope,
@@ -129,7 +147,7 @@ export async function applyMvuCommand(
     delta: actualDelta,
     stageBefore: stageBefore.id,
     stageAfter: stageAfter.id,
-    reason: audit.reason,
+    reason: recordReason,
     source: audit.source,
     ruleIds: [...audit.ruleIds],
     effectIds: activeEffects.map((effect) => effect.id),

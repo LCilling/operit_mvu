@@ -148,6 +148,18 @@ async function processPersistedMessage(
     const recentFacts = await activeRuntime.getRecentMessageFacts(context);
     const dataset = await activeRuntime.dataset();
     const fields = await activeRuntime.service.projectFields(context);
+    const aiRules = await activeRuntime.service.getApplicableAiRules(context, payload.timestamp);
+    let aiRuleJudgements: Awaited<ReturnType<HostSystemModelApi["judgeRules"]>>["judgements"] = [];
+    if (aiRules.length > 0) {
+      const judgement = await ensureSystemModel().judgeRules({
+        context,
+        rules: aiRules,
+        fields,
+        recentFacts,
+        message: payload.content,
+      });
+      if (judgement.available) aiRuleJudgements = judgement.judgements;
+    }
     let aiChanges: Awaited<ReturnType<HostSystemModelApi["judgeState"]>>["changes"] = [];
     if (dataset.settings.aiEnabled && fields.some((projection) =>
       projection.bound && projection.definition.enabled && projection.definition.ai.enabled
@@ -170,6 +182,7 @@ async function processPersistedMessage(
       occurredAt: payload.timestamp,
       signals: automationSignalsForMessage(recentFacts, payload),
       aiChanges,
+      aiRuleJudgements,
     });
   } catch (error) {
     console.error("MVU persisted message processing failed", error);
@@ -211,7 +224,9 @@ export async function onSystemPromptCompose(
 
 async function buildActiveSnapshot(request: SnapshotRequest): Promise<MvuPageSnapshot> {
   try {
-    const hostSnapshot = await ToolPkg.chatContext.snapshot();
+    const hostSnapshot = await ToolPkg.chatContext.snapshot(
+      request.groupId === undefined ? undefined : { groupId: request.groupId }
+    );
     const synchronized = await synchronizeHostSnapshot(hostSnapshot);
     await settleContexts(synchronized.context, synchronized.members);
     const selectedContext = activeContextFromHostSnapshot(hostSnapshot, request.actorId);
@@ -220,7 +235,19 @@ async function buildActiveSnapshot(request: SnapshotRequest): Promise<MvuPageSna
       if (member.actorId === null) throw new Error("MVU_HOST_MEMBER_ACTOR_ID_MISSING");
       return member.actorId;
     });
-    return { ...snapshot, selectableActorIds };
+    const contextOwnerName = hostSnapshot.activeGroup?.name ??
+      hostSnapshot.activeCharacter?.name ??
+      hostSnapshot.activePrompt?.name ??
+      "";
+    return {
+      ...snapshot,
+      selectableActorIds,
+      groups: hostSnapshot.groups,
+      contextLabels: {
+        groupName: hostSnapshot.activeGroup?.name ?? null,
+        chatName: contextOwnerName.length > 0 ? `${contextOwnerName} 的会话` : "当前会话",
+      },
+    };
   } catch (error) {
     console.error("MVU active snapshot failed", error);
     throw error;

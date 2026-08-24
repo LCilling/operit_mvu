@@ -172,27 +172,27 @@ export const DEFAULT_AUTO_RULES: DataAutoRule[] = [
   {
     id: "auto_positive", name: "连续积极互动", description: "最近对话持续积极互动。",
     enabled: true, condition: { kind: "recentPositive", count: 6 },
-    effects: [{ fieldId: "field_affinity", delta: 4 }], cooldownMs: 6 * 3_600_000, order: 1,
+    effects: [{ fieldId: "field_affinity", delta: 4, temporaryEffectIds: [] }], cooldownMs: 6 * 3_600_000, order: 1,
   },
   {
     id: "auto_inactive", name: "长时间未交流", description: "超过一天没有交流。",
     enabled: true, condition: { kind: "longInactive", hours: 24 },
-    effects: [{ fieldId: "field_affinity", delta: -2 }], cooldownMs: 24 * 3_600_000, order: 2,
+    effects: [{ fieldId: "field_affinity", delta: -2, temporaryEffectIds: [] }], cooldownMs: 24 * 3_600_000, order: 2,
   },
   {
     id: "auto_care", name: "主动关心", description: "用户主动关心角色。",
     enabled: true, condition: { kind: "userCare" },
-    effects: [{ fieldId: "field_affinity", delta: 3 }], cooldownMs: 0, order: 3,
+    effects: [{ fieldId: "field_affinity", delta: 3, temporaryEffectIds: [] }], cooldownMs: 0, order: 3,
   },
   {
     id: "auto_special", name: "特别的日子", description: "角色的重要纪念日。",
     enabled: true, condition: { kind: "specialDay" },
-    effects: [{ fieldId: "field_affinity", delta: 10 }], cooldownMs: 0, order: 4,
+    effects: [{ fieldId: "field_affinity", delta: 10, temporaryEffectIds: [] }], cooldownMs: 0, order: 4,
   },
   {
     id: "auto_high_frequency", name: "高频互动", description: "一天内产生大量消息。",
     enabled: true, condition: { kind: "highFreq", messages: 20 },
-    effects: [{ fieldId: "field_excite", delta: 5 }], cooldownMs: 24 * 3_600_000, order: 5,
+    effects: [{ fieldId: "field_excite", delta: 5, temporaryEffectIds: [] }], cooldownMs: 24 * 3_600_000, order: 5,
   },
 ];
 

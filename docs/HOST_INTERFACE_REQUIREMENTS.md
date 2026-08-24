@@ -8,7 +8,7 @@
 
 | 宿主能力 | 当前接口 | MVU 用途 |
 | --- | --- | --- |
-| 聊天与角色上下文 | `ToolPkg.chatContext.snapshot({ chatId? })` | 字段绑定、作用域、角色组成员和头像 |
+| 聊天与角色上下文 | `ToolPkg.chatContext.snapshot({ chatId? \| groupId? })` | 字段绑定、作用域、群组目录、成员和头像 |
 | 已持久化消息事件 | `message_persisted` | 每轮变化、规则、记录和消息幂等 |
 | 系统默认模型 | `ToolPkg.systemModel.probe/complete` | 无聊天副作用的 AI 状态候选 |
 | Prompt 组合 | `registerSystemPromptComposeHook` | 仅向普通聊天追加当前状态投影 |
@@ -32,6 +32,12 @@ interface ChatContextMemberSnapshot extends ChatContextCharacterSnapshot {
   orderIndex: number;
 }
 
+interface ChatContextGroupSnapshot {
+  characterGroupId: string;
+  name: string;
+  avatarUri: string | null;
+}
+
 interface ChatContextSnapshot {
   chatId: string | null;
   activePrompt: {
@@ -40,17 +46,15 @@ interface ChatContextSnapshot {
     name: string;
   } | null;
   activeCharacter: ChatContextCharacterSnapshot | null;
-  activeGroup: {
-    characterGroupId: string;
-    name: string;
-  } | null;
+  activeGroup: ChatContextGroupSnapshot | null;
   characters: ChatContextCharacterSnapshot[];
+  groups: ChatContextGroupSnapshot[];
   members: ChatContextMemberSnapshot[];
   currentCharacter: ChatContextCharacterSnapshot | null;
 }
 
 interface ChatContextApi {
-  snapshot(request?: { chatId?: string }): Promise<ChatContextSnapshot>;
+  snapshot(request?: { chatId?: string; groupId?: string }): Promise<ChatContextSnapshot>;
 }
 ```
 
@@ -58,13 +62,14 @@ interface ChatContextApi {
 
 - `snapshot()` 使用当前 Operit 会话和当前 `activePrompt` 的稳定 ID。
 - `snapshot({ chatId })` 读取指定聊天的持久化绑定，适用于后台消息和打开非当前聊天的数据。
-- 参数只能省略或传对象。显式 `null`、数组、非对象、`chatId: null`、空白 `chatId` 都会拒绝。
+- `snapshot({ groupId })` 只读解析指定角色群组及其成员，不切换宿主当前提示词；非当前群组返回 `chatId: null`。
+- `chatId` 与 `groupId` 互斥。参数显式 `null`、数组、非对象、空白 ID 或两个 ID 同时出现都会拒绝。
 - 指定聊天绑定角色组时使用持久化 `characterGroupId`。
 - 指定单聊在旧持久化字段只有角色卡名称时，只有全局角色卡名称唯一匹配才返回稳定 `characterCardId`。
 - 缺失或歧义绑定不会猜测角色。快照保留请求的 `chatId` 和全局 `characters`，将 `activePrompt`、角色和组上下文设为 `null`，并由宿主记录警告。
 - 角色组没有宿主权威的持久化当前发言者，因此 `currentCharacter` 为 `null`，不得选成员第一项。
 
-`avatarUri` 来自 `UserPreferencesManager.getAiAvatarForCharacterCardFlow(id)`。宿主契约会透传真实 URI；MVU WebView 只开放 Android `content://` 读取能力，通用文件 URL 跨域访问仍关闭。最终头像显示必须使用宿主返回的 URI，不能在插件中改用假头像身份。
+角色与群组 `avatarUri` 分别来自 `UserPreferencesManager.getAiAvatarForCharacterCardFlow(id)` 和 `getAiAvatarForCharacterGroupFlow(id)`。宿主契约会透传真实 URI；MVU WebView 只开放 Android `content://` 读取能力，通用文件 URL 跨域访问仍关闭。最终头像显示必须使用宿主返回的 URI，不能在插件中改用假头像身份。
 
 ## `message_persisted`
 

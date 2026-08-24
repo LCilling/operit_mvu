@@ -855,6 +855,8 @@ export namespace ToolPkg {
     export interface ChatContextGroupSnapshot extends JsonObject {
         characterGroupId: string;
         name: string;
+        /** Host avatar URI; a UI surface still needs permission for its URI scheme. */
+        avatarUri: string | null;
     }
 
     export interface ChatContextActivePromptSnapshot extends JsonObject {
@@ -871,6 +873,8 @@ export namespace ToolPkg {
         activeGroup: ChatContextGroupSnapshot | null;
         /** All character cards available for field-binding selectors. */
         characters: ChatContextCharacterSnapshot[];
+        /** All character groups available for group-state and field-binding selectors. */
+        groups: ChatContextGroupSnapshot[];
         members: ChatContextMemberSnapshot[];
         /**
          * The active character for a character-card prompt. This is null for a group because the
@@ -882,6 +886,8 @@ export namespace ToolPkg {
     export interface ChatContextSnapshotRequest extends JsonObject {
         /** Omit to inspect the current active prompt; provide to resolve that persisted chat binding. */
         chatId?: string;
+        /** Resolve a character group without changing the host's active prompt. Mutually exclusive with chatId. */
+        groupId?: string;
     }
 
     export interface ChatContextApi {

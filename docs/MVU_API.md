@@ -20,6 +20,8 @@
 
 `pendingBootstrapFieldIds` 是 v2 文档中的必填、严格一次性元数据，不以空 `bindingIds` 猜测初始化状态。默认模板首次取得对应宿主稳定 ID 后即从列表移除；用户主动清空绑定、修改作用域、导入配置或后续出现新角色时都不会重新扩张绑定。完整数据集导入会严格保留文件中显式给出的待绑定列表，且列表必须通过字段存在、非全局作用域、尚无绑定和 ID 唯一性校验。
 
+已发布的 v2 数据可能包含单目标临时效果、效果级 `triggerSources` 和没有效果引用的旧自动规则结果。文件读取和完整数据导入会在严格校验前，把旧的 `targetFieldId/scope/scopeKey` 规范化为单元素 `targets`，移除错误归属于效果的触发来源，并为旧规则结果补充空的 `temporaryEffectIds`；`formatVersion` 不因此递增。后续提交和导出只写新的结果级引用结构。
+
 ## 作用域上下文
 
 ```ts
@@ -46,11 +48,53 @@ interface StateScopeContext {
 - 临时效果：`addTemporaryEffect`、`updateTemporaryEffect`、`deleteTemporaryEffect`
 - 状态变化：`setStateValue`、`applyCommand`、`settleNatural`
 - 已持久化消息：`processPersistedMessage`、`hasProcessedMessage`、`getRecentMessageFacts`
+- AI 规则候选：`getApplicableAiRules`
 - AI 候选：`applyAiJudgement`
 - 配置与数据：`exportConfiguration`、`replaceConfiguration`、`replaceDataset`、`updateSettings`
 - 查询与记录：`getFields`、`getRules`、`getAutoRules`、`getRecords`、`clearRecords`
 
 字段删除会同步清理当前值、自然变化锚点、轮次计数器、规则引用和临时效果；修改字段作用域或绑定时会在同一事务内删除已不再兼容的临时效果。既有变化记录保留其字段名与提交值，继续可读。
+
+临时效果使用以下规范结构：
+
+```ts
+interface DataTemporaryEffect {
+  id: string;
+  targets: Array<{ fieldId: string; scope: StateScope; scopeKey: string }>;
+  mode: "multiplier" | "additive";
+  value: number;
+  enabled: boolean;
+  expiresAt: number | null;
+  remainingTurns: number | null;
+  reasonMode: "template" | "custom";
+  reasonTemplate: "general" | "positive" | "negative" | "environment" | "relationship";
+  reason: string;
+  createdAt: number;
+}
+```
+
+`targets` 非空且按字段与作用键唯一，每个目标都必须匹配字段当前作用域和绑定。临时效果不拥有触发条件：自然变化、每轮变化和普通 AI 状态更新会使用当前有效且目标匹配的效果；手动设值不会套用效果；自动规则的每条字段结果只使用其 `temporaryEffectIds` 显式导入的当前有效效果。变化记录保存实际参与计算的 `effectIds`，并将解析后的默认模板原因或自定义原因追加到 `reason`。
+
+自动规则结果与 AI 条件使用以下核心结构：
+
+```ts
+type AutoRuleCondition =
+  | /* 既有确定性条件 */
+  | {
+      kind: "aiJudgement";
+      triggerType: string;
+      requirement: string;
+      minimumConfidence: number;
+    };
+
+interface AutoRuleEffect {
+  fieldId: string;
+  delta: number;
+  temporaryEffectIds: string[];
+}
+```
+
+`triggerType` 是可读分类，既可使用界面预设，也可自定义；`requirement` 描述模型必须观察到的事实。系统模型对同一消息中的候选 AI 规则执行一次批量严格 JSON Schema 判断，只返回 `ruleId/matched/confidence/reason`，不返回字段或变化值。服务在同一事务内再次校验规则 ID、置信度、冷却和作用域后，才执行规则预先保存的字段结果。
 
 字段上下限仍通过已发布的 `updateField({ id, patch })` 修改，不新增 IPC 名称。`patch` 中的 `minimum` 或 `maximum` 发生变化时，服务把旧范围到新范围视为一次量纲换算，在同一事务内按相对位置更新初始值、当前值、阶段阈值、字段步进、自然与每轮变化、AI 最大变化、联动与自动规则、加法临时效果以及该字段的历史数值。倍率、时间、置信度和阶段名称不变。任一换算产生非有限数值、阶段顺序丢失或不可表示的步进时，整个事务拒绝提交。
 
@@ -70,11 +114,11 @@ interface PersistedMessageIdentity {
 
 `processPersistedMessage` 只接收宿主已经持久化且 `isComplete` 的消息。幂等键由 `chatId`、`messageId` 和 `variantId` 共同构成；原始变体使用明确的 `null` 标签，与任何真实变体 ID 区分。时间戳不参与消息身份推导。
 
-一次消息事务依次执行自然时间结算、每轮变化、自动规则、AI 候选、状态联动、临时效果消耗、变化记录写入与幂等标记。任一步校验失败时整次事务不提交。
+一次消息事务依次执行自然时间结算、每轮变化、确定性/AI 自动规则、普通 AI 状态候选、状态联动、临时效果消耗、变化记录写入与幂等标记。任一步校验失败时整次事务不提交。
 
 ## AI 判断
 
-MVU 通过 `ToolPkg.systemModel` 调用 Operit 当前默认聊天模型，不选择或复制宿主模型配置，也不使用 `ToolPkg.localModels` 代替系统模型。
+MVU 通过 `ToolPkg.systemModel` 调用 Operit 当前默认聊天模型，不选择或复制宿主模型配置，也不使用 `ToolPkg.localModels` 代替系统模型。普通 AI 状态判断返回字段候选；AI 规则判断独立返回规则命中结果，两者都不能直接写入数据集。
 
 模型返回值先按严格 JSON 解析，再校验每一项的字段 ID、有限数值、置信度、字段 AI 开关、最小置信度与最大变化幅度。Markdown 代码块、说明文字、未知字段、重复字段、越界变化或无效数字均不能进入写入链。
 

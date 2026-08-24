@@ -12,6 +12,9 @@ import type {
   MvuSettings,
   TurnCounter,
 } from "./model";
+import {
+  TEMPORARY_EFFECT_REASON_TEMPLATES,
+} from "./temporary-effect";
 
 const STABLE_ID = /^[A-Za-z][A-Za-z0-9_]*$/;
 
@@ -113,6 +116,16 @@ function validateAutoCondition(
       if (!fieldIds.has(condition.fieldId)) fail(`MVU_AUTO_FIELD_NOT_FOUND:${ruleId}:${condition.fieldId}`);
       requireFinite(condition.threshold, `MVU_AUTO_CONDITION_INVALID:${ruleId}`);
       return;
+    case "aiJudgement":
+      if (condition.triggerType.trim().length === 0 || condition.triggerType.length > 80 ||
+        condition.requirement.trim().length === 0 || condition.requirement.length > 2_000) {
+        fail(`MVU_AUTO_AI_CONDITION_TEXT_INVALID:${ruleId}`);
+      }
+      requireFinite(condition.minimumConfidence, `MVU_AUTO_AI_CONFIDENCE_INVALID:${ruleId}`);
+      if (condition.minimumConfidence < 0 || condition.minimumConfidence > 1) {
+        fail(`MVU_AUTO_AI_CONFIDENCE_INVALID:${ruleId}`);
+      }
+      return;
     case "userCare":
     case "specialDay":
       return;
@@ -132,7 +145,11 @@ export function validateLinkRule(rule: DataLinkRule, fields: readonly DataField[
   }
 }
 
-export function validateAutoRule(rule: DataAutoRule, fields: readonly DataField[]): void {
+export function validateAutoRule(
+  rule: DataAutoRule,
+  fields: readonly DataField[],
+  temporaryEffects: readonly DataTemporaryEffect[]
+): void {
   requireStableId(rule.id, `MVU_AUTO_RULE_ID_INVALID:${rule.id}`);
   if (rule.name.trim().length === 0) fail(`MVU_AUTO_RULE_NAME_EMPTY:${rule.id}`);
   requireNonNegative(rule.cooldownMs, `MVU_AUTO_RULE_COOLDOWN_INVALID:${rule.id}`);
@@ -143,6 +160,16 @@ export function validateAutoRule(rule: DataAutoRule, fields: readonly DataField[
   for (const effect of rule.effects) {
     if (!fieldIds.has(effect.fieldId)) fail(`MVU_AUTO_EFFECT_FIELD_NOT_FOUND:${rule.id}:${effect.fieldId}`);
     requireFinite(effect.delta, `MVU_AUTO_EFFECT_DELTA_INVALID:${rule.id}:${effect.fieldId}`);
+    requireUnique(effect.temporaryEffectIds, `MVU_AUTO_EFFECT_IMPORT_DUPLICATE:${rule.id}:${effect.fieldId}`);
+    for (const temporaryEffectId of effect.temporaryEffectIds) {
+      const temporaryEffect = temporaryEffects.find((candidate) => candidate.id === temporaryEffectId);
+      if (temporaryEffect === undefined) {
+        fail(`MVU_AUTO_EFFECT_IMPORT_NOT_FOUND:${rule.id}:${temporaryEffectId}`);
+      }
+      if (!temporaryEffect.targets.some((target) => target.fieldId === effect.fieldId)) {
+        fail(`MVU_AUTO_EFFECT_IMPORT_TARGET_MISMATCH:${rule.id}:${temporaryEffectId}`);
+      }
+    }
   }
 }
 
@@ -151,16 +178,26 @@ export function validateTemporaryEffect(
   fields: readonly DataField[]
 ): void {
   requireStableId(effect.id, `MVU_EFFECT_ID_INVALID:${effect.id}`);
-  const field = fields.find((candidate) => candidate.id === effect.targetFieldId);
-  if (field === undefined) fail(`MVU_EFFECT_FIELD_NOT_FOUND:${effect.id}`);
-  if (field.scope !== effect.scope) fail(`MVU_EFFECT_SCOPE_MISMATCH:${effect.id}`);
-  const validScopeKey = effect.scope === "global"
-    ? effect.scopeKey === "global"
-    : effect.scopeKey.startsWith(`${effect.scope}:`) && effect.scopeKey.length > effect.scope.length + 1;
-  if (!validScopeKey) fail(`MVU_EFFECT_SCOPE_KEY_INVALID:${effect.id}`);
-  if (effect.scope !== "global") {
-    const bindingId = effect.scopeKey.slice(effect.scope.length + 1);
-    if (!field.bindingIds.includes(bindingId)) fail(`MVU_EFFECT_SCOPE_NOT_BOUND:${effect.id}`);
+  if (effect.targets.length === 0) fail(`MVU_EFFECT_TARGETS_EMPTY:${effect.id}`);
+  requireUnique(
+    effect.targets.map((target) => `${target.fieldId}\u0000${target.scopeKey}`),
+    `MVU_EFFECT_TARGET_DUPLICATE:${effect.id}`
+  );
+  for (const target of effect.targets) {
+    const field = fields.find((candidate) => candidate.id === target.fieldId);
+    if (field === undefined) fail(`MVU_EFFECT_FIELD_NOT_FOUND:${effect.id}:${target.fieldId}`);
+    if (field.scope !== target.scope) fail(`MVU_EFFECT_SCOPE_MISMATCH:${effect.id}:${target.fieldId}`);
+    const validScopeKey = target.scope === "global"
+      ? target.scopeKey === "global"
+      : target.scopeKey.startsWith(`${target.scope}:`) &&
+        target.scopeKey.length > target.scope.length + 1;
+    if (!validScopeKey) fail(`MVU_EFFECT_SCOPE_KEY_INVALID:${effect.id}:${target.fieldId}`);
+    if (target.scope !== "global") {
+      const bindingId = target.scopeKey.slice(target.scope.length + 1);
+      if (!field.bindingIds.includes(bindingId)) {
+        fail(`MVU_EFFECT_SCOPE_NOT_BOUND:${effect.id}:${target.fieldId}`);
+      }
+    }
   }
   requireFinite(effect.value, `MVU_EFFECT_VALUE_INVALID:${effect.id}`);
   if (effect.mode === "multiplier" && effect.value < 0) fail(`MVU_EFFECT_MULTIPLIER_INVALID:${effect.id}`);
@@ -171,7 +208,12 @@ export function validateTemporaryEffect(
     if (effect.enabled && effect.remainingTurns === 0) fail(`MVU_EFFECT_ENABLED_WITHOUT_TURNS:${effect.id}`);
   }
   requireNonNegative(effect.createdAt, `MVU_EFFECT_CREATED_INVALID:${effect.id}`);
-  if (effect.reason.trim().length === 0) fail(`MVU_EFFECT_REASON_EMPTY:${effect.id}`);
+  if (!(effect.reasonTemplate in TEMPORARY_EFFECT_REASON_TEMPLATES)) {
+    fail(`MVU_EFFECT_REASON_TEMPLATE_INVALID:${effect.id}`);
+  }
+  if (effect.reasonMode === "custom" && effect.reason.trim().length === 0) {
+    fail(`MVU_EFFECT_REASON_EMPTY:${effect.id}`);
+  }
 }
 
 function validateLinkGraph(rules: readonly DataLinkRule[]): void {
@@ -200,7 +242,9 @@ export function validateConfiguration(configuration: MvuConfiguration): void {
   for (const rule of configuration.rules) validateLinkRule(rule, configuration.fields);
   validateLinkGraph(configuration.rules);
   requireUnique(configuration.autoRules.map((rule) => rule.id), "MVU_AUTO_RULE_ID_DUPLICATE");
-  for (const rule of configuration.autoRules) validateAutoRule(rule, configuration.fields);
+  for (const rule of configuration.autoRules) {
+    validateAutoRule(rule, configuration.fields, configuration.temporaryEffects);
+  }
   requireUnique(configuration.temporaryEffects.map((effect) => effect.id), "MVU_EFFECT_ID_DUPLICATE");
   for (const effect of configuration.temporaryEffects) {
     validateTemporaryEffect(effect, configuration.fields);
@@ -210,6 +254,62 @@ export function validateConfiguration(configuration: MvuConfiguration): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Version 2 was already published with single-target temporary effects. Keep the
+ * document version stable while converting those records to the canonical
+ * multi-target shape before strict validation.
+ */
+export function normalizeMvuDataset(value: unknown): MvuDataset {
+  let normalized = value;
+  if (isRecord(value) && value.formatVersion === 2 && Array.isArray(value.temporaryEffects)) {
+    normalized = {
+      ...value,
+      temporaryEffects: value.temporaryEffects.map(normalizeLegacyTemporaryEffect),
+      autoRules: Array.isArray(value.autoRules)
+        ? value.autoRules.map(normalizeLegacyAutoRule)
+        : value.autoRules,
+    };
+  }
+  assertMvuDataset(normalized);
+  return normalized;
+}
+
+function normalizeLegacyTemporaryEffect(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const {
+    triggerSources: _legacyTriggerSources,
+    source: _legacySource,
+    targetFieldId,
+    scope,
+    scopeKey,
+    ...rest
+  } = value;
+  if (Array.isArray(value.targets)) return { ...rest, targets: value.targets };
+  if (typeof targetFieldId !== "string" || typeof scope !== "string" ||
+    typeof scopeKey !== "string") return value;
+  return {
+    ...rest,
+    targets: [{ fieldId: targetFieldId, scope, scopeKey }],
+    reasonMode: "custom",
+    reasonTemplate: "general",
+  };
+}
+
+function normalizeLegacyAutoRule(value: unknown): unknown {
+  if (!isRecord(value) || !Array.isArray(value.effects)) return value;
+  return {
+    ...value,
+    effects: value.effects.map((effect) => isRecord(effect)
+      ? {
+          ...effect,
+          temporaryEffectIds: Array.isArray(effect.temporaryEffectIds)
+            ? effect.temporaryEffectIds
+            : [],
+        }
+      : effect),
+  };
 }
 
 function isStringOrNull(value: unknown): value is string | null {
@@ -274,10 +374,16 @@ function assertAutoRuleShape(value: unknown): asserts value is DataAutoRule {
     (value.condition.operator !== ">=" && value.condition.operator !== "<=" && value.condition.operator !== ">" && value.condition.operator !== "<"))) {
     fail("INVALID_MVU_AUTO_CONDITION");
   }
+  if (kind === "aiJudgement" && (typeof value.condition.triggerType !== "string" ||
+    typeof value.condition.requirement !== "string" ||
+    !isFiniteNumber(value.condition.minimumConfidence))) fail("INVALID_MVU_AUTO_CONDITION");
   if (kind !== "recentPositive" && kind !== "longInactive" && kind !== "userCare" &&
-    kind !== "specialDay" && kind !== "highFreq" && kind !== "stateThreshold") fail("INVALID_MVU_AUTO_CONDITION");
+    kind !== "specialDay" && kind !== "highFreq" && kind !== "stateThreshold" &&
+    kind !== "aiJudgement") fail("INVALID_MVU_AUTO_CONDITION");
   for (const effect of value.effects) {
-    if (!isRecord(effect) || typeof effect.fieldId !== "string" || !isFiniteNumber(effect.delta)) {
+    if (!isRecord(effect) || typeof effect.fieldId !== "string" || !isFiniteNumber(effect.delta) ||
+      !Array.isArray(effect.temporaryEffectIds) ||
+      !effect.temporaryEffectIds.every((entry) => typeof entry === "string")) {
       fail("INVALID_MVU_AUTO_EFFECT");
     }
   }
@@ -288,15 +394,22 @@ function assertSettingsShape(value: unknown): asserts value is MvuSettings {
 }
 
 function assertTemporaryEffectShape(value: unknown): asserts value is DataTemporaryEffect {
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.targetFieldId !== "string" ||
-    (value.scope !== "character" && value.scope !== "group" && value.scope !== "global" && value.scope !== "chat") ||
-    typeof value.scopeKey !== "string" ||
+  if (!isRecord(value) || typeof value.id !== "string" || !Array.isArray(value.targets) ||
     (value.mode !== "multiplier" && value.mode !== "additive") || !isFiniteNumber(value.value) ||
     typeof value.enabled !== "boolean" || !(value.expiresAt === null || isFiniteNumber(value.expiresAt)) ||
     !(value.remainingTurns === null || isFiniteNumber(value.remainingTurns)) ||
+    (value.reasonMode !== "template" && value.reasonMode !== "custom") ||
+    (value.reasonTemplate !== "general" && value.reasonTemplate !== "positive" &&
+      value.reasonTemplate !== "negative" && value.reasonTemplate !== "environment" &&
+      value.reasonTemplate !== "relationship") ||
     typeof value.reason !== "string" ||
-    (value.source !== "manual" && value.source !== "rule" && value.source !== "ai") ||
     !isFiniteNumber(value.createdAt)) fail("INVALID_MVU_TEMPORARY_EFFECT");
+  for (const target of value.targets) {
+    if (!isRecord(target) || typeof target.fieldId !== "string" ||
+      (target.scope !== "character" && target.scope !== "group" &&
+        target.scope !== "global" && target.scope !== "chat") ||
+      typeof target.scopeKey !== "string") fail("INVALID_MVU_TEMPORARY_EFFECT_TARGET");
+  }
 }
 
 function assertRecordShape(value: unknown): asserts value is DataChangeRecord {

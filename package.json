@@ -7,10 +7,11 @@
   "packageManager": "pnpm@11.19.0",
   "scripts": {
     "audit": "node scripts/audit-web-ui.mjs",
+    "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "build:web": "node scripts/build-web.mjs",
-    "build": "pnpm run audit && pnpm run typecheck && pnpm run build:web",
-    "check": "pnpm run audit && pnpm run typecheck",
+    "build": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run build:web",
+    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects",
     "pack": "pnpm run build && node scripts/pack.mjs"
   },
   "devDependencies": {

@@ -82,11 +82,21 @@ export type AutoRuleCondition =
   | { kind: "userCare" }
   | { kind: "specialDay" }
   | { kind: "highFreq"; messages: number }
-  | { kind: "stateThreshold"; fieldId: string; operator: ">=" | "<=" | ">" | "<"; threshold: number };
+  | { kind: "stateThreshold"; fieldId: string; operator: ">=" | "<=" | ">" | "<"; threshold: number }
+  | {
+      kind: "aiJudgement";
+      /** Human-readable category; presets and custom values share the same backend contract. */
+      triggerType: string;
+      /** Concrete facts the model must observe before the rule can match. */
+      requirement: string;
+      minimumConfidence: number;
+    };
 
 export interface AutoRuleEffect {
   fieldId: string;
   delta: number;
+  /** Explicit temporary modifiers applied to this result after its rule matches. */
+  temporaryEffectIds: string[];
 }
 
 export interface DataAutoRule {
@@ -100,19 +110,41 @@ export interface DataAutoRule {
   order: number;
 }
 
-export interface DataTemporaryEffect {
-  id: string;
-  targetFieldId: string;
+export type TemporaryEffectReasonTemplate =
+  | "general"
+  | "positive"
+  | "negative"
+  | "environment"
+  | "relationship";
+
+export interface DataTemporaryEffectTarget {
+  fieldId: string;
   scope: StateScope;
   scopeKey: string;
+}
+
+export interface DataTemporaryEffect {
+  id: string;
+  /** One effect can modify several fields, including fields with different scopes. */
+  targets: DataTemporaryEffectTarget[];
   mode: "multiplier" | "additive";
   value: number;
   enabled: boolean;
   expiresAt: number | null;
   remainingTurns: number | null;
+  reasonMode: "template" | "custom";
+  reasonTemplate: TemporaryEffectReasonTemplate;
+  /** Required only for custom reasons. Template reasons are resolved by the backend. */
   reason: string;
-  source: "manual" | "rule" | "ai";
   createdAt: number;
+}
+
+/** One strict model judgement for an AI-driven automatic rule condition. */
+export interface AiRuleJudgement {
+  ruleId: string;
+  matched: boolean;
+  confidence: number;
+  reason: string;
 }
 
 export interface DataChangeRecord {

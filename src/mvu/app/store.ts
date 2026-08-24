@@ -7,7 +7,7 @@
  */
 import { klona } from "../port/util";
 import type { MvuDataset } from "./model";
-import { assertMvuDataset } from "./validation";
+import { assertMvuDataset, normalizeMvuDataset } from "./validation";
 
 export interface MvuStoreSnapshot {
   revision: number;
@@ -81,7 +81,7 @@ export class InMemoryMvuStore implements MvuStore {
   private snapshot: MvuStoreSnapshot;
 
   constructor(initial: MvuDataset = emptyDataset()) {
-    const dataset = klona(initial);
+    const dataset = normalizeMvuDataset(klona(initial));
     this.snapshot = snapshotOf(dataset);
   }
 
@@ -162,8 +162,7 @@ export class FileMvuStore implements MvuStore {
     }
 
     const raw = await this.files.readText(filePath);
-    const parsed: unknown = JSON.parse(raw);
-    assertMvuDataset(parsed);
+    const parsed = normalizeMvuDataset(JSON.parse(raw));
     return snapshotOf(parsed);
   }
 

@@ -1,5 +1,10 @@
 /** Strict adapter for Operit's one-shot system-model completion API. */
-import type { MessageFact, StateScopeContext } from "./model";
+import type {
+  AiRuleJudgement,
+  DataAutoRule,
+  MessageFact,
+  StateScopeContext,
+} from "./model";
 import type {
   FieldStateProjection,
   PersistedAiChange,
@@ -25,15 +30,34 @@ export interface StateJudgementResult {
   raw: string;
 }
 
+export interface RuleJudgementRequest {
+  context: StateScopeContext;
+  rules: readonly DataAutoRule[];
+  fields: readonly FieldStateProjection[];
+  recentFacts: readonly MessageFact[];
+  message: string;
+}
+
+export interface RuleJudgementResult {
+  available: boolean;
+  judgements: AiRuleJudgement[];
+  raw: string;
+}
+
 export interface SystemModelApi {
   probe(): Promise<BackgroundModelProbeResult>;
   judgeState(request: StateJudgementRequest): Promise<StateJudgementResult>;
+  judgeRules(request: RuleJudgementRequest): Promise<RuleJudgementResult>;
 }
 
 type SystemModelHostApi = Pick<ToolPkg.SystemModelApi, "probe" | "complete">;
 
 interface StrictJudgementDocument {
   changes: PersistedAiChange[];
+}
+
+interface StrictRuleJudgementDocument {
+  matches: AiRuleJudgement[];
 }
 
 const STATE_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
@@ -54,6 +78,31 @@ const STATE_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
             delta: { type: "number" },
             reason: { type: "string" },
             confidence: { type: "number", minimum: 0, maximum: 1 },
+          },
+        },
+      },
+    },
+  },
+};
+
+const RULE_JUDGEMENT_JSON_SCHEMA: ToolPkg.SystemModelJsonSchema = {
+  name: "mvu_rule_judgement",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["matches"],
+    properties: {
+      matches: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["ruleId", "matched", "confidence", "reason"],
+          properties: {
+            ruleId: { type: "string" },
+            matched: { type: "boolean" },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            reason: { type: "string" },
           },
         },
       },
@@ -116,6 +165,36 @@ export class HostSystemModelApi implements SystemModelApi {
       throw error;
     }
   }
+
+  async judgeRules(request: RuleJudgementRequest): Promise<RuleJudgementResult> {
+    const message = request.message.trim();
+    if (message.length === 0) throw new Error("MVU_AI_RULE_MESSAGE_EMPTY");
+    const rules = request.rules.filter((rule) =>
+      rule.enabled && rule.condition.kind === "aiJudgement"
+    );
+    if (rules.length === 0) throw new Error("MVU_AI_RULES_EMPTY");
+
+    const capability = await this.probe();
+    if (!capability.available) return { available: false, judgements: [], raw: "" };
+
+    try {
+      const completion = await this.host.complete({
+        systemPrompt: buildRuleJudgementSystemPrompt(request.context, rules, request.fields),
+        userPrompt: buildJudgementUserPrompt(request.recentFacts, message),
+        jsonSchema: RULE_JUDGEMENT_JSON_SCHEMA,
+      });
+      const document = parseStrictRuleJudgement(completion.text);
+      assertRuleJudgementTargets(document.matches, rules);
+      return {
+        available: true,
+        judgements: document.matches,
+        raw: completion.text,
+      };
+    } catch (error) {
+      console.error("MVU system model rule judgement failed", error);
+      throw error;
+    }
+  }
 }
 
 function buildJudgementSystemPrompt(
@@ -166,6 +245,43 @@ function buildJudgementUserPrompt(
   ].join("\n");
 }
 
+function buildRuleJudgementSystemPrompt(
+  context: StateScopeContext,
+  rules: readonly DataAutoRule[],
+  fields: readonly FieldStateProjection[]
+): string {
+  const fieldStates = fields
+    .filter((projection) => projection.bound && projection.currentValue !== null)
+    .map((projection) => ({
+      fieldId: projection.definition.id,
+      name: projection.definition.name,
+      value: projection.currentValue,
+      stage: projection.currentStage?.name ?? null,
+    }));
+  const ruleContract = rules.map((rule) => {
+    if (rule.condition.kind !== "aiJudgement") {
+      throw new Error(`MVU_AI_RULE_CONDITION_INVALID:${rule.id}`);
+    }
+    return {
+      ruleId: rule.id,
+      name: rule.name,
+      triggerType: rule.condition.triggerType,
+      requirement: rule.condition.requirement,
+      minimumConfidence: rule.condition.minimumConfidence,
+    };
+  });
+  return [
+    "你是自动规则触发判断器，只判断给定规则是否满足，不修改任何字段。",
+    "触发类型只是判断类别，触发要求是必须满足的事实；不得自行放宽要求。",
+    "只输出一个 JSON 对象，禁止 Markdown、代码围栏、解释或字段修改命令。",
+    'JSON 必须严格符合：{"matches":[{"ruleId":"规则ID","matched":true或false,"confidence":0到1数字,"reason":"简短事实理由"}]}。',
+    "每个候选规则必须恰好返回一次；未满足时 matched 为 false。不得输出未列出的规则。",
+    `上下文：${JSON.stringify(context)}`,
+    `当前状态：${JSON.stringify(fieldStates)}`,
+    `候选规则：${JSON.stringify(ruleContract)}`,
+  ].join("\n");
+}
+
 function parseStrictJudgement(raw: string): StrictJudgementDocument {
   const text = raw.trim();
   if (text.length === 0) throw new Error("MVU_AI_RESPONSE_EMPTY");
@@ -203,6 +319,42 @@ function parseStrictJudgement(raw: string): StrictJudgementDocument {
   return { changes };
 }
 
+function parseStrictRuleJudgement(raw: string): StrictRuleJudgementDocument {
+  const text = raw.trim();
+  if (text.length === 0) throw new Error("MVU_AI_RULE_RESPONSE_EMPTY");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    console.error("MVU system model returned invalid rule JSON", error);
+    throw new Error("MVU_AI_RULE_RESPONSE_JSON_INVALID");
+  }
+  if (!isRecord(parsed) || !hasExactKeys(parsed, ["matches"]) || !Array.isArray(parsed.matches)) {
+    throw new Error("MVU_AI_RULE_RESPONSE_SHAPE_INVALID");
+  }
+  const matches: AiRuleJudgement[] = parsed.matches.map((match, index) => {
+    if (!isRecord(match) ||
+      !hasExactKeys(match, ["ruleId", "matched", "confidence", "reason"]) ||
+      typeof match.ruleId !== "string" || match.ruleId.length === 0 ||
+      typeof match.matched !== "boolean" ||
+      typeof match.confidence !== "number" || !Number.isFinite(match.confidence) ||
+      match.confidence < 0 || match.confidence > 1 ||
+      typeof match.reason !== "string" || match.reason.trim().length === 0) {
+      throw new Error(`MVU_AI_RULE_RESPONSE_MATCH_INVALID:${index}`);
+    }
+    return {
+      ruleId: match.ruleId,
+      matched: match.matched,
+      confidence: match.confidence,
+      reason: match.reason.trim(),
+    };
+  });
+  if (new Set(matches.map((match) => match.ruleId)).size !== matches.length) {
+    throw new Error("MVU_AI_RULE_RESPONSE_DUPLICATE_RULE");
+  }
+  return { matches };
+}
+
 function assertJudgementTargets(
   changes: readonly PersistedAiChange[],
   fields: readonly FieldStateProjection[]
@@ -217,6 +369,19 @@ function assertJudgementTargets(
     }
     if (Math.abs(change.delta) > field.ai.maxDelta) {
       throw new Error(`MVU_AI_DELTA_EXCEEDED:${field.id}`);
+    }
+  }
+}
+
+function assertRuleJudgementTargets(
+  judgements: readonly AiRuleJudgement[],
+  rules: readonly DataAutoRule[]
+): void {
+  const ruleIds = new Set(rules.map((rule) => rule.id));
+  if (judgements.length !== rules.length) throw new Error("MVU_AI_RULE_RESPONSE_INCOMPLETE");
+  for (const judgement of judgements) {
+    if (!ruleIds.has(judgement.ruleId)) {
+      throw new Error(`MVU_AI_RULE_RESPONSE_RULE_NOT_ALLOWED:${judgement.ruleId}`);
     }
   }
 }
