@@ -1,4 +1,8 @@
-import { MAX_LINK_CHAIN_DEPTH } from "./automation";
+import {
+  MAX_LINK_CHAIN_DEPTH,
+  MAX_MESSAGE_FACTS_PER_SCOPE_V3,
+  MAX_PROCESSED_MESSAGE_IDS_V3,
+} from "./automation";
 import type {
   AutoRuleCondition,
   DataAutoRule,
@@ -22,6 +26,8 @@ import type {
   EffectGroupDefinition,
   EffectOperation,
   MvuDatasetV3,
+  RuleActorSelector,
+  RuleTargetSelector,
 } from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
@@ -481,11 +487,28 @@ function assertNestedCounterMap(value: unknown): asserts value is Record<string,
   }
 }
 
-function assertMessageFactsMap(value: unknown): asserts value is Record<string, MessageFact[]> {
+function assertMessageFactsMap(value: unknown, maximumFacts = 20): asserts value is Record<string, MessageFact[]> {
   if (!isRecord(value)) fail("INVALID_MVU_MESSAGE_FACTS");
   for (const entry of Object.values(value)) {
-    if (!Array.isArray(entry) || entry.length > 20) fail("INVALID_MVU_MESSAGE_FACTS");
+    if (!Array.isArray(entry) || entry.length > maximumFacts) fail("INVALID_MVU_MESSAGE_FACTS");
     for (const fact of entry) assertMessageFactShape(fact);
+  }
+}
+
+function assertHourlyMessageBucketsMap(value: unknown): void {
+  if (!isRecord(value)) fail("INVALID_MVU_V3_HOURLY_BUCKETS");
+  for (const buckets of Object.values(value)) {
+    if (!Array.isArray(buckets)) fail("INVALID_MVU_V3_HOURLY_BUCKETS");
+    let previous = -Infinity;
+    for (const bucket of buckets) {
+      if (!isRecord(bucket) || !isFiniteNumber(bucket.startedAt) ||
+        !Number.isInteger(bucket.startedAt) || bucket.startedAt < 0 || bucket.startedAt % 3_600_000 !== 0 ||
+        !isFiniteNumber(bucket.messageCount) || !Number.isInteger(bucket.messageCount) || bucket.messageCount <= 0 ||
+        bucket.startedAt <= previous) {
+        fail("INVALID_MVU_V3_HOURLY_BUCKETS");
+      }
+      previous = bucket.startedAt;
+    }
   }
 }
 
@@ -619,7 +642,15 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
   if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.fields) ||
     !Array.isArray(value.linkRules) || !Array.isArray(value.conditions) ||
     !Array.isArray(value.rules) || !Array.isArray(value.effectGroups) ||
-    !Array.isArray(value.activeEffects)) fail("INVALID_MVU_V3_DATASET");
+    !Array.isArray(value.activeEffects) || !Array.isArray(value.processedMessageIds) ||
+    value.processedMessageIds.length > MAX_PROCESSED_MESSAGE_IDS_V3 ||
+    !value.processedMessageIds.every((id) => typeof id === "string") ||
+    new Set(value.processedMessageIds).size !== value.processedMessageIds.length) {
+    fail("INVALID_MVU_V3_DATASET");
+  }
+  assertMessageFactsMap(value.messageFacts, MAX_MESSAGE_FACTS_PER_SCOPE_V3);
+  assertHourlyMessageBucketsMap(value.hourlyMessageBuckets);
+  assertNestedNumberMap(value.ruleLastTriggered);
 
   const conditionIds = new Set<string>();
   const aiPredicateIds = new Set<string>();
@@ -639,23 +670,39 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     return field;
   });
   const effectGroupIds = new Set<string>();
+  const effectGroups: EffectGroupDefinition[] = [];
   for (const effectGroup of value.effectGroups) {
     if (!isRecord(effectGroup) || typeof effectGroup.id !== "string" || effectGroupIds.has(effectGroup.id)) {
       fail("INVALID_MVU_V3_EFFECT_GROUP");
     }
     assertEffectGroupDefinitionShape(effectGroup, fields);
     effectGroupIds.add(effectGroup.id);
+    effectGroups.push(effectGroup);
   }
+  const ruleIds = new Set<string>();
   for (const rule of value.rules) {
-    if (!isRecord(rule) || typeof rule.conditionId !== "string" || !conditionIds.has(rule.conditionId) ||
+    if (!isRecord(rule) || typeof rule.id !== "string" || !STABLE_ID.test(rule.id) || ruleIds.has(rule.id) ||
+      typeof rule.name !== "string" || typeof rule.description !== "string" || typeof rule.enabled !== "boolean" ||
+      typeof rule.conditionId !== "string" || !conditionIds.has(rule.conditionId) ||
+      !isFiniteNumber(rule.cooldownHours) || rule.cooldownHours < 0 ||
+      !isFiniteNumber(rule.executionOrder) || !isIsoTimestamp(rule.createdAt) || !isIsoTimestamp(rule.updatedAt) ||
       !Array.isArray(rule.actions)) fail("INVALID_MVU_V3_RULE");
+    assertRuleActorSelectorShape(rule.triggerActorSelector);
     for (const action of rule.actions) {
       if (!isRecord(action)) fail("INVALID_MVU_V3_RULE_ACTION");
       if (action.kind === "change_field") {
-        if (!Array.isArray(action.effectGroupIds) ||
+        const field = fields.find((candidate) => candidate.id === action.fieldId);
+        if (field === undefined || !isFiniteNumber(action.delta) ||
+          !Array.isArray(action.effectGroupIds) ||
           !action.effectGroupIds.every((id) => typeof id === "string" && effectGroupIds.has(id))) {
           fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
         }
+        requireUnique(action.effectGroupIds, "INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
+        if (!action.effectGroupIds.every((id) => effectGroups.some((group) =>
+          group.id === id && group.fieldEffects.some((fieldEffect) => fieldEffect.fieldId === field.id)))) {
+          fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
+        }
+        assertRuleTargetSelectorShape(action.target, field);
       } else if (action.kind === "activate_effect_group") {
         if (typeof action.effectGroupId !== "string" || !effectGroupIds.has(action.effectGroupId)) {
           fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
@@ -664,6 +711,7 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
         fail("INVALID_MVU_V3_RULE_ACTION");
       }
     }
+    ruleIds.add(rule.id);
   }
   const activeEffectIds = new Set<string>();
   for (const instance of value.activeEffects) {
@@ -673,6 +721,43 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     assertActiveEffectInstanceShape(instance, fields);
     activeEffectIds.add(instance.id);
   }
+}
+
+function assertRuleActorSelectorShape(value: unknown): asserts value is RuleActorSelector {
+  if (!isRecord(value) || typeof value.kind !== "string") fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+  if (value.kind === "any" || value.kind === "current_actor") return;
+  if (value.kind === "selected") {
+    if (!Array.isArray(value.actorIds) || value.actorIds.length === 0 ||
+      !value.actorIds.every((id) => typeof id === "string" && id.length > 0)) {
+      fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+    }
+    requireUnique(value.actorIds, "INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+    return;
+  }
+  if (value.kind === "group") {
+    if (!Array.isArray(value.groupIds) || value.groupIds.length === 0 ||
+      !value.groupIds.every((id) => typeof id === "string" && id.length > 0)) {
+      fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+    }
+    requireUnique(value.groupIds, "INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+    return;
+  }
+  fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+}
+
+function assertRuleTargetSelectorShape(value: unknown, field: DataField): asserts value is RuleTargetSelector {
+  if (!isRecord(value) || typeof value.kind !== "string") fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
+  if (value.kind === "all_bound") return;
+  if (value.kind === "trigger_actor") {
+    if (field.scope !== "character") fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
+    return;
+  }
+  if (value.kind !== "selected" || field.scope !== "character" || !Array.isArray(value.actorIds) ||
+    value.actorIds.length === 0 ||
+    !value.actorIds.every((id) => typeof id === "string" && field.bindingIds.includes(id))) {
+    fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
+  }
+  requireUnique(value.actorIds, "INVALID_MVU_V3_RULE_TARGET_SELECTOR");
 }
 
 function assertEffectGroupDefinitionShape(

@@ -11,8 +11,39 @@ import type {
   DataAutoRule,
   DataLinkRule,
 } from "./model";
+import type { HourlyMessageBucket } from "./model-v3";
 
 export const MAX_LINK_CHAIN_DEPTH = 8;
+export const MAX_PROCESSED_MESSAGE_IDS_V3 = 2_048;
+export const MAX_MESSAGE_FACTS_PER_SCOPE_V3 = 50;
+const HOUR_IN_MILLISECONDS = 3_600_000;
+
+/** Append one event to sorted hourly counters without consulting capped facts. */
+export function appendHourlyMessageBucket(
+  buckets: readonly HourlyMessageBucket[],
+  occurredAt: number,
+): HourlyMessageBucket[] {
+  requireFinite(occurredAt, "MVU_V3_HOURLY_BUCKET_TIME_INVALID");
+  const startedAt = Math.floor(occurredAt / HOUR_IN_MILLISECONDS) * HOUR_IN_MILLISECONDS;
+  const next = buckets.map((bucket) => ({ ...bucket }));
+  const existing = next.find((bucket) => bucket.startedAt === startedAt);
+  if (existing === undefined) {
+    next.push({ startedAt, messageCount: 1 });
+    next.sort((left, right) => left.startedAt - right.startedAt);
+  } else {
+    existing.messageCount += 1;
+  }
+  return next;
+}
+
+/** Build deterministic counters from every supplied fact before any fact cap. */
+export function hourlyMessageBucketsFromFacts(
+  facts: readonly { occurredAt: number }[],
+): HourlyMessageBucket[] {
+  let buckets: HourlyMessageBucket[] = [];
+  for (const fact of facts) buckets = appendHourlyMessageBucket(buckets, fact.occurredAt);
+  return buckets;
+}
 
 /** Facts derived by the host from one persisted-message evaluation window. */
 export interface AutomationMessageFacts {
