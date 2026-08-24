@@ -187,14 +187,24 @@ function actorMatches(
 }
 
 function cloneAction(action: RuleActionV3): RuleActionV3 {
-  if (action.kind === "activate_effect_group") return { ...action };
+  if (action.kind === "activate_effect_group") {
+    return { kind: "activate_effect_group", effectGroupId: action.effectGroupId };
+  }
   return {
-    ...action,
-    target: action.target.kind === "selected"
-      ? { kind: "selected", actorIds: [...action.target.actorIds] }
-      : { ...action.target },
+    kind: "change_field",
+    fieldId: action.fieldId,
+    target: cloneTargetSelector(action.target),
+    delta: action.delta,
     effectGroupIds: [...action.effectGroupIds],
   };
+}
+
+function cloneTargetSelector(
+  target: Extract<RuleActionV3, { kind: "change_field" }>["target"],
+): Extract<RuleActionV3, { kind: "change_field" }>["target"] {
+  if (target.kind === "selected") return { kind: "selected", actorIds: [...target.actorIds] };
+  if (target.kind === "trigger_actor") return { kind: "trigger_actor" };
+  return { kind: "all_bound" };
 }
 
 function timestamp(value: string | number): number | null {

@@ -43,6 +43,7 @@ export function conditionContextFixture(overrides = {}) {
     now: "2033-05-18T03:33:20.000Z",
     fieldValues: { field_affinity: 30, field_excite: 20 },
     messageFacts: [],
+    currentMessage: null,
     ...overrides,
   };
 }

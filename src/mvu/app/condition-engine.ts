@@ -24,6 +24,7 @@ export interface ConditionEvaluationContext {
   fieldValues: Readonly<Record<string, number>>;
   messageFacts: readonly MessageFact[];
   hourlyMessageBuckets: readonly HourlyMessageBucket[];
+  currentMessage: MessageFact | null;
   aiSemanticResults?: Readonly<Record<string, AiSemanticResult | undefined>>;
 }
 
@@ -145,8 +146,7 @@ function evaluatePredicate(
       .filter((fact) => predicate.sender === undefined || fact.role === predicate.sender).length >= predicate.count);
     case "keywords": return matches(matchesKeywords(predicate, context.messageFacts, now));
     case "sender": {
-      const fact = latestFact(context.messageFacts);
-      return matches(fact !== undefined && predicate.senders.includes(fact.role));
+      return matches(context.currentMessage !== null && predicate.senders.includes(context.currentMessage.role));
     }
     case "actor": return matches(context.actorId !== null && predicate.actorIds.includes(context.actorId));
     case "group": return matches(context.groupId !== null && predicate.groupIds.includes(context.groupId));
@@ -207,12 +207,6 @@ function latestInteraction(facts: readonly MessageFact[]): number | null {
     typeof value === "number" && Number.isFinite(value)
   );
   return values.length === 0 ? null : Math.max(...values);
-}
-
-function latestFact(facts: readonly MessageFact[]): MessageFact | undefined {
-  return facts.reduce<MessageFact | undefined>((latest, fact) =>
-    latest === undefined || fact.occurredAt > latest.occurredAt ? fact : latest, undefined
-  );
 }
 
 function compare(value: number | undefined, operator: Extract<ConditionPredicate, { kind: "field_comparison" }>["operator"], expected: number): boolean {

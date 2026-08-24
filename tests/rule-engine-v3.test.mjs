@@ -85,14 +85,31 @@ function evaluationContext(overrides = {}) {
     fieldValues: { field_affinity: 50 },
     messageFacts: [messageFact()],
     hourlyMessageBuckets: [],
+    currentMessage: messageFact({ occurredAt: NOW }),
     ...overrides,
   };
+}
+
+function senderAndAiCondition(id, sender) {
+  return condition(id, {
+    kind: "and",
+    children: [
+      { kind: "predicate", predicate: { kind: "sender", senders: [sender] } },
+      { kind: "predicate", predicate: {
+        kind: "ai_semantic",
+        id: `${id}_ai`,
+        triggerType: "sender",
+        requirement: `${sender} event`,
+        minimumConfidence: 0.5,
+      } },
+    ],
+  });
 }
 
 function v3Dataset() {
   const legacy = legacyDatasetFixture();
   legacy.fields = [legacy.fields[0]];
-  legacy.fields[0].bindingIds = ["T", "U"];
+  legacy.fields[0].bindingIds = ["T", "U", "V"];
   legacy.fields[0].initialValue = 50;
   legacy.autoRules = [];
   legacy.temporaryEffects = [];
@@ -100,6 +117,7 @@ function v3Dataset() {
   dataset.stateValues = {
     "character:T": { field_affinity: 50 },
     "character:U": { field_affinity: 50 },
+    "character:V": { field_affinity: 50 },
   };
   return dataset;
 }
@@ -182,13 +200,15 @@ test("executeRulePlan keeps direct changes and effect activation as separate ord
     rule("rule_change", "condition_change", { kind: "any" }, [{
       kind: "change_field",
       fieldId: "field_affinity",
-      target: { kind: "trigger_actor" },
+      target: { kind: "trigger_actor", triggerCondition: "injected target data" },
       delta: 10,
       effectGroupIds: ["effect_group_focus"],
+      condition: { injected: true },
     }]),
     { ...rule("rule_effect", "condition_effect", { kind: "any" }, [{
       kind: "activate_effect_group",
       effectGroupId: "effect_group_focus",
+      triggerCondition: "injected action data",
     }]), executionOrder: -1 },
   ];
   const plan = planRuleEvaluation({
@@ -232,7 +252,9 @@ test("executeRulePlan keeps direct changes and effect activation as separate ord
     { ruleId: "rule_effect", triggeredAt: NOW },
     { ruleId: "rule_change", triggeredAt: NOW },
   ]);
-  assert.equal("condition" in result.actions[0], false);
+  assert.equal("triggerCondition" in result.actions[0].action, false);
+  assert.equal("condition" in result.actions[1].action, false);
+  assert.equal("triggerCondition" in result.actions[1].action.target, false);
 });
 
 test("one v3 message batches all AI predicates and applies T-only actions through the effect pipeline", async () => {
@@ -297,6 +319,7 @@ test("one v3 message batches all AI predicates and applies T-only actions throug
   });
   assert.equal(result.dataset.stateValues["character:T"].field_affinity, 25);
   assert.equal(result.dataset.stateValues["character:U"].field_affinity, 50);
+  assert.equal(result.dataset.stateValues["character:V"].field_affinity, 50);
   assert.equal(result.dataset.activeEffects.length, 1);
   assert.equal(result.dataset.activeEffects[0].triggerActorId, "T");
   assert.deepEqual(result.matchedRuleIds, ["rule_effect", "rule_change"]);
@@ -340,19 +363,36 @@ test("the v3 path caps identities and facts while preserving independent hourly 
   assert.equal(result.dataset.stateValues["character:T"].field_affinity, 51);
 });
 
-test("missing trigger actors skip before AI and never broaden actions", async () => {
+test("the v3 path creates a new UTC-hour bucket on rollover", async () => {
   const dataset = v3Dataset();
-  dataset.conditions = [aiCondition("condition_broadcast")];
-  dataset.rules = [rule("rule_broadcast", "condition_broadcast", { kind: "any" }, [{
+  const eventKey = automationScopeKey({ chatId: "chat_main", actorId: "T", groupId: "G", actorName: "T" });
+  const currentHour = Math.floor(NOW / HOUR) * HOUR;
+  dataset.hourlyMessageBuckets[eventKey] = [{ startedAt: currentHour - HOUR, messageCount: 3 }];
+
+  const result = await processPersistedMessageV3(persistedInput(dataset));
+
+  assert.deepEqual(result.dataset.hourlyMessageBuckets[eventKey], [
+    { startedAt: currentHour - HOUR, messageCount: 3 },
+    { startedAt: currentHour, messageCount: 1 },
+  ]);
+});
+
+test("missing trigger actors preserve all state and permit retry after actor resolution", async () => {
+  const dataset = v3Dataset();
+  dataset.conditions = [condition("condition_user", {
+    kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+  })];
+  dataset.rules = [rule("rule_retry", "condition_user", { kind: "any" }, [{
     kind: "change_field",
     fieldId: "field_affinity",
-    target: { kind: "all_bound" },
-    delta: 100,
+    target: { kind: "trigger_actor" },
+    delta: 1,
     effectGroupIds: [],
   }])];
+  const before = structuredClone(dataset);
   let calls = 0;
 
-  const result = await processPersistedMessageV3(persistedInput(dataset, {
+  const skipped = await processPersistedMessageV3(persistedInput(dataset, {
     context: { chatId: "chat_main", actorId: null, groupId: "G", actorName: "" },
     currentActorId: null,
     judgeConditions: async () => {
@@ -362,10 +402,39 @@ test("missing trigger actors skip before AI and never broaden actions", async ()
   }));
 
   assert.equal(calls, 0);
-  assert.equal(result.dataset.stateValues["character:T"].field_affinity, 50);
-  assert.equal(result.dataset.stateValues["character:U"].field_affinity, 50);
-  assert.deepEqual(result.matchedRuleIds, []);
-  assert.equal(result.diagnostics.some((entry) => entry.code === "MVU_RULE_TRIGGER_ACTOR_MISSING"), true);
+  assert.equal(skipped.duplicate, false);
+  assert.deepEqual(skipped.dataset, before);
+  assert.deepEqual(skipped.records, []);
+  assert.deepEqual(skipped.matchedRuleIds, []);
+  assert.deepEqual(skipped.diagnostics, [{ code: "MVU_RULE_TRIGGER_ACTOR_MISSING" }]);
+
+  const retried = await processPersistedMessageV3(persistedInput(skipped.dataset));
+
+  assert.equal(retried.duplicate, false);
+  assert.equal(retried.dataset.stateValues["character:T"].field_affinity, 51);
+  assert.equal(retried.dataset.stateValues["character:U"].field_affinity, 50);
+  assert.equal(retried.dataset.stateValues["character:V"].field_affinity, 50);
+  assert.equal(retried.dataset.processedMessageIds.length, 1);
+  assert.equal(Object.values(retried.dataset.messageFacts).flat().length, 1);
+  assert.equal(Object.values(retried.dataset.hourlyMessageBuckets).flat().reduce(
+    (sum, bucket) => sum + bucket.messageCount, 0), 1);
+});
+
+test("missing trigger actors emit diagnostics with zero or only disabled rules", async () => {
+  for (const rules of [[], [{ ...rule("rule_disabled", "condition_ai", { kind: "any" }), enabled: false }]]) {
+    const dataset = v3Dataset();
+    dataset.conditions = [aiCondition("condition_ai")];
+    dataset.rules = rules;
+    const before = structuredClone(dataset);
+
+    const result = await processPersistedMessageV3(persistedInput(dataset, {
+      context: { chatId: "chat_main", actorId: null, groupId: "G", actorName: "" },
+      currentActorId: null,
+    }));
+
+    assert.deepEqual(result.dataset, before);
+    assert.deepEqual(result.diagnostics, [{ code: "MVU_RULE_TRIGGER_ACTOR_MISSING" }]);
+  }
 });
 
 test("AI batch failure makes only AI predicates false and deterministic rules still execute", async () => {
@@ -390,6 +459,106 @@ test("AI batch failure makes only AI predicates false and deterministic rules st
   assert.equal(result.dataset.stateValues["character:T"].field_affinity, 54);
   assert.deepEqual(result.matchedRuleIds, ["rule_user"]);
   assert.equal(result.diagnostics.some((entry) => entry.code === "MVU_RULE_AI_BATCH_FAILED"), true);
+});
+
+test("current event sender wins over a prior fact with a newer timestamp before AI batching", async () => {
+  const dataset = v3Dataset();
+  const eventKey = automationScopeKey({ chatId: "chat_main", actorId: "T", groupId: "G", actorName: "T" });
+  dataset.messageFacts[eventKey] = [messageFact({
+    messageId: "future_character",
+    role: "character",
+    occurredAt: NOW + HOUR,
+  })];
+  dataset.conditions = [
+    senderAndAiCondition("condition_user_sender", "user"),
+    senderAndAiCondition("condition_character_sender", "character"),
+  ];
+  dataset.rules = [
+    rule("rule_user_sender", "condition_user_sender", { kind: "any" }),
+    rule("rule_character_sender", "condition_character_sender", { kind: "any" }),
+  ];
+  const requests = [];
+
+  await processPersistedMessageV3(persistedInput(dataset, {
+    role: "user",
+    judgeConditions: async (request) => {
+      requests.push(request);
+      return {
+        available: true,
+        judgements: request.predicates.map((predicate) => ({
+          predicateId: predicate.id, matched: false, confidence: 0,
+        })),
+        raw: "fixture",
+      };
+    },
+  }));
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].predicates.map((predicate) => predicate.id), ["condition_user_sender_ai"]);
+});
+
+test("current event sender wins over a prior equal-timestamp fact before AI batching", async () => {
+  const dataset = v3Dataset();
+  const eventKey = automationScopeKey({ chatId: "chat_main", actorId: "T", groupId: "G", actorName: "T" });
+  dataset.messageFacts[eventKey] = [messageFact({
+    messageId: "equal_character",
+    role: "character",
+    occurredAt: NOW,
+  })];
+  dataset.conditions = [
+    senderAndAiCondition("condition_user_equal", "user"),
+    senderAndAiCondition("condition_character_equal", "character"),
+  ];
+  dataset.rules = [
+    rule("rule_user_equal", "condition_user_equal", { kind: "any" }),
+    rule("rule_character_equal", "condition_character_equal", { kind: "any" }),
+  ];
+  const requests = [];
+
+  await processPersistedMessageV3(persistedInput(dataset, {
+    role: "user",
+    judgeConditions: async (request) => {
+      requests.push(request);
+      return {
+        available: true,
+        judgements: request.predicates.map((predicate) => ({
+          predicateId: predicate.id, matched: false, confidence: 0,
+        })),
+        raw: "fixture",
+      };
+    },
+  }));
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].predicates.map((predicate) => predicate.id), ["condition_user_equal_ai"]);
+});
+
+test("actor condition predicates suppress AI before the model call", async () => {
+  const dataset = v3Dataset();
+  dataset.conditions = [condition("condition_wrong_actor", {
+    kind: "and",
+    children: [
+      { kind: "predicate", predicate: { kind: "actor", actorIds: ["U"] } },
+      { kind: "predicate", predicate: {
+        kind: "ai_semantic",
+        id: "condition_wrong_actor_ai",
+        triggerType: "actor",
+        requirement: "U only",
+        minimumConfidence: 0.5,
+      } },
+    ],
+  })];
+  dataset.rules = [rule("rule_wrong_actor", "condition_wrong_actor", { kind: "any" })];
+  let calls = 0;
+
+  await processPersistedMessageV3(persistedInput(dataset, {
+    judgeConditions: async () => {
+      calls += 1;
+      throw new Error("must not run");
+    },
+  }));
+
+  assert.equal(calls, 0);
 });
 
 test("migration builds deterministic hourly buckets from uncapped legacy facts", () => {
@@ -442,18 +611,112 @@ test("HostSystemModelApi sends one strict role-aware condition batch", async () 
   ]);
 });
 
-test("v3 validation rejects malformed actor-bound rule actions", () => {
+test("v3 validation rejects each malformed actor-bound rule guarantee independently", () => {
   const dataset = v3Dataset();
   dataset.conditions = [condition("condition_user", {
     kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
   })];
-  dataset.rules = [rule("rule_invalid", "condition_user", { kind: "selected", actorIds: [] }, [{
+  dataset.rules = [rule("rule_valid", "condition_user", { kind: "selected", actorIds: ["T"] }, [{
     kind: "change_field",
-    fieldId: "missing_field",
-    target: { kind: "selected", actorIds: [] },
-    delta: Number.NaN,
+    fieldId: "field_affinity",
+    target: { kind: "selected", actorIds: ["T"] },
+    delta: 1,
     effectGroupIds: [],
   }])];
 
-  assert.throws(() => assertMvuDatasetV3(dataset), /INVALID_MVU_V3_RULE/);
+  const emptyTriggerSelection = structuredClone(dataset);
+  emptyTriggerSelection.rules[0].triggerActorSelector.actorIds = [];
+  assert.throws(() => assertMvuDatasetV3(emptyTriggerSelection), /INVALID_MVU_V3_RULE_ACTOR_SELECTOR/);
+
+  const missingField = structuredClone(dataset);
+  missingField.rules[0].actions[0].fieldId = "missing_field";
+  assert.throws(() => assertMvuDatasetV3(missingField), /INVALID_MVU_V3_RULE_EFFECT_REFERENCE/);
+
+  const emptyTargetSelection = structuredClone(dataset);
+  emptyTargetSelection.rules[0].actions[0].target.actorIds = [];
+  assert.throws(() => assertMvuDatasetV3(emptyTargetSelection), /INVALID_MVU_V3_RULE_TARGET_SELECTOR/);
+
+  const nonFiniteDelta = structuredClone(dataset);
+  nonFiniteDelta.rules[0].actions[0].delta = Number.NaN;
+  assert.throws(() => assertMvuDatasetV3(nonFiniteDelta), /INVALID_MVU_V3_RULE_EFFECT_REFERENCE/);
+});
+
+test("v3 validation rejects extra trigger-selector keys", () => {
+  const selectors = [
+    { kind: "any", condition: "injected" },
+    { kind: "current_actor", condition: "injected" },
+    { kind: "selected", actorIds: ["T"], condition: "injected" },
+    { kind: "group", groupIds: ["G"], condition: "injected" },
+  ];
+  for (const triggerActorSelector of selectors) {
+    const dataset = v3Dataset();
+    dataset.conditions = [condition("condition_user", {
+      kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+    })];
+    dataset.rules = [rule("rule_extra_selector", "condition_user", triggerActorSelector)];
+    assert.throws(() => assertMvuDatasetV3(dataset), /INVALID_MVU_V3_RULE_ACTOR_SELECTOR/);
+  }
+});
+
+test("v3 validation rejects extra target-selector keys", () => {
+  const targets = [
+    { kind: "trigger_actor", condition: "injected" },
+    { kind: "all_bound", condition: "injected" },
+    { kind: "selected", actorIds: ["T"], condition: "injected" },
+  ];
+  for (const target of targets) {
+    const dataset = v3Dataset();
+    dataset.conditions = [condition("condition_user", {
+      kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+    })];
+    dataset.rules = [rule("rule_extra_target", "condition_user", { kind: "any" }, [{
+      kind: "change_field",
+      fieldId: "field_affinity",
+      target,
+      delta: 1,
+      effectGroupIds: [],
+    }])];
+    assert.throws(() => assertMvuDatasetV3(dataset), /INVALID_MVU_V3_RULE_TARGET_SELECTOR/);
+  }
+});
+
+test("v3 validation rejects extra keys on each rule action variant", () => {
+  const changeDataset = v3Dataset();
+  changeDataset.conditions = [condition("condition_user", {
+    kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+  })];
+  changeDataset.rules = [rule("rule_extra_change", "condition_user", { kind: "any" }, [{
+    kind: "change_field",
+    fieldId: "field_affinity",
+    target: { kind: "trigger_actor" },
+    delta: 1,
+    effectGroupIds: [],
+    condition: "injected",
+  }])];
+  assert.throws(() => assertMvuDatasetV3(changeDataset), /INVALID_MVU_V3_RULE_ACTION/);
+
+  const activateDataset = v3Dataset();
+  activateDataset.effectGroups = [{
+    id: "effect_group_validation",
+    name: "Validation",
+    description: "",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_validation",
+      fieldId: "field_affinity",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [{ kind: "immediate_delta", value: 1 }],
+    }],
+    createdAt: NOW_ISO,
+    updatedAt: NOW_ISO,
+  }];
+  activateDataset.conditions = [condition("condition_user", {
+    kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+  })];
+  activateDataset.rules = [rule("rule_extra_activate", "condition_user", { kind: "any" }, [{
+    kind: "activate_effect_group",
+    effectGroupId: "effect_group_validation",
+    triggerCondition: "injected",
+  }])];
+  assert.throws(() => assertMvuDatasetV3(activateDataset), /INVALID_MVU_V3_RULE_ACTION/);
 });

@@ -23,6 +23,7 @@ function contextFor(actorId = "actor_t", overrides = {}) {
     fieldValues: { field_affinity: 30, field_excite: 20 },
     messageFacts: [],
     hourlyMessageBuckets: [],
+    currentMessage: null,
     aiSemanticResults: {},
     ...overrides,
   };
@@ -119,7 +120,8 @@ test("evaluates field comparisons, count windows, and keyword include-any/includ
 });
 
 test("evaluates sender, actor, group, inactivity, and concrete and repeating dates", () => {
-  const context = contextFor("actor_t", { messageFacts: [fact()] });
+  const currentMessage = fact();
+  const context = contextFor("actor_t", { messageFacts: [currentMessage], currentMessage });
 
   for (const predicate of [
     { kind: "sender", senders: ["user"] },

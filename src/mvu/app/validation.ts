@@ -273,6 +273,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...expected].sort();
+  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]);
+}
+
 /**
  * Version 2 was already published with single-target temporary effects. Keep the
  * document version stable while converting those records to the canonical
@@ -691,6 +697,9 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     for (const action of rule.actions) {
       if (!isRecord(action)) fail("INVALID_MVU_V3_RULE_ACTION");
       if (action.kind === "change_field") {
+        if (!hasExactKeys(action, ["kind", "fieldId", "target", "delta", "effectGroupIds"])) {
+          fail("INVALID_MVU_V3_RULE_ACTION");
+        }
         const field = fields.find((candidate) => candidate.id === action.fieldId);
         if (field === undefined || !isFiniteNumber(action.delta) ||
           !Array.isArray(action.effectGroupIds) ||
@@ -704,6 +713,7 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
         }
         assertRuleTargetSelectorShape(action.target, field);
       } else if (action.kind === "activate_effect_group") {
+        if (!hasExactKeys(action, ["kind", "effectGroupId"])) fail("INVALID_MVU_V3_RULE_ACTION");
         if (typeof action.effectGroupId !== "string" || !effectGroupIds.has(action.effectGroupId)) {
           fail("INVALID_MVU_V3_RULE_EFFECT_REFERENCE");
         }
@@ -725,9 +735,13 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
 
 function assertRuleActorSelectorShape(value: unknown): asserts value is RuleActorSelector {
   if (!isRecord(value) || typeof value.kind !== "string") fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
-  if (value.kind === "any" || value.kind === "current_actor") return;
+  if (value.kind === "any" || value.kind === "current_actor") {
+    if (!hasExactKeys(value, ["kind"])) fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
+    return;
+  }
   if (value.kind === "selected") {
-    if (!Array.isArray(value.actorIds) || value.actorIds.length === 0 ||
+    if (!hasExactKeys(value, ["kind", "actorIds"]) ||
+      !Array.isArray(value.actorIds) || value.actorIds.length === 0 ||
       !value.actorIds.every((id) => typeof id === "string" && id.length > 0)) {
       fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
     }
@@ -735,7 +749,8 @@ function assertRuleActorSelectorShape(value: unknown): asserts value is RuleActo
     return;
   }
   if (value.kind === "group") {
-    if (!Array.isArray(value.groupIds) || value.groupIds.length === 0 ||
+    if (!hasExactKeys(value, ["kind", "groupIds"]) ||
+      !Array.isArray(value.groupIds) || value.groupIds.length === 0 ||
       !value.groupIds.every((id) => typeof id === "string" && id.length > 0)) {
       fail("INVALID_MVU_V3_RULE_ACTOR_SELECTOR");
     }
@@ -747,12 +762,18 @@ function assertRuleActorSelectorShape(value: unknown): asserts value is RuleActo
 
 function assertRuleTargetSelectorShape(value: unknown, field: DataField): asserts value is RuleTargetSelector {
   if (!isRecord(value) || typeof value.kind !== "string") fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
-  if (value.kind === "all_bound") return;
-  if (value.kind === "trigger_actor") {
-    if (field.scope !== "character") fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
+  if (value.kind === "all_bound") {
+    if (!hasExactKeys(value, ["kind"])) fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
     return;
   }
-  if (value.kind !== "selected" || field.scope !== "character" || !Array.isArray(value.actorIds) ||
+  if (value.kind === "trigger_actor") {
+    if (!hasExactKeys(value, ["kind"]) || field.scope !== "character") {
+      fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
+    }
+    return;
+  }
+  if (value.kind !== "selected" || !hasExactKeys(value, ["kind", "actorIds"]) ||
+    field.scope !== "character" || !Array.isArray(value.actorIds) ||
     value.actorIds.length === 0 ||
     !value.actorIds.every((id) => typeof id === "string" && field.bindingIds.includes(id))) {
     fail("INVALID_MVU_V3_RULE_TARGET_SELECTOR");
