@@ -28,11 +28,26 @@ const THEME_OPTIONS = [
 ];
 
 const SCOPE_LABELS = {
-  character: "角色（独立）",
-  group: "群组（共享）",
-  global: "全局",
-  chat: "当前聊天"
+  character: "角色独立",
+  group: "群组共享",
+  global: "全局共享",
+  chat: "会话专属"
 };
+
+const SCOPE_DESCRIPTIONS = {
+  character: "每个已绑定角色分别维护一份状态值",
+  group: "群组成员共同读取和更新同一份状态值",
+  global: "所有角色、群组和会话共用同一份状态值",
+  chat: "只在绑定的对话中生效；选择后默认绑定当前会话"
+};
+
+const EFFECT_REASON_TEMPLATES = [
+  { value: "general", label: "临时影响", description: "通用的短期状态变化" },
+  { value: "positive", label: "临时增益", description: "积极事件带来的加成" },
+  { value: "negative", label: "临时减益", description: "压力或负面事件影响" },
+  { value: "environment", label: "情境影响", description: "场景、环境或时间因素" },
+  { value: "relationship", label: "关系事件", description: "互动与关系变化带来的影响" }
+];
 
 const MODEL_VISIBILITY_LABELS = {
   full: "完整状态",
@@ -54,11 +69,20 @@ const CONDITION_LABELS = {
   userCare: "用户主动关心",
   specialDay: "特别的日子",
   highFreq: "高频互动",
-  stateThreshold: "状态阈值"
+  stateThreshold: "状态阈值",
+  aiJudgement: "AI 自定义判断"
 };
 
+const AI_TRIGGER_PRESETS = [
+  { value: "情绪变化", label: "情绪变化", icon: "mood", hint: "识别明确的情绪转折" },
+  { value: "行为意图", label: "行为意图", icon: "ads_click", hint: "识别承诺、计划或行动" },
+  { value: "关系事件", label: "关系事件", icon: "favorite", hint: "识别关系中的关键互动" },
+  { value: "场景事件", label: "场景事件", icon: "event", hint: "识别特定情境或事件" },
+  { value: "__custom__", label: "自定义类型", icon: "edit", hint: "填写自己的判断类别" }
+];
+
 const SCREEN_META = {
-  home: { label: "动态状态", caption: "当前上下文的角色状态" },
+  home: { label: "动态状态", caption: "当前上下文的角色或群组状态" },
   detail: { label: "状态详情", caption: "数值、阶段、趋势与最近变化" },
   fields: { label: "字段设置", caption: "字段搜索、启用状态与绑定范围" },
   edit: { label: "编辑字段", caption: "数值字段、作用域、角色与初始值" },
@@ -68,9 +92,9 @@ const SCREEN_META = {
   effects: { label: "临时效果", caption: "当前数据集的临时倍率与增量" },
   effect: { label: "编辑临时效果", caption: "作用字段、范围、时效与启停" },
   ai: { label: "AI 自动更新", caption: "模型能力、判断参数与实际执行" },
-  advanced: { label: "高级选项", caption: "模型可见性、主题、图标与数据" },
+  advanced: { label: "高级选项", caption: "外观与数据导入导出" },
   rules: { label: "规则设置", caption: "自动规则列表" },
-  rule: { label: "编辑规则", caption: "条件、多个效果与冷却限制" },
+  rule: { label: "编辑规则", caption: "触发条件、字段结果与冷却限制" },
   records: { label: "记录", caption: "按角色、状态与来源筛选" },
   recordDetail: { label: "变化详情", caption: "真实时间、角色、来源与趋势" }
 };
@@ -87,6 +111,7 @@ const appState = {
   screen: requestedScreen && SCREEN_IDS.has(requestedScreen) ? requestedScreen : "home",
   fieldTab: "active",
   changeTab: "natural",
+  homeActorId: "",
   chartRange: "30",
   selectedFieldId: "",
   selectedRecordId: "",
@@ -330,11 +355,22 @@ function validateSnapshot(snapshot) {
     throw new Error("MVU_SNAPSHOT_SETTINGS_INVALID");
   }
   if (!Array.isArray(snapshot.actors)) throw new Error("MVU_SNAPSHOT_ACTORS_INVALID");
+  if (!Array.isArray(snapshot.groups) || snapshot.groups.some(function (group) {
+    return !group || typeof group.characterGroupId !== "string" ||
+      typeof group.name !== "string" ||
+      (group.avatarUri !== null && typeof group.avatarUri !== "string");
+  })) throw new Error("MVU_SNAPSHOT_GROUPS_INVALID");
   if (!Array.isArray(snapshot.selectableActorIds) ||
       snapshot.selectableActorIds.some(function (actorId) {
         return typeof actorId !== "string" || actorId.length === 0;
       })) {
     throw new Error("MVU_SNAPSHOT_SELECTABLE_ACTORS_INVALID");
+  }
+  if (!snapshot.contextLabels || typeof snapshot.contextLabels !== "object" ||
+      (snapshot.contextLabels.groupName !== null &&
+        typeof snapshot.contextLabels.groupName !== "string") ||
+      typeof snapshot.contextLabels.chatName !== "string") {
+    throw new Error("MVU_SNAPSHOT_CONTEXT_LABELS_INVALID");
   }
   const context = snapshot.activeContext;
   if (!context || typeof context !== "object") throw new Error("MVU_ACTIVE_CONTEXT_INVALID");
@@ -367,6 +403,50 @@ function temporaryEffects() {
   return appState.snapshot.temporaryEffects;
 }
 
+function effectTargets(effect) {
+  return Array.isArray(effect.targets) ? effect.targets : [];
+}
+
+function effectReasonLabel(effect) {
+  if (effect.reasonMode === "custom") return effect.reason.trim();
+  const template = EFFECT_REASON_TEMPLATES.find(function (item) {
+    return item.value === effect.reasonTemplate;
+  });
+  return template ? template.label : "临时影响";
+}
+
+function effectTargetFields(effect) {
+  return effectTargets(effect).map(function (target) {
+    return fieldById(target.fieldId);
+  }).filter(Boolean);
+}
+
+function effectTargetMatchesCurrentProjection(target) {
+  const projection = fieldProjectionById(target.fieldId);
+  return Boolean(projection && projection.bound && projection.scopeKey !== null &&
+    projection.scopeKey === target.scopeKey && projection.definition.scope === target.scope);
+}
+
+function effectTargetContextLabel(target) {
+  if (target.scope === "global") return "全部上下文";
+  const bindingId = target.scopeKey.slice(target.scope.length + 1);
+  if (target.scope === "character") {
+    const actor = appState.snapshot.actors.find(function (item) {
+      return item.characterId === bindingId;
+    });
+    return actor ? actor.name : "已绑定角色";
+  }
+  if (target.scope === "group") {
+    const group = appState.snapshot.groups.find(function (item) {
+      return item.characterGroupId === bindingId;
+    });
+    return group ? group.name : "已绑定群组";
+  }
+  return bindingId === appState.snapshot.activeContext.chatId
+    ? appState.snapshot.contextLabels.chatName
+    : "已绑定会话";
+}
+
 function requireField(fieldId) {
   const field = fieldById(fieldId);
   if (!field) throw new Error("MVU_FIELD_NOT_FOUND:" + fieldId);
@@ -392,9 +472,25 @@ function actorAvatarMarkup(actor, className, decorative) {
     escapeHtml(actor.name) + '头像">' + escapeHtml(initial) + "</span>";
 }
 
+function groupAvatarMarkup(group, className, decorative) {
+  const label = decorative ? "" : escapeHtml(group.name) + "头像";
+  if (typeof group.avatarUri === "string" && group.avatarUri.trim().length > 0) {
+    return '<img class="' + escapeHtml(className) + '" src="' + escapeHtml(group.avatarUri) +
+      '" alt="' + label + '">';
+  }
+  const initial = group.name.trim().slice(0, 1) || "·";
+  return '<span class="' + escapeHtml(className) + ' actor-avatar-placeholder" aria-label="' +
+    escapeHtml(group.name) + '头像">' + escapeHtml(initial) + "</span>";
+}
+
 function contextAvatarMarkup(className) {
   const actor = activeActor();
   if (actor) return actorAvatarMarkup(actor, className, false);
+  const groupId = appState.snapshot.activeContext.groupId;
+  const group = appState.snapshot.groups.find(function (item) {
+    return item.characterGroupId === groupId;
+  });
+  if (group) return groupAvatarMarkup(group, className, false);
   const name = appState.snapshot.activeContext.actorName;
   const initial = name.trim().slice(0, 1) || "·";
   return '<span class="' + escapeHtml(className) + ' actor-avatar-placeholder" aria-label="' +
@@ -573,7 +669,7 @@ function topBar(title, options) {
   const config = options || {};
   let left = '<span class="icon-button" aria-hidden="true"></span>';
   if (config.backScreen) {
-    left = '<button type="button" class="icon-button" data-action="go-back" data-back-screen="' +
+    left = '<button type="button" class="icon-button back-button" data-action="go-back" data-back-screen="' +
       escapeHtml(config.backScreen) + '" aria-label="返回">' + mi("arrow_back") + "</button>";
   } else if (config.menu) {
     left = '<button type="button" class="icon-button menu-button" data-action="open-drawer" aria-label="打开菜单">' +
@@ -597,7 +693,9 @@ function topBar(title, options) {
 function bottomNav(active) {
   const items = [
     { id: "home", icon: "favorite", label: "状态" },
-    { id: "fields", icon: "settings", label: "设置" },
+    { id: "fields", icon: "settings", label: "字段" },
+    { id: "rules", icon: "account_tree", label: "规则" },
+    { id: "effects", icon: "bolt", label: "效果" },
     { id: "records", icon: "article", label: "记录" }
   ];
   return '<nav class="bottom-nav" aria-label="插件主导航">' + items.map(function (item) {
@@ -610,6 +708,8 @@ function bottomNav(active) {
 
 function activeBottomNav() {
   if (appState.screen === "home" || appState.screen === "detail") return "home";
+  if (appState.screen === "rules" || appState.screen === "rule") return "rules";
+  if (appState.screen === "effects" || appState.screen === "effect") return "effects";
   if (appState.screen === "records" || appState.screen === "recordDetail") return "records";
   return "fields";
 }
@@ -649,8 +749,19 @@ function sectionTitle(title, trailing) {
     (trailing || "") + "</div>";
 }
 
+function editorSection(title, description, content, className) {
+  return '<section class="form-section editor-section ' + escapeHtml(className || "") + '">' +
+    '<header class="editor-section-heading"><h3>' + escapeHtml(title) + '</h3>' +
+    (description ? '<p>' + escapeHtml(description) + '</p>' : "") +
+    '</header>' + content + '</section>';
+}
+
 function segmentedTabs(items, active, attribute) {
-  return '<div class="segmented-tabs" role="tablist" style="--tabs:' + items.length + '">' +
+  const activeIndex = Math.max(0, items.findIndex(function (item) {
+    return item.id === active;
+  }));
+  return '<div class="segmented-tabs" role="tablist" style="--tabs:' + items.length +
+    ';--active-index:' + activeIndex + '">' +
     items.map(function (item) {
     const selected = item.id === active;
     return '<button type="button" role="tab" aria-selected="' + selected + '" class="' +
@@ -724,31 +835,35 @@ function temporaryEffectIsCurrent(effect) {
   if (!effect.enabled) return false;
   if (effect.expiresAt !== null && effect.expiresAt <= Date.now()) return false;
   if (effect.remainingTurns !== null && effect.remainingTurns <= 0) return false;
-  const projection = fieldProjectionById(effect.targetFieldId);
-  return Boolean(projection && projection.bound && projection.scopeKey !== null &&
-    projection.scopeKey === effect.scopeKey &&
-    projection.definition.scope === effect.scope);
+  return effectTargets(effect).some(effectTargetMatchesCurrentProjection);
 }
 
 function homeTemporaryEffectCard(effect) {
-  const field = fieldById(effect.targetFieldId);
+  const currentTargets = effectTargets(effect).filter(effectTargetMatchesCurrentProjection);
+  const fields = currentTargets.map(function (target) { return fieldById(target.fieldId); }).filter(Boolean);
+  const field = fields[0] || null;
   if (!field) {
     return '<button class="buff-row" data-effect-id="' + escapeHtml(effect.id) + '">' +
       mi("error") + '<span><strong>无效字段引用</strong><span>' +
-      escapeHtml(effect.reason) + '</span></span><span class="micro">' +
+      escapeHtml(effectReasonLabel(effect)) + '</span></span><span class="micro">' +
       escapeHtml(temporaryEffectDuration(effect)) + " " + mi("chevron_right") + "</span></button>";
   }
+  const targetLabel = fields.length === 1
+    ? field.name
+    : fields.slice(0, 2).map(function (item) { return item.name; }).join("、") +
+      (fields.length > 2 ? " 等 " + fields.length + " 项" : "");
   return '<button class="buff-row" data-effect-id="' + escapeHtml(effect.id) +
     '" style="--tone:' + requireThemeColor(field) + '">' +
-    mi(normalizeIconName(field.icon)) + '<span><strong>' + escapeHtml(field.name) +
+    mi(normalizeIconName(field.icon)) + '<span><strong>' + escapeHtml(targetLabel) +
     ' <span class="status-pill">临时效果</span></strong><span>' +
-    escapeHtml(effect.reason) + " · " + escapeHtml(temporaryEffectValue(effect)) +
+    escapeHtml(effectReasonLabel(effect)) + " · " + escapeHtml(temporaryEffectValue(effect)) +
     '</span></span><span class="micro">' + escapeHtml(temporaryEffectDuration(effect)) +
     " " + mi("chevron_right") + "</span></button>";
 }
 
 function renderHome() {
   const context = appState.snapshot.activeContext;
+  const groupMode = context.groupId !== null && context.actorId === null;
   const selectableActorIds = new Set(appState.snapshot.selectableActorIds);
   const actors = appState.snapshot.actors.filter(function (actor) {
     return actor.enabled && selectableActorIds.has(actor.characterId);
@@ -769,15 +884,34 @@ function renderHome() {
     return b.occurredAt - a.occurredAt;
   })[0] || null;
 
-  const roleStrip = '<div class="role-strip selectable-role-strip" role="group" aria-label="切换角色">' +
-    actors.map(function (actor) {
-      const active = context.actorId === actor.characterId;
-      return '<button type="button" class="role-chip ' + (active ? "active" : "") +
-        '" data-select-actor="' + escapeHtml(actor.characterId) +
-        '" aria-pressed="' + active + '" aria-label="切换到' + escapeHtml(actor.name) + '">' +
-        actorAvatarMarkup(actor, "role-chip-avatar", true) + "<span>" + escapeHtml(actor.name) +
-        "</span></button>";
-    }).join("") + "</div>";
+  const scopeTabs = context.groupId === null
+    ? ""
+    : '<div class="home-scope-switch">' + segmentedTabs([
+        { id: "character", label: "角色状态" },
+        { id: "group", label: "群组状态" }
+      ], groupMode ? "group" : "character", "data-home-scope") + "</div>";
+  const roleStrip = groupMode || actors.length === 0
+    ? ""
+    : '<div class="role-strip selectable-role-strip" role="group" aria-label="切换角色">' +
+      actors.map(function (actor) {
+        const active = context.actorId === actor.characterId;
+        return '<button type="button" class="role-chip ' + (active ? "active" : "") +
+          '" data-select-actor="' + escapeHtml(actor.characterId) +
+          '" aria-pressed="' + active + '" aria-label="切换到' + escapeHtml(actor.name) + '">' +
+          actorAvatarMarkup(actor, "role-chip-avatar", true) + "<span>" + escapeHtml(actor.name) +
+          "</span></button>";
+      }).join("") + "</div>";
+  const groupStrip = !groupMode || appState.snapshot.groups.length === 0
+    ? ""
+    : '<div class="role-strip selectable-role-strip selectable-group-strip" role="group" aria-label="切换群组">' +
+      appState.snapshot.groups.map(function (group) {
+        const active = context.groupId === group.characterGroupId;
+        return '<button type="button" class="role-chip group-chip ' + (active ? "active" : "") +
+          '" data-select-group="' + escapeHtml(group.characterGroupId) +
+          '" aria-pressed="' + active + '" aria-label="切换到' + escapeHtml(group.name) + '">' +
+          groupAvatarMarkup(group, "role-chip-avatar", true) + '<span>' + escapeHtml(group.name) +
+          "</span></button>";
+      }).join("") + "</div>";
 
   const banner = '<article class="character-banner">' +
     contextAvatarMarkup("character-avatar") +
@@ -808,7 +942,7 @@ function renderHome() {
       : "") +
     '<button class="button primary" data-action="new-field">' + mi("add") + "新增状态</button></div>";
 
-  return page(roleStrip + banner + cards + effects + actions, {
+  return page(scopeTabs + groupStrip + roleStrip + banner + cards + effects + actions, {
     title: "动态状态",
     top: {
       menu: true,
@@ -1115,12 +1249,14 @@ function themePicker(draft) {
 }
 
 function scopePicker(draft) {
-  return '<div class="option-grid two-by-two" role="group" aria-label="字段作用域">' +
+  const scopeIcons = { character: "person", group: "groups", global: "public", chat: "forum" };
+  return '<div class="scope-choice-grid" role="group" aria-label="字段作用域">' +
     Object.keys(SCOPE_LABELS).map(function (scope) {
-      return '<button class="option-chip ' + (draft.scope === scope ? "active" : "") +
+      return '<button class="scope-choice ' + (draft.scope === scope ? "active" : "") +
         '" data-field-scope="' + scope + '" aria-pressed="' + (draft.scope === scope) + '">' +
-        escapeHtml(SCOPE_LABELS[scope]) + "</button>";
-    }).join("") + "</div>";
+        mi(scopeIcons[scope]) + '<span>' + escapeHtml(SCOPE_LABELS[scope]) + "</span></button>";
+    }).join("") + '</div><p class="scope-choice-description">' +
+    escapeHtml(SCOPE_DESCRIPTIONS[draft.scope]) + "</p>";
 }
 
 function actorBindingPicker(draft) {
@@ -1150,21 +1286,56 @@ function currentBindingIdForScope(scope) {
   throw new Error("MVU_FIELD_SCOPE_INVALID:" + scope);
 }
 
-function nonCharacterBindingSummary(draft) {
+function contextBindingPicker(draft) {
   if (draft.scope === "global") {
-    return '<p class="form-hint">全局字段不需要绑定 ID。</p>';
+    return '<div class="scope-explainer">' + mi("all_inclusive") +
+      '<span><strong>无需绑定</strong><small>保存后立即对所有上下文生效，并共享同一份数值。</small></span></div>';
+  }
+  if (draft.scope === "group") {
+    const groups = appState.snapshot.groups;
+    if (groups.length === 0) {
+      return '<div class="scope-explainer warning">' + mi("link_off") +
+        '<span><strong>没有可绑定群组</strong><small>请先在 OperitAI 中创建角色群组。</small></span></div>';
+    }
+    const knownIds = new Set(groups.map(function (group) { return group.characterGroupId; }));
+    const hiddenCount = draft.bindingIds.filter(function (id) { return !knownIds.has(id); }).length;
+    return '<label class="field-label">绑定群组</label><div class="actor-bind-grid group-bind-grid" ' +
+      'role="group" aria-label="绑定群组">' + groups.map(function (group) {
+        const selected = draft.bindingIds.includes(group.characterGroupId);
+        return '<button class="actor-bind-chip group-bind-chip ' + (selected ? "active" : "") +
+          '" data-context-binding="' + escapeHtml(group.characterGroupId) + '" aria-pressed="' + selected + '">' +
+          groupAvatarMarkup(group, "actor-bind-avatar", true) + '<span>' + escapeHtml(group.name) +
+          '</span>' + mi(selected ? "check_circle" : "circle") + '</button>';
+      }).join("") + '</div>' + (hiddenCount > 0
+        ? '<p class="form-hint">另有 ' + hiddenCount + ' 个已失效或不可识别的旧群组绑定，保存后会保留。</p>'
+        : "");
   }
   const bindingId = currentBindingIdForScope(draft.scope);
   if (bindingId === null) {
-    return '<p class="form-hint">当前上下文没有可用的' +
-      escapeHtml(draft.scope === "group" ? "群组" : "聊天") + "标识。</p>";
+    return '<div class="scope-explainer warning">' + mi("link_off") +
+      '<span><strong>当前没有可绑定对象</strong><small>请先打开一个' +
+      escapeHtml(draft.scope === "group" ? "群聊" : "会话") + "，再保存此作用域。</small></span></div>";
   }
   const bound = draft.bindingIds.includes(bindingId);
-  const scopeName = draft.scope === "group" ? "当前群组" : "当前聊天";
-  return '<div class="setting-group compact-settings"><div class="setting-row"><span><strong>绑定' +
-    escapeHtml(scopeName) + '</strong><span class="description">' + escapeHtml(bindingId) +
-    '</span></span>' + toggleSwitch("data-context-binding", bindingId, bound, "绑定" + scopeName) +
-    "</div></div>";
+  const label = appState.snapshot.contextLabels.chatName;
+  const noun = "会话";
+  const otherCount = draft.bindingIds.filter(function (id) { return id !== bindingId; }).length;
+  const card = '<button class="context-bind-card ' + (bound ? "active" : "") +
+    '" data-context-binding="' + escapeHtml(bindingId) + '" aria-pressed="' + bound + '" aria-label="' +
+    escapeHtml((bound ? "取消绑定" : "绑定") + label) + '">' +
+    '<span class="context-bind-icon">' + mi("forum") + '</span>' +
+    '<span><strong>' + escapeHtml(label) + '</strong><small>' +
+    escapeHtml(bound ? "已绑定当前" + noun : "暂不生效，仅保存配置") + '</small></span>' +
+    mi(bound ? "check_circle" : "circle") + '</button>';
+  return '<label class="field-label">默认绑定</label>' + card +
+    '<details class="binding-advanced"><summary><span>' + mi("tune") +
+    '<strong>高级绑定设置</strong><small>创建模板或管理多个会话时使用</small></span>' +
+    mi("expand_more") + '</summary><div class="binding-advanced-body"><p>' +
+    (bound
+      ? "当前会话已自动绑定。取消后字段只作为模板保存，不会在本会话中生效。"
+      : "字段目前仅作为模板保存。重新选择上方会话即可恢复绑定。") +
+    '</p><span class="binding-count">' + mi("link") + '共绑定 ' +
+    draft.bindingIds.length + ' 个会话</span></div></details>';
 }
 
 function renderEdit() {
@@ -1178,24 +1349,18 @@ function renderEdit() {
       '<label>下限<input class="number-input" data-field-number="minimum" type="number" value="' +
       numberAttribute(draft.minimum) + '"></label><label>上限<input class="number-input" data-field-number="maximum" type="number" value="' +
       numberAttribute(draft.maximum) + '"></label></div>';
-  const persistedConfigurationLinks = appState.editingFieldId
-    ? '<button class="setting-row" data-action="open-change-settings"><span>' + mi("schedule") +
-      '<strong>自然与每轮变化</strong><span class="description">配置自动增减和状态联动</span></span><span class="value">' +
-      mi("chevron_right") + "</span></button>" +
-      '<button class="setting-row" data-action="open-ai-settings"><span>' + mi("magic_button") +
-      '<strong>AI 自动更新</strong><span class="description">置信度、幅度与判断提示</span></span><span class="value">' +
-      mi("chevron_right") + "</span></button>" +
-      '<button class="setting-row" data-action="open-advanced-settings"><span>' + mi("tune") +
-      '<strong>高级选项</strong><span class="description">模型可见性与数据管理</span></span><span class="value">' +
-      mi("chevron_right") + "</span></button>"
-    : '<p class="form-hint editor-save-hint">保存字段后可继续配置自动变化、AI 与高级选项。</p>';
-  const content = '<div class="editor-identity" style="--tone:' +
-    escapeHtml(draft.themeColor) + ";--tone-soft:" + softThemeColor(draft.themeColor) + '">' +
-    '<span class="state-icon large" style="--tone:' + escapeHtml(draft.themeColor) +
-    ";--tone-soft:" + softThemeColor(draft.themeColor) + '">' +
-    mi(normalizeIconName(draft.icon)) + '</span><span><strong>' +
-    escapeHtml(draft.name || "未命名字段") + '</strong><span>数值型动态字段</span></span></div>' +
-    '<section class="form-section"><h3>基础信息</h3>' +
+  const configTile = function (icon, label, description, action, disabled) {
+    return '<button class="config-tile" data-action="' + escapeHtml(action) + '"' +
+      (disabled ? " disabled" : "") + '><span class="config-tile-icon">' + mi(icon) +
+      '</span><span><strong>' + escapeHtml(label) + '</strong><small>' +
+      escapeHtml(description) + '</small></span>' + mi("chevron_right") + '</button>';
+  };
+  const persistedConfigurationLinks =
+    configTile("format_list_numbered", "阶段设置", draft.stages.length + " 个阶段", "edit-stages", false) +
+    configTile("schedule", "变化与联动", "自然、每轮和状态联动", "open-change-settings", !appState.editingFieldId) +
+    configTile("magic_button", "AI 自动更新", "判断、幅度和模型可见性", "open-ai-settings", !appState.editingFieldId) +
+    configTile("dashboard_customize", "数据与外观", "背景以及导入导出", "open-advanced-settings", false);
+  const basicSection = editorSection("基础信息", "定义字段名称、数值与启用状态",
     '<label class="field-label" for="fieldName">字段名称 *</label>' +
     '<input class="text-input" id="fieldName" data-field-input="name" maxlength="80" value="' +
     escapeHtml(draft.name) + '">' +
@@ -1211,19 +1376,34 @@ function renderEdit() {
     '<div class="setting-group compact-settings"><div class="setting-row"><span><strong>启用字段</strong>' +
     '<span class="description">停用后不参与状态更新</span></span>' +
     toggleSwitch("data-field-toggle", "enabled", draft.enabled, "启用字段") +
-    "</div></div></section>" +
-    '<section class="form-section"><h3>作用域</h3>' + scopePicker(draft) +
-    (draft.scope === "character"
-      ? '<label class="field-label">绑定角色</label>' + actorBindingPicker(draft)
-      : nonCharacterBindingSummary(draft)) +
-    "</section>" +
-    '<section class="form-section"><h3>图标</h3>' + iconPicker(draft) +
-    '<h3 class="subsection-heading">主题色</h3>' + themePicker(draft) + "</section>" +
-    '<section class="form-section"><h3>详细配置</h3><div class="config-link-list">' +
-    '<button class="setting-row" data-action="edit-stages"><span>' + mi("format_list_numbered") +
-    '<strong>阶段设置</strong><span class="description">' + draft.stages.length +
-    ' 个阶段</span></span><span class="value">' + mi("chevron_right") + "</span></button>" +
-    persistedConfigurationLinks + "</div></section>";
+    "</div></div>", "basic-editor-section");
+  const bindingContent = draft.scope === "character"
+    ? '<label class="field-label">绑定角色</label>' + actorBindingPicker(draft)
+    : contextBindingPicker(draft);
+  const scopeSection = editorSection("作用范围", "决定状态值由谁独立保存或共同使用",
+    scopePicker(draft) + '<div class="scope-binding-area">' + bindingContent + '</div>',
+    "scope-editor-section");
+  const appearanceSection = editorSection("字段外观", "统一设置状态卡使用的图标和强调色",
+    '<label class="field-label appearance-label">图标样式</label>' + iconPicker(draft) +
+    '<label class="field-label appearance-label theme-label">主题色</label>' + themePicker(draft),
+    "appearance-editor-section");
+  const detailSection = editorSection("详细配置", "按需进入，不影响基础字段的快速编辑",
+    '<div class="config-tile-grid">' + persistedConfigurationLinks + '</div>' +
+    (!appState.editingFieldId
+      ? '<p class="form-hint editor-save-hint">先保存字段，即可启用变化与 AI 配置。</p>'
+      : ""), "detail-editor-section");
+  const managementSection = appState.editingFieldId
+    ? '<section class="field-management"><button class="field-delete-action" data-action="delete-field">' +
+      mi("delete") + '<span><strong>删除字段</strong><small>相关规则与临时效果目标会同步清理</small></span>' +
+      mi("chevron_right") + '</button></section>'
+    : "";
+  const content = '<div class="editor-identity" style="--tone:' +
+    escapeHtml(draft.themeColor) + ";--tone-soft:" + softThemeColor(draft.themeColor) + '">' +
+    '<span class="state-icon large" style="--tone:' + escapeHtml(draft.themeColor) +
+    ";--tone-soft:" + softThemeColor(draft.themeColor) + '">' +
+    mi(normalizeIconName(draft.icon)) + '</span><span><strong>' +
+    escapeHtml(draft.name || "未命名字段") + '</strong><span>数值型动态字段</span></span></div>' +
+    basicSection + scopeSection + appearanceSection + detailSection + managementSection;
 
   return page(content, {
     title: title,
@@ -1425,16 +1605,22 @@ function fieldSelectOptions(selectedId) {
   }).join("");
 }
 
-function effectFieldSelectOptions(selectedId) {
-  return sortedFields().filter(function (field) {
-    if (field.id === selectedId) return true;
-    const projection = fieldProjectionById(field.id);
-    return Boolean(projection && projection.bound && projection.scopeKey !== null);
-  }).map(function (field) {
-    return '<option value="' + escapeHtml(field.id) + '"' +
-      (field.id === selectedId ? " selected" : "") + ">" +
-      escapeHtml(field.name) + "</option>";
-  }).join("");
+function availableEffectTargetOptions() {
+  return sortedFields().flatMap(function (field) {
+    if (field.scope === "global") {
+      return [{ field: field, target: { fieldId: field.id, scope: "global", scopeKey: "global" } }];
+    }
+    return field.bindingIds.map(function (bindingId) {
+      return {
+        field: field,
+        target: {
+          fieldId: field.id,
+          scope: field.scope,
+          scopeKey: field.scope + ":" + bindingId
+        }
+      };
+    });
+  });
 }
 
 function defaultLinkRuleDraft() {
@@ -1502,43 +1688,20 @@ function renderLinkRule() {
   });
 }
 
-function scopeKeyFor(scope) {
-  const context = appState.snapshot.activeContext;
-  if (scope === "global") return "global";
-  if (scope === "character") {
-    if (context.actorId === null) throw new Error("MVU_EFFECT_CHARACTER_CONTEXT_REQUIRED");
-    return "character:" + context.actorId;
-  }
-  if (scope === "group") {
-    if (context.groupId === null) throw new Error("MVU_EFFECT_GROUP_CONTEXT_REQUIRED");
-    return "group:" + context.groupId;
-  }
-  if (scope === "chat") {
-    if (context.chatId === null) throw new Error("MVU_EFFECT_CHAT_CONTEXT_REQUIRED");
-    return "chat:" + context.chatId;
-  }
-  throw new Error("MVU_EFFECT_SCOPE_INVALID:" + scope);
-}
-
 function defaultEffectDraft() {
-  const field = sortedFields().find(function (item) {
-    const projection = fieldProjectionById(item.id);
-    return projection && projection.bound && projection.scopeKey !== null;
-  });
-  if (!field) throw new Error("MVU_EFFECT_BOUND_FIELD_REQUIRED");
+  const firstOption = availableEffectTargetOptions()[0] || null;
   appState.effectDurationMode = "time";
   appState.effectDurationHours = 24;
   return {
-    targetFieldId: field.id,
-    scope: field.scope,
-    scopeKey: scopeKeyFor(field.scope),
+    targets: firstOption ? [cloneJson(firstOption.target)] : [],
     mode: "multiplier",
     value: 1.1,
     enabled: true,
     expiresAt: Date.now() + 86400000,
     remainingTurns: null,
+    reasonMode: "template",
+    reasonTemplate: "general",
     reason: "",
-    source: "manual",
     createdAt: Date.now()
   };
 }
@@ -1575,17 +1738,22 @@ function temporaryEffectCanToggle(effect) {
 }
 
 function managementEffectCard(effect) {
-  const field = fieldById(effect.targetFieldId);
+  const fields = effectTargetFields(effect);
+  const field = fields[0] || null;
   const status = effectStatus(effect);
   const icon = field ? normalizeIconName(field.icon) : "error";
   const tone = field ? requireThemeColor(field) : "#7058D8";
+  const targetNames = fields.length > 0
+    ? fields.map(function (item) { return item.name; }).join("、")
+    : "无效字段引用";
+  const targetMeta = fields.length > 1 ? fields.length + " 个目标 · " : "";
   return '<article class="temporary-effect-card" style="--tone:' + tone + '">' +
     '<button class="effect-card-main" data-effect-id="' + escapeHtml(effect.id) + '">' +
     '<span class="state-icon" style="--tone:' + tone + ";--tone-soft:" +
     softThemeColor(tone) + '">' + mi(icon) + '</span><span><strong>' +
-    escapeHtml(field ? field.name : "无效字段引用（" + effect.targetFieldId + "）") +
-    '</strong><small>' + escapeHtml(effect.reason) + '</small><em>' +
-    escapeHtml(temporaryEffectValue(effect)) + " · " +
+    escapeHtml(targetNames) +
+    '</strong><small>' + escapeHtml(effectReasonLabel(effect)) + '</small><em>' +
+    escapeHtml(targetMeta + temporaryEffectValue(effect)) + " · " +
     escapeHtml(temporaryEffectDuration(effect)) + '</em></span>' +
     mi("chevron_right") + '</button><div class="effect-card-switch"><span class="status-pill ' +
     status.className + '">' + escapeHtml(status.label) + "</span>" +
@@ -1603,20 +1771,16 @@ function renderEffects() {
   const effects = temporaryEffects().slice().sort(function (a, b) {
     return b.createdAt - a.createdAt || a.id.localeCompare(b.id);
   });
-  const content = '<p class="muted rule-explainer">临时效果参与自然、每轮、规则与 AI 变化计算；手动直接设值不应用临时效果。</p>' +
+  const content = '<p class="muted rule-explainer">临时效果只描述字段变化的计算方式；自动规则可在每条触发结果中明确导入需要的效果。</p>' +
     (effects.length > 0
       ? '<div class="temporary-effect-list">' + effects.map(managementEffectCard).join("") + "</div>"
-      : emptyState("bolt", "还没有临时效果", "为已绑定字段创建一个限时倍率或增量。", null));
-  const canCreate = sortedFields().some(function (field) {
-    const projection = fieldProjectionById(field.id);
-    return Boolean(projection && projection.bound && projection.scopeKey !== null);
-  });
+      : emptyState("bolt", "还没有临时效果", "为一个或多个已绑定字段创建限时倍率或增量。", null));
   return page(content, {
     title: "临时效果",
     top: {
-      backScreen: "fields",
-      rightAction: canCreate ? "new-effect" : "",
-      rightText: canCreate ? "+ 新增" : ""
+      menu: true,
+      rightAction: "new-effect",
+      rightText: "+ 新增"
     }
   });
 }
@@ -1638,41 +1802,86 @@ function renderEffect() {
         'data-effect-number="remainingTurns" aria-label="剩余轮次" value="' +
         numberAttribute(draft.remainingTurns) + '">'
       : '<p class="form-hint">此效果不会自动到期，可随时手动停用或删除。</p>';
-  const content = '<section class="form-section"><label class="field-label">目标字段</label>' +
-    '<select class="select-input" data-effect-input="targetFieldId" aria-label="目标字段">' +
-    effectFieldSelectOptions(draft.targetFieldId) + '</select><label class="field-label">原因 *</label>' +
-    '<textarea class="textarea-input" data-effect-input="reason" aria-label="原因" maxlength="500" ' +
-    'placeholder="说明该效果为什么生效">' + escapeHtml(draft.reason) +
-    "</textarea></section>" +
-    sectionTitle("计算方式", "") +
-    '<section class="form-section rule-form-card"><div class="number-row"><label>效果类型' +
+  const selectedTargets = effectTargets(draft);
+  const targetOptions = availableEffectTargetOptions();
+  const targetPicker = targetOptions.length === 0
+    ? '<div class="scope-explainer warning">' + mi("link_off") +
+      '<span><strong>没有可用目标</strong><small>请先在字段设置中为至少一个字段选择作用范围并完成绑定。</small></span></div>'
+    : '<div class="effect-target-list" role="group" aria-label="目标字段与作用对象，可多选">' +
+    targetOptions.map(function (option) {
+      const field = option.field;
+      const displayTarget = option.target;
+      const selected = selectedTargets.some(function (target) {
+        return target.fieldId === displayTarget.fieldId && target.scopeKey === displayTarget.scopeKey;
+      });
+      return '<button class="effect-target-choice ' + (selected ? "active" : "") +
+        '" data-effect-target-field="' + escapeHtml(field.id) + '" data-effect-target-scope="' +
+        escapeHtml(displayTarget.scope) + '" data-effect-target-scope-key="' +
+        escapeHtml(displayTarget.scopeKey) + '" aria-pressed="' + selected + '"><span class="state-icon" style="--tone:' +
+        escapeHtml(field.themeColor) + ';--tone-soft:' + softThemeColor(field.themeColor) + '">' +
+        mi(normalizeIconName(field.icon)) + '</span><span><strong>' + escapeHtml(field.name) +
+        '</strong><small>' + escapeHtml(SCOPE_LABELS[displayTarget.scope] + " · " +
+          effectTargetContextLabel(displayTarget)) + '</small></span>' +
+        mi(selected ? "check_circle" : "add_circle") + '</button>';
+    }).join("") + '</div><p class="form-hint">每个目标都保留自己的字段作用域，可同时选择角色、群组、全局或会话字段。</p>';
+  const scopeSummary = selectedTargets.length > 0
+    ? '<div class="effect-scope-summary">' + selectedTargets.map(function (target) {
+      const field = fieldById(target.fieldId);
+      return '<span>' + mi("my_location") + escapeHtml(field ? field.name : "已删除字段") +
+        '<small>' + escapeHtml(SCOPE_LABELS[target.scope] + " · " + effectTargetContextLabel(target)) +
+        '</small></span>';
+    }).join("") + '</div>'
+    : '<p class="inline-empty">请至少选择一个目标字段</p>';
+  const reasonModeTabs = segmentedTabs([
+    { id: "template", label: "默认模板" },
+    { id: "custom", label: "自定义原因" }
+  ], draft.reasonMode, "data-effect-reason-mode");
+  const reasonEditor = draft.reasonMode === "template"
+    ? '<div class="reason-template-grid" role="group" aria-label="默认原因模板">' +
+      EFFECT_REASON_TEMPLATES.map(function (template) {
+        const selected = draft.reasonTemplate === template.value;
+        return '<button class="reason-template-choice ' + (selected ? "active" : "") +
+          '" data-effect-reason-template="' + template.value + '" aria-pressed="' + selected + '"' +
+          '><span><strong>' + escapeHtml(template.label) + '</strong><small>' +
+          escapeHtml(template.description) + '</small></span>' + mi(selected ? "check_circle" : "circle") +
+          '</button>';
+      }).join("") + '</div>'
+    : '<label class="field-label" for="effectReason">自定义原因 *</label>' +
+      '<textarea class="textarea-input" id="effectReason" data-effect-input="reason" aria-label="自定义原因" maxlength="500" ' +
+      'placeholder="例如：雨夜散步带来的放松效果">' + escapeHtml(draft.reason) + "</textarea>";
+  const targetNames = selectedTargets.map(function (target) {
+    return linkFieldLabel(target.fieldId);
+  }).join("、") || "尚未选择字段";
+  const content = editorSection("目标字段", "选择一个或多个需要被修饰的状态",
+    targetPicker + scopeSummary, "effect-target-section") +
+    editorSection("计算方式", "定义目标字段变化值的临时修饰方式",
+    '<div class="number-row"><label>效果类型' +
     '<select class="select-input" data-effect-input="mode"><option value="multiplier"' +
     (draft.mode === "multiplier" ? " selected" : "") + '>倍率</option><option value="additive"' +
     (draft.mode === "additive" ? " selected" : "") + '>增量</option></select></label>' +
     '<label>效果数值<input class="number-input" type="number" data-effect-number="value" value="' +
-    numberAttribute(draft.value) + '"></label></div><div class="setting-group compact-settings">' +
+    numberAttribute(draft.value) + '"></label></div><p class="form-hint">自然变化、每轮变化和普通 AI 更新会使用当前有效效果；规则结果只使用其明确导入的效果。</p>' +
+    '<div class="setting-group compact-settings">' +
     '<div class="setting-row"><span><strong>启用效果</strong><span class="description">停用后保留配置</span></span>' +
     toggleSwitch("data-effect-toggle", "enabled", draft.enabled, "启用效果") +
-    "</div></div></section>" +
-    sectionTitle("作用域", '<span class="muted">跟随目标字段</span>') +
-    '<section class="form-section rule-form-card"><div class="static-type-row">' +
-    mi("my_location") + '<span><strong>' + escapeHtml(SCOPE_LABELS[draft.scope]) +
-    '</strong><small>目标字段决定临时效果作用域</small></span></div>' +
-    '<p class="scope-key-preview">作用键：<code>' + escapeHtml(draft.scopeKey) +
-    "</code></p></section>" +
-    sectionTitle("持续时间", "") +
-    '<section class="form-section rule-form-card"><div class="option-grid three">' +
+    "</div></div>", "effect-calculation-section") +
+    editorSection("效果原因", "原因会写入变化记录，便于回看和筛选",
+      reasonModeTabs + '<div class="effect-reason-editor">' + reasonEditor + '</div>',
+      "effect-reason-section") +
+    editorSection("持续时间", "选择自动结束方式",
+    '<div class="option-grid three">' +
     durationModes.map(function (mode) {
       const selected = appState.effectDurationMode === mode.id;
       return '<button class="option-chip ' +
         (selected ? "active" : "") + '" data-effect-duration-mode="' + mode.id +
         '" aria-pressed="' + selected + '">' +
         escapeHtml(mode.label) + "</button>";
-    }).join("") + "</div>" + durationInput + "</section>" +
+    }).join("") + "</div>" + durationInput, "effect-duration-section") +
     '<div class="rule-preview"><strong>' + mi("visibility") +
-    "效果预览</strong><p>" + escapeHtml(linkFieldLabel(draft.targetFieldId)) + " · " +
+    "效果预览</strong><p>" + escapeHtml(targetNames) + " · " +
     escapeHtml(temporaryEffectValue(draft)) + " · " +
-    escapeHtml(temporaryEffectDuration(draft)) + "</p></div>";
+    escapeHtml(temporaryEffectDuration(draft)) + " · " +
+    escapeHtml(effectReasonLabel(draft)) + "</p></div>";
 
   return page(content, {
     title: appState.editingEffectId ? "编辑临时效果" : "新增临时效果",
@@ -1754,6 +1963,9 @@ function renderAi() {
     '<span class="description">字段级开关</span></span>' +
     toggleSwitch("data-ai-toggle", "enabled", draft.ai.enabled, "允许 AI 修改此字段") +
     "</div></div>" +
+    sectionTitle("模型可见性", '<span class="muted">决定注入模型的状态详细程度</span>') +
+    '<section class="form-section inline-form-section">' + visibilityPicker(draft) +
+    '<p class="form-hint">“不注入模型”只影响提示词读取，不会停用字段本身。</p></section>' +
     sectionTitle("判断参数", '<button class="button secondary compact-button" data-action="probe-model">' +
       mi("sensors") + "探测模型</button>") +
     '<section class="form-section inline-form-section">' + renderModelProbe() +
@@ -1802,38 +2014,31 @@ function visibilityPicker(draft) {
 }
 
 function renderAdvanced() {
-  const draft = requireFieldDraft();
-  const content = '<div class="selected-field-banner">' +
-    '<span class="state-icon" style="--tone:' + escapeHtml(draft.themeColor) +
-    ";--tone-soft:" + softThemeColor(draft.themeColor) + '">' +
-    mi(normalizeIconName(draft.icon)) + "</span><span><strong>" +
-    escapeHtml(draft.name) + '</strong><small>当前编辑字段</small></span></div>' +
-    sectionTitle("变量标识", "") +
-    '<div class="setting-group"><div class="setting-row"><span><strong>内部 ID</strong>' +
-    '<span class="description">由后端维护，不随名称改变</span></span><code class="field-id-code">' +
-    escapeHtml(appState.editingFieldId || "保存后生成") + "</code></div></div>" +
-    sectionTitle("模型可见性", '<span class="muted">控制状态注入模型的详细程度</span>') +
-    visibilityPicker(draft) +
-    sectionTitle("显示设置", "") +
-    '<section class="form-section"><label class="field-label">主题色</label>' +
-    themePicker(draft) + '<label class="field-label">图标</label>' + iconPicker(draft) + "</section>" +
-    sectionTitle("数据集管理", "") +
-    '<div class="option-grid data-actions-grid"><button class="button secondary" data-action="export-dataset">' +
-    mi("ios_share") + '导出数据</button><button class="button secondary" data-action="choose-dataset-import">' +
-    mi("download") + "导入数据</button></div>" +
-    (appState.editingFieldId
-      ? '<button class="button danger full-danger" data-action="delete-field">' +
-        mi("delete") + "删除字段</button>"
-      : "") +
-    '<div class="info-panel">' + mi("info") +
-    "<div><strong>数据导入</strong><p>导入会由后端校验 formatVersion 2，并在成功后重新读取快照。</p></div></div>";
+  const hasCustomBackground = document.documentElement.classList.contains("has-custom-background");
+  const content = editorSection("页面外观", "背景会统一应用到插件的全部页面",
+    '<div class="appearance-preview" aria-label="当前页面背景预览"><span>' +
+    mi(hasCustomBackground ? "photo" : "auto_awesome") + '<strong>' +
+    (hasCustomBackground ? "自定义背景" : "默认角色主题") + '</strong><small>' +
+    (hasCustomBackground ? "已使用本地压缩照片" : "使用插件内置背景图片") +
+    '</small></span></div><div class="advanced-action-grid">' +
+    '<button class="advanced-action" data-action="choose-background">' + mi("wallpaper") +
+    '<span><strong>更换背景</strong><small>选择 JPEG、PNG 或 WebP</small></span>' + mi("chevron_right") + '</button>' +
+    '<button class="advanced-action" data-action="reset-background"' +
+    (hasCustomBackground ? "" : " disabled") + '>' + mi("restart_alt") +
+    '<span><strong>恢复默认</strong><small>移除当前自定义背景</small></span>' + mi("chevron_right") +
+    '</button></div>', "advanced-appearance-section") +
+    editorSection("导入与导出", "备份或迁移完整 MVU 数据集",
+      '<div class="advanced-action-grid"><button class="advanced-action" data-action="export-dataset">' +
+      mi("ios_share") + '<span><strong>导出数据</strong><small>保存完整 v2 数据集</small></span>' +
+      mi("chevron_right") + '</button><button class="advanced-action" data-action="choose-dataset-import">' +
+      mi("download") + '<span><strong>导入数据</strong><small>校验后替换当前数据</small></span>' +
+      mi("chevron_right") + '</button></div><div class="info-panel compact-info">' + mi("info") +
+      '<div><strong>导入前请先备份</strong><p>导入会由后端严格校验 formatVersion 2，成功后刷新全部字段、规则与记录。</p></div></div>',
+      "advanced-data-section");
 
   return page(content, {
     title: "高级选项",
-    top: { backScreen: "edit" },
-    action: {
-      primary: { action: "save-advanced", label: "保存高级选项" }
-    }
+    top: { menu: true }
   });
 }
 
@@ -1853,12 +2058,18 @@ function autoConditionSummary(condition) {
     return linkFieldLabel(condition.fieldId) + " " + condition.operator + " " +
       numberText(condition.threshold);
   }
+  if (condition.kind === "aiJudgement") {
+    return "AI 判断“" + condition.triggerType + "”：" + condition.requirement;
+  }
   throw new Error("MVU_AUTO_RULE_CONDITION_INVALID");
 }
 
 function autoEffectSummary(effects) {
   return effects.map(function (effect) {
-    return linkFieldLabel(effect.fieldId) + " " + signedNumber(effect.delta);
+    const imported = effect.temporaryEffectIds.length > 0
+      ? "，应用 " + effect.temporaryEffectIds.length + " 个临时效果"
+      : "";
+    return linkFieldLabel(effect.fieldId) + " " + signedNumber(effect.delta) + imported;
   }).join("；");
 }
 
@@ -1868,7 +2079,7 @@ function autoRuleCard(rule) {
     '--tone-soft:color-mix(in srgb, #7058D8 14%, white)">' + mi("rule") +
     '</span><span><strong>' + escapeHtml(rule.name) +
     '</strong><span class="description">' + escapeHtml(autoConditionSummary(rule.condition)) +
-    '</span><span class="meta">效果：' + escapeHtml(autoEffectSummary(rule.effects)) +
+    '</span><span class="meta">结果：' + escapeHtml(autoEffectSummary(rule.effects)) +
     " · 冷却 " + numberText(rule.cooldownMs / 3600000) + ' 小时</span></span>' +
     '<span class="status-pill ' + (rule.enabled ? "good" : "warn") + '">' +
     (rule.enabled ? "已启用" : "已停用") + "</span>" + mi("chevron_right") + "</button>";
@@ -1884,7 +2095,7 @@ function renderRules() {
       : emptyState("rule", "还没有自动规则", "新增规则后，可按消息事实修改一个或多个状态。", null));
   return page(content, {
     title: "规则设置",
-    top: { backScreen: "fields" },
+    top: { menu: true },
     action: {
       primary: { action: "new-auto-rule", label: "+ 添加规则" }
     }
@@ -1902,6 +2113,14 @@ function conditionForKind(kind) {
     if (!field) throw new Error("MVU_AUTO_RULE_FIELD_REQUIRED");
     return { kind: kind, fieldId: field.id, operator: ">=", threshold: field.minimum };
   }
+  if (kind === "aiJudgement") {
+    return {
+      kind: kind,
+      triggerType: "情绪变化",
+      requirement: "当消息中出现明确、可验证的情绪变化时触发",
+      minimumConfidence: 0.75
+    };
+  }
   throw new Error("MVU_AUTO_RULE_CONDITION_KIND_INVALID:" + kind);
 }
 
@@ -1916,7 +2135,7 @@ function defaultAutoRuleDraft() {
     description: "",
     enabled: true,
     condition: { kind: "userCare" },
-    effects: [{ fieldId: fields[0].id, delta: fields[0].step }],
+    effects: [{ fieldId: fields[0].id, delta: fields[0].step, temporaryEffectIds: [] }],
     cooldownMs: 21600000,
     order: maxOrder + 1
   };
@@ -1951,7 +2170,58 @@ function renderConditionFields(condition) {
       'data-auto-condition-number="threshold" value="' + numberAttribute(condition.threshold) +
       '"></label></div>';
   }
+  if (condition.kind === "aiJudgement") {
+    const presetSelected = AI_TRIGGER_PRESETS.some(function (preset) {
+      return preset.value !== "__custom__" && preset.value === condition.triggerType;
+    });
+    return '<label class="field-label">AI 触发类型</label>' +
+      '<div class="ai-trigger-preset-grid" role="group" aria-label="AI 触发类型">' +
+      AI_TRIGGER_PRESETS.map(function (preset) {
+        const selected = preset.value === "__custom__"
+          ? !presetSelected
+          : condition.triggerType === preset.value;
+        return '<button type="button" class="ai-trigger-preset ' + (selected ? "active" : "") +
+          '" data-ai-trigger-preset="' + escapeHtml(preset.value) + '" aria-pressed="' + selected + '">' +
+          mi(preset.icon) + '<span><strong>' + escapeHtml(preset.label) + '</strong><small>' +
+          escapeHtml(preset.hint) + '</small></span>' + mi(selected ? "check_circle" : "circle") + '</button>';
+      }).join("") + '</div>' + (!presetSelected
+        ? '<label class="field-label" for="aiTriggerType">自定义类型名称 *</label>' +
+          '<input class="text-input" id="aiTriggerType" data-auto-condition-input="triggerType" maxlength="80" ' +
+          'value="' + escapeHtml(condition.triggerType) + '" placeholder="例如：边界被尊重">'
+        : "") +
+      '<label class="field-label" for="aiTriggerRequirement">触发要求 *</label>' +
+      '<textarea class="textarea-input" id="aiTriggerRequirement" data-auto-condition-input="requirement" ' +
+      'maxlength="2000" placeholder="写清必须观察到哪些事实，以及哪些情况不应触发">' +
+      escapeHtml(condition.requirement) + '</textarea><label class="field-label">最低置信度</label>' +
+      '<input class="number-input" type="number" min="0" max="1" step="0.01" ' +
+      'data-auto-condition-number="minimumConfidence" aria-label="AI 触发最低置信度" value="' +
+      numberAttribute(condition.minimumConfidence) + '"><p class="form-hint">模型只返回是否命中、置信度和理由；字段变化由下方“触发结果”单独定义。</p>';
+  }
   return '<p class="form-hint">此条件不需要额外参数。</p>';
+}
+
+function temporaryEffectImportChoices(effect, index) {
+  const candidates = temporaryEffects().filter(function (temporaryEffect) {
+    return effectTargets(temporaryEffect).some(function (target) {
+      return target.fieldId === effect.fieldId;
+    });
+  });
+  if (candidates.length === 0) {
+    return '<p class="auto-effect-import-empty">该字段还没有可导入的临时效果，可先到底栏“效果”中创建。</p>';
+  }
+  return '<div class="auto-effect-import-list" role="group" aria-label="导入临时效果，可多选">' +
+    candidates.map(function (temporaryEffect) {
+      const selected = effect.temporaryEffectIds.includes(temporaryEffect.id);
+      const status = effectStatus(temporaryEffect);
+      return '<button type="button" class="auto-effect-import ' + (selected ? "active" : "") +
+        '" data-auto-effect-import-index="' + index + '" data-auto-effect-import-id="' +
+        escapeHtml(temporaryEffect.id) + '" aria-pressed="' + selected + '" aria-label="' +
+        escapeHtml((selected ? "取消导入" : "导入") + effectReasonLabel(temporaryEffect)) + '">' +
+        '<span><strong>' + escapeHtml(effectReasonLabel(temporaryEffect)) + '</strong><small>' +
+        escapeHtml(temporaryEffectValue(temporaryEffect)) + '</small></span><em class="status-pill ' +
+        status.className + '">' + escapeHtml(status.label) + '</em>' +
+        mi(selected ? "check_circle" : "add_circle") + '</button>';
+    }).join("") + '</div>';
 }
 
 function autoEffectRow(effect, index, count) {
@@ -1963,7 +2233,8 @@ function autoEffectRow(effect, index, count) {
     '"></label>' + (count > 1
       ? '<button class="delete-stage" data-action="delete-auto-effect" data-effect-index="' +
         index + '" aria-label="删除效果">' + mi("delete") + "</button>"
-      : "") + "</div>";
+      : "") + '<div class="auto-effect-import-panel"><span class="field-label">应用临时效果</span>' +
+      temporaryEffectImportChoices(effect, index) + '</div></div>';
 }
 
 function renderRule() {
@@ -1983,12 +2254,12 @@ function renderRule() {
     '<select class="select-input" data-auto-condition-kind aria-label="条件类型">' +
     conditionOptions + "</select>" +
     renderConditionFields(draft.condition) + "</section>" +
-    sectionTitle("则……", '<span class="muted">依次执行多个效果</span>') +
+    sectionTitle("触发结果", '<span class="muted">触发后改变的字段内容</span>') +
     '<section class="form-section rule-form-card"><div class="auto-effect-list">' +
     draft.effects.map(function (effect, index) {
       return autoEffectRow(effect, index, draft.effects.length);
     }).join("") + '</div><button class="button secondary add-stage-button" data-action="add-auto-effect">' +
-    mi("add") + "添加效果</button></section>" +
+    mi("add") + '添加字段变化</button><p class="form-hint">每条结果可导入多个临时效果；未导入的效果不会暗中修改该规则结果。</p></section>' +
     sectionTitle("触发限制", "") +
     '<section class="form-section rule-form-card"><div class="number-row"><label>冷却（小时）' +
     '<input class="number-input" type="number" min="0" data-auto-cooldown-hours value="' +
@@ -2244,13 +2515,7 @@ function renderOverlay() {
       drawerLink("schedule", "自然变化与规则", "change") +
       drawerLink("account_tree", "规则设置", "rules") +
       drawerLink("bolt", "临时效果", "effects") +
-      drawerLink("tune", "高级选项", "advanced") + "</section>" +
-      '<section class="drawer-group"><p>外观</p>' +
-      '<button class="drawer-link" data-action="choose-background">' +
-      mi("wallpaper") + "<span>更换背景照片</span>" + mi("chevron_right") + "</button>" +
-      '<button class="drawer-link" data-action="reset-background">' +
-      mi("restart_alt") + "<span>恢复默认背景</span>" + mi("chevron_right") + "</button>" +
-      "</section></div></aside>";
+      drawerLink("tune", "高级选项", "advanced") + "</section></div></aside>";
   }
   if (appState.sheet) {
     return '<div class="sheet-scrim" data-action="close-overlay"></div>' +
@@ -2376,6 +2641,25 @@ const renderers = {
   records: renderRecords,
   recordDetail: renderRecordDetail
 };
+
+function transitionRender(update) {
+  const commit = function () {
+    update();
+    render();
+  };
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
+      typeof document.startViewTransition !== "function") {
+    commit();
+    return;
+  }
+  try {
+    const transition = document.startViewTransition(commit);
+    transition.finished.catch(function () {});
+  } catch (error) {
+    console.warn("MVU view transition unavailable", error);
+    commit();
+  }
+}
 
 function render(options) {
   const config = options || {};
@@ -2585,16 +2869,22 @@ function clearEditorState() {
 function currentSnapshotRequest() {
   if (appState.snapshot === null) return {};
   const context = appState.snapshot.activeContext;
-  // actorId is an explicit group-member override in the host contract. Passing the active
-  // character of a one-to-one chat as that override makes the host correctly reject it because
-  // a single-character chat has no member list.
-  if (context.groupId === null || context.actorId === null) return {};
-  return { actorId: context.actorId };
+  if (context.groupId === null) return {};
+  return context.actorId === null
+    ? { groupId: context.groupId }
+    : { groupId: context.groupId, actorId: context.actorId };
 }
 
 function isStaleActorSelectionError(error) {
   return error instanceof Error &&
     error.message.includes("MVU_HOST_SELECTED_ACTOR_NOT_IN_ACTIVE_CONTEXT:");
+}
+
+function isStaleGroupSelectionError(error) {
+  return error instanceof Error && (
+    error.message.includes("Requested character group does not exist:") ||
+    error.message.includes("MVU_SNAPSHOT_GROUP_ID_INVALID")
+  );
 }
 
 async function requestSnapshot(snapshotRequest) {
@@ -2604,7 +2894,11 @@ async function requestSnapshot(snapshotRequest) {
     // A group can change, or the host can switch back to a one-to-one chat, between two page
     // refreshes. Recover against the host's authoritative active context instead of leaving a
     // completed mutation looking like it failed.
-    if (typeof snapshotRequest.actorId !== "string" || !isStaleActorSelectionError(error)) {
+    const staleActor = typeof snapshotRequest.actorId === "string" &&
+      isStaleActorSelectionError(error);
+    const staleGroup = typeof snapshotRequest.groupId === "string" &&
+      isStaleGroupSelectionError(error);
+    if (!staleActor && !staleGroup) {
       throw error;
     }
     return callNative("snapshot", {});
@@ -2615,12 +2909,19 @@ async function reloadSnapshot(request) {
   const previousActorId = appState.snapshot === null
     ? null
     : appState.snapshot.activeContext.actorId;
+  const previousGroupId = appState.snapshot === null
+    ? null
+    : appState.snapshot.activeContext.groupId;
   const snapshotRequest = request === undefined ? currentSnapshotRequest() : request;
   const snapshot = await requestSnapshot(snapshotRequest);
   validateSnapshot(snapshot);
   const actorChanged = appState.snapshot !== null &&
-    previousActorId !== snapshot.activeContext.actorId;
+    (previousActorId !== snapshot.activeContext.actorId ||
+      previousGroupId !== snapshot.activeContext.groupId);
   appState.snapshot = snapshot;
+  if (snapshot.activeContext.groupId !== null && snapshot.activeContext.actorId !== null) {
+    appState.homeActorId = snapshot.activeContext.actorId;
+  }
   appState.settingsDraft = cloneJson(snapshot.settings);
   const fields = sortedFields();
   const selectedProjection = appState.selectedFieldId
@@ -2882,6 +3183,17 @@ function handleFormMutation(event) {
     effect[target.dataset.autoEffectProperty] = target.dataset.autoEffectProperty === "delta"
       ? numericInputValue(target)
       : target.value;
+    if (target.dataset.autoEffectProperty === "fieldId") {
+      effect.temporaryEffectIds = effect.temporaryEffectIds.filter(function (temporaryEffectId) {
+        const temporaryEffect = temporaryEffects().find(function (candidate) {
+          return candidate.id === temporaryEffectId;
+        });
+        return Boolean(temporaryEffect && effectTargets(temporaryEffect).some(function (temporaryTarget) {
+          return temporaryTarget.fieldId === effect.fieldId;
+        }));
+      });
+      render();
+    }
     return;
   }
 
@@ -2890,16 +3202,6 @@ function handleFormMutation(event) {
     if (!draft) throw new Error("MVU_EFFECT_DRAFT_MISSING");
     const property = target.dataset.effectInput;
     draft[property] = target.value;
-    if (property === "targetFieldId") {
-      const field = requireField(target.value);
-      const projection = fieldProjectionById(field.id);
-      if (!projection || !projection.bound || projection.scopeKey === null) {
-        throw new Error("MVU_EFFECT_TARGET_CONTEXT_NOT_BOUND:" + field.id);
-      }
-      draft.scope = field.scope;
-      draft.scopeKey = projection.scopeKey;
-      render();
-    }
     return;
   }
 
@@ -3151,6 +3453,20 @@ function validateAutoRule(draft) {
       throw formError("状态阈值条件无效");
     }
   }
+  if (condition.kind === "aiJudgement") {
+    condition.triggerType = condition.triggerType.trim();
+    condition.requirement = condition.requirement.trim();
+    if (condition.triggerType.length === 0 || condition.triggerType.length > 80) {
+      throw formError("AI 触发类型名称需为 1 到 80 个字符");
+    }
+    if (condition.requirement.length === 0 || condition.requirement.length > 2000) {
+      throw formError("请填写 1 到 2000 个字符的 AI 触发要求");
+    }
+    if (!Number.isFinite(condition.minimumConfidence) ||
+        condition.minimumConfidence < 0 || condition.minimumConfidence > 1) {
+      throw formError("AI 触发最低置信度必须在 0 到 1 之间");
+    }
+  }
   if (!Array.isArray(draft.effects) || draft.effects.length === 0) {
     throw formError("至少添加一个规则效果");
   }
@@ -3158,7 +3474,20 @@ function validateAutoRule(draft) {
     if (!fieldById(effect.fieldId) || !Number.isFinite(effect.delta)) {
       throw formError("规则效果字段或变化值无效");
     }
-    return { fieldId: effect.fieldId, delta: effect.delta };
+    const temporaryEffectIds = Array.from(new Set(effect.temporaryEffectIds));
+    temporaryEffectIds.forEach(function (temporaryEffectId) {
+      const temporaryEffect = temporaryEffects().find(function (candidate) {
+        return candidate.id === temporaryEffectId;
+      });
+      if (!temporaryEffect || !effectTargets(temporaryEffect).some(function (target) {
+        return target.fieldId === effect.fieldId;
+      })) throw formError("规则结果中导入了无效的临时效果");
+    });
+    return {
+      fieldId: effect.fieldId,
+      delta: effect.delta,
+      temporaryEffectIds: temporaryEffectIds
+    };
   });
   if (!Number.isFinite(draft.cooldownMs) || draft.cooldownMs < 0) {
     throw formError("冷却时间不能小于 0");
@@ -3176,29 +3505,47 @@ function validateAutoRule(draft) {
 }
 
 function validateTemporaryEffect(draft) {
-  const targetField = fieldById(draft.targetFieldId);
-  if (!targetField) throw formError("请选择仍然存在的目标字段");
-  if (targetField.scope !== draft.scope) throw formError("临时效果作用域必须与目标字段一致");
-  if (!Object.prototype.hasOwnProperty.call(SCOPE_LABELS, draft.scope)) {
-    throw formError("临时效果作用域无效");
+  if (!Array.isArray(draft.targets) || draft.targets.length === 0) {
+    throw formError("请至少选择一个目标字段");
   }
-  if (draft.scope === "global") {
-    if (draft.scopeKey !== "global") throw formError("全局临时效果作用键无效");
-  } else {
-    const prefix = draft.scope + ":";
-    if (!draft.scopeKey.startsWith(prefix) ||
-        !targetField.bindingIds.includes(draft.scopeKey.slice(prefix.length))) {
-      throw formError("临时效果作用键未绑定到目标字段");
+  const seenTargets = new Set();
+  const targets = draft.targets.map(function (target) {
+    const targetField = fieldById(target.fieldId);
+    if (!targetField) throw formError("目标字段已不存在，请重新选择");
+    if (targetField.scope !== target.scope ||
+        !Object.prototype.hasOwnProperty.call(SCOPE_LABELS, target.scope)) {
+      throw formError("临时效果目标作用域与字段不一致");
     }
-  }
+    const identity = target.fieldId + "\u0000" + target.scopeKey;
+    if (seenTargets.has(identity)) throw formError("目标字段不能重复");
+    seenTargets.add(identity);
+    if (target.scope === "global") {
+      if (target.scopeKey !== "global") throw formError("全局目标作用键无效");
+    } else {
+      const prefix = target.scope + ":";
+      if (!target.scopeKey.startsWith(prefix) ||
+          !targetField.bindingIds.includes(target.scopeKey.slice(prefix.length))) {
+        throw formError("目标字段的作用范围已失效，请重新选择");
+      }
+    }
+    return { fieldId: target.fieldId, scope: target.scope, scopeKey: target.scopeKey };
+  });
   if (!["multiplier", "additive"].includes(draft.mode) || !Number.isFinite(draft.value)) {
     throw formError("临时效果计算参数无效");
   }
   if (draft.mode === "multiplier" && draft.value <= 0) {
     throw formError("倍率必须大于 0");
   }
+  if (!['template', 'custom'].includes(draft.reasonMode)) {
+    throw formError("请选择效果原因的设置方式");
+  }
+  if (!EFFECT_REASON_TEMPLATES.some(function (template) {
+    return template.value === draft.reasonTemplate;
+  })) throw formError("请选择有效的默认原因模板");
   const reason = draft.reason.trim();
-  if (reason.length === 0) throw formError("请填写临时效果原因");
+  if (draft.reasonMode === "custom" && reason.length === 0) {
+    throw formError("请填写自定义效果原因");
+  }
   if (draft.expiresAt !== null && (!Number.isFinite(draft.expiresAt) || draft.expiresAt <= Date.now())) {
     throw formError("到期时间必须晚于当前时间");
   }
@@ -3209,24 +3556,22 @@ function validateTemporaryEffect(draft) {
   if (draft.expiresAt !== null && draft.remainingTurns !== null) {
     throw formError("时间期限和轮次期限不能同时设置");
   }
-  if (!["manual", "rule", "ai"].includes(draft.source)) throw formError("临时效果来源无效");
   if (!Number.isFinite(draft.createdAt)) throw formError("临时效果创建时间无效");
   return {
-    targetFieldId: draft.targetFieldId,
-    scope: draft.scope,
-    scopeKey: draft.scopeKey,
+    targets: targets,
     mode: draft.mode,
     value: draft.value,
     enabled: Boolean(draft.enabled),
     expiresAt: draft.expiresAt,
     remainingTurns: draft.remainingTurns,
+    reasonMode: draft.reasonMode,
+    reasonTemplate: draft.reasonTemplate,
     reason: reason,
-    source: draft.source,
     createdAt: draft.createdAt
   };
 }
 
-const FIELD_EDITOR_SCREENS = ["edit", "stages", "change", "ai", "advanced"];
+const FIELD_EDITOR_SCREENS = ["edit", "stages", "change", "ai"];
 
 function ensureSelectedFieldDraft() {
   const alreadyEditingCurrentField = FIELD_EDITOR_SCREENS.includes(appState.screen) &&
@@ -3541,11 +3886,36 @@ function handleChoiceButton(target) {
   if (target.matches("[data-field-scope]")) {
     const fieldDraft = requireFieldDraft();
     const nextScope = target.dataset.fieldScope;
+    const bindingId = currentBindingIdForScope(nextScope);
     if (fieldDraft.scope !== nextScope) {
       fieldDraft.scope = nextScope;
-      const bindingId = currentBindingIdForScope(nextScope);
       fieldDraft.bindingIds = bindingId === null ? [] : [bindingId];
+    } else if (bindingId !== null && !fieldDraft.bindingIds.includes(bindingId)) {
+      fieldDraft.bindingIds.push(bindingId);
     }
+    render();
+    return true;
+  }
+  if (target.matches("[data-ai-trigger-preset]")) {
+    const condition = appState.autoRuleDraft && appState.autoRuleDraft.condition;
+    if (!condition || condition.kind !== "aiJudgement") {
+      throw new Error("MVU_AI_RULE_DRAFT_MISSING");
+    }
+    const preset = target.dataset.aiTriggerPreset;
+    condition.triggerType = preset === "__custom__" ? "自定义触发" : preset;
+    render();
+    return true;
+  }
+  if (target.matches("[data-auto-effect-import-index][data-auto-effect-import-id]")) {
+    const draft = appState.autoRuleDraft;
+    if (!draft) throw new Error("MVU_AUTO_RULE_DRAFT_MISSING");
+    const index = Number(target.dataset.autoEffectImportIndex);
+    const effect = draft.effects[index];
+    if (!effect) throw new Error("MVU_AUTO_EFFECT_DRAFT_NOT_FOUND:" + index);
+    const temporaryEffectId = target.dataset.autoEffectImportId;
+    const selectedIndex = effect.temporaryEffectIds.indexOf(temporaryEffectId);
+    if (selectedIndex >= 0) effect.temporaryEffectIds.splice(selectedIndex, 1);
+    else effect.temporaryEffectIds.push(temporaryEffectId);
     render();
     return true;
   }
@@ -3564,6 +3934,42 @@ function handleChoiceButton(target) {
     if (index >= 0) bindings.splice(index, 1);
     else bindings.push(bindingId);
     render();
+    return true;
+  }
+  if (target.matches("[data-effect-target-field]")) {
+    const draft = appState.effectDraft;
+    if (!draft) throw new Error("MVU_EFFECT_DRAFT_MISSING");
+    const fieldId = target.dataset.effectTargetField;
+    const scope = target.dataset.effectTargetScope;
+    const scopeKey = target.dataset.effectTargetScopeKey;
+    const existing = draft.targets.findIndex(function (item) {
+      return item.fieldId === fieldId && item.scopeKey === scopeKey;
+    });
+    if (existing >= 0) {
+      draft.targets.splice(existing, 1);
+    } else {
+      const field = requireField(fieldId);
+      if (field.scope !== scope || typeof scopeKey !== "string" || scopeKey.length === 0) {
+        throw formError("该效果目标已失效，请刷新后重试");
+      }
+      draft.targets.push({ fieldId: field.id, scope: field.scope, scopeKey: scopeKey });
+    }
+    render();
+    return true;
+  }
+  if (target.matches("[data-effect-reason-template]")) {
+    const draft = appState.effectDraft;
+    if (!draft) throw new Error("MVU_EFFECT_DRAFT_MISSING");
+    draft.reasonTemplate = target.dataset.effectReasonTemplate;
+    render();
+    return true;
+  }
+  if (target.matches("[data-effect-reason-mode]")) {
+    const draft = appState.effectDraft;
+    if (!draft) throw new Error("MVU_EFFECT_DRAFT_MISSING");
+    const mode = target.dataset.effectReasonMode;
+    if (draft.reasonMode === mode) return true;
+    transitionRender(function () { draft.reasonMode = mode; });
     return true;
   }
   if (target.matches("[data-field-toggle]")) {
@@ -3720,15 +4126,17 @@ async function handleAppClick(event) {
 
   const fieldTabTarget = target.closest("[data-field-tab]");
   if (fieldTabTarget) {
-    appState.fieldTab = fieldTabTarget.dataset.fieldTab;
-    render();
+    const nextTab = fieldTabTarget.dataset.fieldTab;
+    if (appState.fieldTab === nextTab) return;
+    transitionRender(function () { appState.fieldTab = nextTab; });
     return;
   }
 
   const changeTabTarget = target.closest("[data-change-tab]");
   if (changeTabTarget) {
-    appState.changeTab = changeTabTarget.dataset.changeTab;
-    render();
+    const nextTab = changeTabTarget.dataset.changeTab;
+    if (appState.changeTab === nextTab) return;
+    transitionRender(function () { appState.changeTab = nextTab; });
     return;
   }
 
@@ -3736,6 +4144,35 @@ async function handleAppClick(event) {
   if (chartRangeTarget) {
     appState.chartRange = chartRangeTarget.dataset.chartRange;
     render();
+    return;
+  }
+
+  const homeScopeTarget = target.closest("[data-home-scope]");
+  if (homeScopeTarget) {
+    const homeScope = homeScopeTarget.dataset.homeScope;
+    const context = appState.snapshot.activeContext;
+    if (context.groupId === null) throw formError("当前聊天不是群聊");
+    if (homeScope === "group") {
+      if (context.actorId === null) return;
+      await withBusy(homeScopeTarget, "select-home-scope", async function () {
+        await reloadSnapshot({ groupId: context.groupId });
+        transitionRender(function () {});
+      });
+      return;
+    }
+    if (homeScope !== "character") throw new Error("MVU_HOME_SCOPE_INVALID:" + homeScope);
+    if (context.actorId !== null) return;
+    const selectableActorIds = appState.snapshot.selectableActorIds;
+    const actorId = selectableActorIds.includes(appState.homeActorId)
+      ? appState.homeActorId
+      : selectableActorIds[0];
+    if (typeof actorId !== "string" || actorId.length === 0) {
+      throw formError("当前群组没有可用角色");
+    }
+    await withBusy(homeScopeTarget, "select-home-scope", async function () {
+      await reloadSnapshot({ groupId: context.groupId, actorId: actorId });
+      transitionRender(function () {});
+    });
     return;
   }
 
@@ -3747,7 +4184,24 @@ async function handleAppClick(event) {
     }
     if (appState.snapshot.activeContext.actorId === actorId) return;
     await withBusy(actorTarget, "select-actor", async function () {
-      await reloadSnapshot({ actorId: actorId });
+      const groupId = appState.snapshot.activeContext.groupId;
+      if (groupId === null) throw formError("当前不在群组上下文中");
+      await reloadSnapshot({ groupId: groupId, actorId: actorId });
+      render();
+    });
+    return;
+  }
+
+  const groupTarget = target.closest("[data-select-group]");
+  if (groupTarget) {
+    const groupId = groupTarget.dataset.selectGroup;
+    if (typeof groupId !== "string" || groupId.length === 0) {
+      throw new Error("MVU_HOME_GROUP_ID_INVALID");
+    }
+    if (appState.snapshot.activeContext.groupId === groupId &&
+        appState.snapshot.activeContext.actorId === null) return;
+    await withBusy(groupTarget, "select-group", async function () {
+      await reloadSnapshot({ groupId: groupId });
       render();
     });
     return;
@@ -3805,7 +4259,6 @@ async function handleAppClick(event) {
     ensureSelectedFieldDraft();
     setScreen("change");
   } else if (action === "open-advanced-settings") {
-    ensureSelectedFieldDraft();
     setScreen("advanced");
   } else if (action === "edit-stages") {
     ensureSelectedFieldDraft();
@@ -3901,7 +4354,10 @@ async function handleAppClick(event) {
     if (!appState.editingFieldId) throw formError("请先保存字段，再配置 AI");
     const fieldId = appState.editingFieldId;
     await withBusy(actionTarget, "save-ai-settings", async function () {
-      await callNative("updateField", { id: fieldId, patch: { ai: payload.ai } });
+      await callNative("updateField", {
+        id: fieldId,
+        patch: { ai: payload.ai, modelVisibility: payload.modelVisibility }
+      });
       await callNative("updateSettings", {
         patch: { aiEnabled: Boolean(appState.settingsDraft.aiEnabled) }
       });
@@ -3910,13 +4366,6 @@ async function handleAppClick(event) {
       render();
       showToast("AI 设置已保存");
     });
-  } else if (action === "save-advanced") {
-    const payload = validateFieldPayload(requireFieldDraft());
-    await saveExistingFieldPatch(actionTarget, "save-advanced", {
-      modelVisibility: payload.modelVisibility,
-      themeColor: payload.themeColor,
-      icon: payload.icon
-    }, "高级选项已保存", "advanced");
   } else if (action === "export-dataset") {
     await exportDatasetAction(actionTarget);
   } else if (action === "choose-dataset-import") {
@@ -3944,7 +4393,11 @@ async function handleAppClick(event) {
   } else if (action === "add-auto-effect") {
     const field = sortedFields()[0];
     if (!field) throw formError("请先创建字段");
-    appState.autoRuleDraft.effects.push({ fieldId: field.id, delta: field.step });
+    appState.autoRuleDraft.effects.push({
+      fieldId: field.id,
+      delta: field.step,
+      temporaryEffectIds: []
+    });
     render();
   } else if (action === "delete-auto-effect") {
     const index = Number(actionTarget.dataset.effectIndex);

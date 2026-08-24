@@ -14,7 +14,7 @@ import type {
   BackgroundModelProbeResult,
   SystemModelApi,
 } from "../mvu/app/system-model";
-import { assertMvuDataset } from "../mvu/app/validation";
+import { normalizeMvuDataset } from "../mvu/app/validation";
 
 export const MVU_TOOLPKG_ID = "com.lcilling.operit_mvu";
 export const MVU_IPC_TARGET_CONTEXT_KEY = `toolpkg_main:${MVU_TOOLPKG_ID}`;
@@ -48,9 +48,14 @@ export const MVU_IPC = {
 } as const;
 
 export type EmptyRequest = Record<string, never>;
-export interface SnapshotRequest { actorId?: string; }
+export interface SnapshotRequest { actorId?: string; groupId?: string; }
 export interface MvuPageSnapshot extends MvuSnapshotView {
   selectableActorIds: string[];
+  groups: ToolPkg.ChatContextGroupSnapshot[];
+  contextLabels: {
+    groupName: string | null;
+    chatName: string;
+  };
 }
 export type FieldInput = Omit<DataField, "id" | "order">;
 export type FieldPatch = Partial<Omit<DataField, "id">>;
@@ -226,11 +231,15 @@ function parseEmptyRequest(value: unknown): EmptyRequest {
 
 function parseSnapshotRequest(value: unknown): SnapshotRequest {
   const record = requireRecord(value, "MVU_SNAPSHOT_REQUEST_INVALID");
-  assertKeys(record, [], ["actorId"], "MVU_SNAPSHOT_REQUEST_INVALID");
-  if (!hasOwn(record, "actorId")) return {};
-  const actorId = requireNonEmptyString(record, "actorId", "MVU_SNAPSHOT_ACTOR_ID_INVALID");
-  if (actorId.trim().length === 0) fail("MVU_SNAPSHOT_ACTOR_ID_INVALID");
-  return { actorId };
+  assertKeys(record, [], ["actorId", "groupId"], "MVU_SNAPSHOT_REQUEST_INVALID");
+  const request: SnapshotRequest = {};
+  if (hasOwn(record, "actorId")) {
+    request.actorId = requireNonEmptyString(record, "actorId", "MVU_SNAPSHOT_ACTOR_ID_INVALID");
+  }
+  if (hasOwn(record, "groupId")) {
+    request.groupId = requireNonEmptyString(record, "groupId", "MVU_SNAPSHOT_GROUP_ID_INVALID");
+  }
+  return request;
 }
 
 function parseScopeContext(value: unknown): StateScopeContext {
@@ -390,7 +399,7 @@ function parseAutoCondition(value: unknown): AutoRuleCondition {
   const kind = requireEnum(
     record,
     "kind",
-    ["recentPositive", "longInactive", "userCare", "specialDay", "highFreq", "stateThreshold"] as const,
+    ["recentPositive", "longInactive", "userCare", "specialDay", "highFreq", "stateThreshold", "aiJudgement"] as const,
     "MVU_AUTO_CONDITION_KIND_REQUIRED"
   );
   switch (kind) {
@@ -411,6 +420,19 @@ function parseAutoCondition(value: unknown): AutoRuleCondition {
         operator: requireEnum(record, "operator", [">=", "<=", ">", "<"] as const, "MVU_AUTO_OPERATOR_REQUIRED"),
         threshold: requireNumber(record, "threshold", "MVU_AUTO_THRESHOLD_REQUIRED"),
       };
+    case "aiJudgement":
+      assertKeys(
+        record,
+        ["kind", "triggerType", "requirement", "minimumConfidence"],
+        [],
+        "MVU_AUTO_CONDITION_INVALID"
+      );
+      return {
+        kind,
+        triggerType: requireNonEmptyString(record, "triggerType", "MVU_AUTO_AI_TRIGGER_TYPE_REQUIRED"),
+        requirement: requireNonEmptyString(record, "requirement", "MVU_AUTO_AI_REQUIREMENT_REQUIRED"),
+        minimumConfidence: requireNumber(record, "minimumConfidence", "MVU_AUTO_AI_CONFIDENCE_REQUIRED"),
+      };
     case "userCare":
     case "specialDay":
       assertKeys(record, ["kind"], [], "MVU_AUTO_CONDITION_INVALID");
@@ -420,10 +442,14 @@ function parseAutoCondition(value: unknown): AutoRuleCondition {
 
 function parseAutoEffect(value: unknown): DataAutoRule["effects"][number] {
   const record = requireRecord(value, "MVU_AUTO_EFFECT_INVALID");
-  assertKeys(record, ["fieldId", "delta"], [], "MVU_AUTO_EFFECT_INVALID");
+  assertKeys(record, ["fieldId", "delta", "temporaryEffectIds"], [], "MVU_AUTO_EFFECT_INVALID");
   return {
     fieldId: requireNonEmptyString(record, "fieldId", "MVU_AUTO_EFFECT_FIELD_REQUIRED"),
     delta: requireNumber(record, "delta", "MVU_AUTO_EFFECT_DELTA_REQUIRED"),
+    temporaryEffectIds: requireStringArray(
+      record.temporaryEffectIds,
+      "MVU_AUTO_EFFECT_IMPORTS_REQUIRED"
+    ),
   };
 }
 
@@ -465,24 +491,48 @@ function parseAutoRulePatch(value: unknown): AutoRulePatch {
 }
 
 const TEMPORARY_EFFECT_KEYS = [
-  "targetFieldId", "scope", "scopeKey", "mode", "value", "enabled", "expiresAt",
-  "remainingTurns", "reason", "source", "createdAt",
+  "targets", "mode", "value", "enabled", "expiresAt", "remainingTurns",
+  "reasonMode", "reasonTemplate", "reason", "createdAt",
 ] as const;
+
+function parseTemporaryEffectTargets(value: unknown): DataTemporaryEffect["targets"] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("MVU_EFFECT_TARGETS_REQUIRED");
+  }
+  return value.map((entry) => {
+    const record = requireRecord(entry, "MVU_EFFECT_TARGET_INVALID");
+    assertKeys(record, ["fieldId", "scope", "scopeKey"], [], "MVU_EFFECT_TARGET_INVALID");
+    return {
+      fieldId: requireNonEmptyString(record, "fieldId", "MVU_EFFECT_TARGET_FIELD_REQUIRED"),
+      scope: requireEnum(
+        record,
+        "scope",
+        ["character", "group", "global", "chat"] as const,
+        "MVU_EFFECT_TARGET_SCOPE_REQUIRED"
+      ),
+      scopeKey: requireNonEmptyString(record, "scopeKey", "MVU_EFFECT_TARGET_SCOPE_KEY_REQUIRED"),
+    };
+  });
+}
 
 function parseTemporaryEffectInput(value: unknown): TemporaryEffectInput {
   const record = requireRecord(value, "MVU_TEMPORARY_EFFECT_INPUT_INVALID");
   assertKeys(record, TEMPORARY_EFFECT_KEYS, [], "MVU_TEMPORARY_EFFECT_INPUT_INVALID");
   return {
-    targetFieldId: requireNonEmptyString(record, "targetFieldId", "MVU_EFFECT_TARGET_REQUIRED"),
-    scope: requireEnum(record, "scope", ["character", "group", "global", "chat"] as const, "MVU_EFFECT_SCOPE_REQUIRED"),
-    scopeKey: requireNonEmptyString(record, "scopeKey", "MVU_EFFECT_SCOPE_KEY_REQUIRED"),
+    targets: parseTemporaryEffectTargets(record.targets),
     mode: requireEnum(record, "mode", ["multiplier", "additive"] as const, "MVU_EFFECT_MODE_REQUIRED"),
     value: requireNumber(record, "value", "MVU_EFFECT_VALUE_REQUIRED"),
     enabled: requireBoolean(record, "enabled", "MVU_EFFECT_ENABLED_REQUIRED"),
     expiresAt: requireNullableNumber(record, "expiresAt", "MVU_EFFECT_EXPIRES_REQUIRED"),
     remainingTurns: requireNullableNumber(record, "remainingTurns", "MVU_EFFECT_TURNS_REQUIRED"),
+    reasonMode: requireEnum(record, "reasonMode", ["template", "custom"] as const, "MVU_EFFECT_REASON_MODE_REQUIRED"),
+    reasonTemplate: requireEnum(
+      record,
+      "reasonTemplate",
+      ["general", "positive", "negative", "environment", "relationship"] as const,
+      "MVU_EFFECT_REASON_TEMPLATE_REQUIRED"
+    ),
     reason: requireString(record, "reason", "MVU_EFFECT_REASON_REQUIRED"),
-    source: requireEnum(record, "source", ["manual", "rule", "ai"] as const, "MVU_EFFECT_SOURCE_REQUIRED"),
     createdAt: requireNumber(record, "createdAt", "MVU_EFFECT_CREATED_REQUIRED"),
   };
 }
@@ -491,16 +541,24 @@ function parseTemporaryEffectPatch(value: unknown): TemporaryEffectPatch {
   const record = requireRecord(value, "MVU_TEMPORARY_EFFECT_PATCH_INVALID");
   assertKeys(record, [], TEMPORARY_EFFECT_KEYS, "MVU_TEMPORARY_EFFECT_PATCH_INVALID");
   const patch: TemporaryEffectPatch = {};
-  if (hasOwn(record, "targetFieldId")) patch.targetFieldId = requireNonEmptyString(record, "targetFieldId", "MVU_EFFECT_TARGET_REQUIRED");
-  if (hasOwn(record, "scope")) patch.scope = requireEnum(record, "scope", ["character", "group", "global", "chat"] as const, "MVU_EFFECT_SCOPE_REQUIRED");
-  if (hasOwn(record, "scopeKey")) patch.scopeKey = requireNonEmptyString(record, "scopeKey", "MVU_EFFECT_SCOPE_KEY_REQUIRED");
+  if (hasOwn(record, "targets")) patch.targets = parseTemporaryEffectTargets(record.targets);
   if (hasOwn(record, "mode")) patch.mode = requireEnum(record, "mode", ["multiplier", "additive"] as const, "MVU_EFFECT_MODE_REQUIRED");
   if (hasOwn(record, "value")) patch.value = requireNumber(record, "value", "MVU_EFFECT_VALUE_REQUIRED");
   if (hasOwn(record, "enabled")) patch.enabled = requireBoolean(record, "enabled", "MVU_EFFECT_ENABLED_REQUIRED");
   if (hasOwn(record, "expiresAt")) patch.expiresAt = requireNullableNumber(record, "expiresAt", "MVU_EFFECT_EXPIRES_REQUIRED");
   if (hasOwn(record, "remainingTurns")) patch.remainingTurns = requireNullableNumber(record, "remainingTurns", "MVU_EFFECT_TURNS_REQUIRED");
+  if (hasOwn(record, "reasonMode")) {
+    patch.reasonMode = requireEnum(record, "reasonMode", ["template", "custom"] as const, "MVU_EFFECT_REASON_MODE_REQUIRED");
+  }
+  if (hasOwn(record, "reasonTemplate")) {
+    patch.reasonTemplate = requireEnum(
+      record,
+      "reasonTemplate",
+      ["general", "positive", "negative", "environment", "relationship"] as const,
+      "MVU_EFFECT_REASON_TEMPLATE_REQUIRED"
+    );
+  }
   if (hasOwn(record, "reason")) patch.reason = requireString(record, "reason", "MVU_EFFECT_REASON_REQUIRED");
-  if (hasOwn(record, "source")) patch.source = requireEnum(record, "source", ["manual", "rule", "ai"] as const, "MVU_EFFECT_SOURCE_REQUIRED");
   if (hasOwn(record, "createdAt")) patch.createdAt = requireNumber(record, "createdAt", "MVU_EFFECT_CREATED_REQUIRED");
   return patch;
 }
@@ -778,8 +836,7 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
     ToolPkg.ipc.on<unknown, void>(
       MVU_IPC.importDataset,
       guarded("importDataset", MVU_REQUEST_PARSERS.importDataset, async (request) => {
-        const parsed: unknown = JSON.parse(request.json);
-        assertMvuDataset(parsed);
+        const parsed = normalizeMvuDataset(JSON.parse(request.json));
         await runtime.service.replaceDataset(parsed);
       })
     ),

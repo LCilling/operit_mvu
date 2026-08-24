@@ -6,6 +6,7 @@
  * returned effects. Missing facts never count as a positive match.
  */
 import type {
+  AiRuleJudgement,
   AutoRuleCondition,
   DataAutoRule,
   DataLinkRule,
@@ -22,6 +23,7 @@ export interface AutomationMessageFacts {
   readonly lastInteractionAt?: number;
   readonly messageCountInLast24Hours?: number;
   readonly specialDayDetected?: boolean;
+  readonly aiRuleJudgements?: Readonly<Record<string, AiRuleJudgement>>;
 }
 
 export interface AutoRuleEvaluationInput {
@@ -37,6 +39,9 @@ export interface AutoRuleEffectResult {
   readonly effectIndex: number;
   readonly fieldId: string;
   readonly delta: number;
+  readonly temporaryEffectIds: readonly string[];
+  readonly triggerReason: string | null;
+  readonly triggerConfidence: number | null;
 }
 
 export interface AutoRuleMatchResult {
@@ -44,6 +49,7 @@ export interface AutoRuleMatchResult {
   readonly ruleName: string;
   readonly ruleOrder: number;
   readonly effects: readonly AutoRuleEffectResult[];
+  readonly triggerReason: string | null;
 }
 
 export interface RuleCooldownUpdate {
@@ -89,7 +95,14 @@ export function evaluateAutoRules(input: AutoRuleEvaluationInput): AutoRuleEvalu
     ) {
       continue;
     }
-    if (!matchesAutoRuleCondition(rule.condition, input.facts)) continue;
+    if (!matchesAutoRuleCondition(rule.condition, input.facts, rule.id)) continue;
+
+    const triggerReason = rule.condition.kind === "aiJudgement"
+      ? input.facts.aiRuleJudgements?.[rule.id]?.reason ?? null
+      : null;
+    const triggerConfidence = rule.condition.kind === "aiJudgement"
+      ? input.facts.aiRuleJudgements?.[rule.id]?.confidence ?? null
+      : null;
 
     const ruleEffects = rule.effects.map((effect, effectIndex): AutoRuleEffectResult => {
       requireFinite(effect.delta, `MVU_AUTO_RULE_EFFECT_INVALID:${rule.id}:${effectIndex}`);
@@ -100,6 +113,9 @@ export function evaluateAutoRules(input: AutoRuleEvaluationInput): AutoRuleEvalu
         effectIndex,
         fieldId: effect.fieldId,
         delta: effect.delta,
+        temporaryEffectIds: [...effect.temporaryEffectIds],
+        triggerReason,
+        triggerConfidence,
       };
     });
     matchedRules.push({
@@ -107,6 +123,7 @@ export function evaluateAutoRules(input: AutoRuleEvaluationInput): AutoRuleEvalu
       ruleName: rule.name,
       ruleOrder: rule.order,
       effects: ruleEffects,
+      triggerReason,
     });
     effects.push(...ruleEffects);
     cooldownUpdates.push({ ruleId: rule.id, triggeredAt: input.facts.occurredAt });
@@ -118,7 +135,8 @@ export function evaluateAutoRules(input: AutoRuleEvaluationInput): AutoRuleEvalu
 /** Return false when a condition's required fact is absent or non-finite. */
 export function matchesAutoRuleCondition(
   condition: AutoRuleCondition,
-  facts: AutomationMessageFacts
+  facts: AutomationMessageFacts,
+  ruleId?: string
 ): boolean {
   switch (condition.kind) {
     case "stateThreshold": {
@@ -150,6 +168,12 @@ export function matchesAutoRuleCondition(
     }
     case "specialDay":
       return facts.specialDayDetected === true;
+    case "aiJudgement": {
+      if (ruleId === undefined) return false;
+      const judgement = facts.aiRuleJudgements?.[ruleId];
+      return judgement !== undefined && judgement.matched &&
+        judgement.confidence >= condition.minimumConfidence;
+    }
   }
 }
 

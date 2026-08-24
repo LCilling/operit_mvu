@@ -6,14 +6,14 @@
 
 ## 功能
 
-- 按角色、角色组、全局或当前聊天管理数值状态
+- 按角色、群组共享、全局共享或会话专属管理数值状态
 - 在字段设置一级页直接自定义每个字段的上下限，并同步换算现有状态与规则
 - 字段阶段、自然变化、每轮变化和状态联动
-- 基于明确消息事实的自动规则和多效果执行
-- 按时间、轮次或持续生效的临时效果
+- 基于明确消息事实或可视化 AI 条件的自动规则和多字段结果
+- 支持多目标、规则结果显式导入、原因模板与自定义原因的临时效果
 - 使用 Operit 当前系统模型执行严格 JSON Schema 状态判断
 - 按角色、字段和来源筛选变化记录，并查看趋势详情
-- 群聊成员切换、真实角色名称与 `content://` 头像
+- 角色/群组双层切换、真实名称与 `content://` 头像
 - 全页面自定义背景、固定底部导航和 Operit 原生宿主顶栏
 - 严格 v2 JSON 数据集导入、导出和私有 revision 事务
 
@@ -28,7 +28,7 @@ Release 只发布一个 ToolPkg，不发布插件 APK：
 
 插件依赖以下 Operit 宿主能力：
 
-- `ToolPkg.chatContext.snapshot({ chatId? })`
+- `ToolPkg.chatContext.snapshot({ chatId? | groupId? })`，并返回完整群组目录
 - 带权威消息身份和角色上下文的 `message_persisted`
 - `ToolPkg.systemModel.probe()` 与带必填 `maxOutputChars` 的 `ToolPkg.systemModel.complete(...)`
 - 保留 Operit 完整系统提示词的普通聊天 Prompt Hook
