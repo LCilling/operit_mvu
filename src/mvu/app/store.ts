@@ -23,8 +23,11 @@ export interface MvuStore {
 export interface MvuFileApi {
   exists(path: string): Promise<boolean>;
   readText(path: string): Promise<string>;
+  readTextPart(path: string, startLine: number, endLine: number): Promise<string>;
   writeText(path: string, content: string): Promise<void>;
+  appendText(path: string, content: string): Promise<void>;
   move(source: string, destination: string): Promise<void>;
+  deleteFile(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
 }
 

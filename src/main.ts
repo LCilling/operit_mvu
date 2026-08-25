@@ -95,9 +95,9 @@ export function registerToolPkg(): boolean {
   return true;
 }
 
-export function onApplicationCreate(): { ok: boolean } {
+export async function onApplicationCreate(): Promise<{ ok: boolean }> {
   try {
-    ensureRuntime();
+    await ensureRuntime().initialize();
     ensureSystemModel();
     ensureIpcInstalled();
     return { ok: true };
@@ -145,12 +145,14 @@ async function processPersistedMessage(
       context,
     ]);
 
+    const migrationStatus = await activeRuntime.migrationStatus();
     const recentFacts = await activeRuntime.getRecentMessageFacts(context);
     const dataset = await activeRuntime.dataset();
     const fields = await activeRuntime.service.projectFields(context);
-    const aiRules = await activeRuntime.service.getApplicableAiRules(context, payload.timestamp);
     let aiRuleJudgements: Awaited<ReturnType<HostSystemModelApi["judgeRules"]>>["judgements"] = [];
-    if (aiRules.length > 0) {
+    if (migrationStatus.mode === "v2_compat") {
+      const aiRules = await activeRuntime.service.getApplicableAiRules(context, payload.timestamp);
+      if (aiRules.length > 0) {
       const judgement = await ensureSystemModel().judgeRules({
         context,
         rules: aiRules,
@@ -159,6 +161,7 @@ async function processPersistedMessage(
         message: payload.content,
       });
       if (judgement.available) aiRuleJudgements = judgement.judgements;
+      }
     }
     let aiChanges: Awaited<ReturnType<HostSystemModelApi["judgeState"]>>["changes"] = [];
     if (dataset.settings.aiEnabled && fields.some((projection) =>
@@ -183,6 +186,14 @@ async function processPersistedMessage(
       signals: automationSignalsForMessage(recentFacts, payload),
       aiChanges,
       aiRuleJudgements,
+      currentActorId: activeContextFromHostSnapshot(hostSnapshot).actorId,
+      actorNamesById: Object.fromEntries((await activeRuntime.listActors()).map((actor) => [
+        actor.characterId,
+        actor.name,
+      ])),
+      judgeConditions: migrationStatus.mode === "v3"
+        ? (request) => ensureSystemModel().judgeConditions(request)
+        : undefined,
     });
   } catch (error) {
     console.error("MVU persisted message processing failed", error);
@@ -291,7 +302,9 @@ function persistedRole(sender: string): "user" | "character" {
 }
 
 export function onApplicationReady(): void {
-  ensureRuntime();
+  void ensureRuntime().initialize().catch((error) => {
+    console.error("MVU runtime initialization failed", error);
+  });
   ensureSystemModel();
   ensureIpcInstalled();
 }

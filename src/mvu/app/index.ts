@@ -37,6 +37,11 @@ import {
 } from "./state-prompt";
 import type { MvuFileApi, MvuStore } from "./store";
 import { FileMvuStore } from "./store";
+import {
+  isV3MvuStore,
+  V3MvuStore,
+  type MigrationStatus,
+} from "./store-v3";
 
 export interface RuntimeOptions {
   store?: MvuStore;
@@ -54,6 +59,7 @@ export interface MvuSnapshotView {
   temporaryEffects: DataTemporaryEffect[];
   records: DataChangeRecord[];
   settings: MvuSettings;
+  migrationStatus: MigrationStatus;
 }
 
 export interface MvuRuntime {
@@ -63,6 +69,8 @@ export interface MvuRuntime {
   service: MvuService;
   actors: HostActorDirectory;
   store: MvuStore;
+  initialize(): Promise<MigrationStatus>;
+  migrationStatus(): Promise<MigrationStatus>;
   dataset(): Promise<MvuDataset>;
   snapshot(context: StateScopeContext): Promise<MvuSnapshotView>;
   buildMvuData(context: StateScopeContext): Promise<ReturnType<typeof buildMvuData>>;
@@ -99,14 +107,21 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
     service,
     actors,
     store,
+    initialize() {
+      return runtimeMigrationStatus(store);
+    },
+    migrationStatus() {
+      return runtimeMigrationStatus(store);
+    },
     async dataset() {
       return service.getDataset();
     },
     async snapshot(activeContext) {
-      const [dataset, actorList, fields] = await Promise.all([
+      const [dataset, actorList, fields, migrationStatus] = await Promise.all([
         service.getDataset(),
         actors.listCharacters(),
         service.projectFields(activeContext),
+        runtimeMigrationStatus(store),
       ]);
       return {
         revision: dataset.revision,
@@ -118,6 +133,7 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
         temporaryEffects: dataset.temporaryEffects,
         records: dataset.records,
         settings: dataset.settings,
+        migrationStatus,
       };
     },
     async buildMvuData(activeContext) {
@@ -176,13 +192,24 @@ function createToolsFileApi(): MvuFileApi {
     async readText(path) {
       return (await Tools.Files.read(path)).content;
     },
+    async readTextPart(path, startLine, endLine) {
+      return (await Tools.Files.readPart(path, startLine, endLine)).content;
+    },
     async writeText(path, content) {
       const result = await Tools.Files.write(path, content, false);
       requireSuccessfulFileOperation("write", result);
     },
+    async appendText(path, content) {
+      const result = await Tools.Files.write(path, content, true);
+      requireSuccessfulFileOperation("append", result);
+    },
     async move(source, destination) {
       const result = await Tools.Files.move(source, destination);
       requireSuccessfulFileOperation("move", result);
+    },
+    async deleteFile(path) {
+      const result = await Tools.Files.deleteFile(path, true);
+      requireSuccessfulFileOperation("delete", result);
     },
     async mkdir(path) {
       const result = await Tools.Files.mkdir(path, true);
@@ -193,10 +220,28 @@ function createToolsFileApi(): MvuFileApi {
 
 function createPersistentStore(getConfigDir: (() => string) | undefined): MvuStore {
   if (getConfigDir === undefined) throw new Error("MVU_RUNTIME_REQUIRES_CONFIG_DIR_OR_EXPLICIT_STORE");
-  return new FileMvuStore({
+  const files = createToolsFileApi();
+  const legacyStore = new FileMvuStore({
     getConfigDir,
-    files: createToolsFileApi(),
+    files,
     createInitialDataset: buildSeedDataset,
+  });
+  return new V3MvuStore({
+    getConfigDir,
+    files,
+    legacyStore,
+    createInitialDataset: buildSeedDataset,
+  });
+}
+
+function runtimeMigrationStatus(store: MvuStore): Promise<MigrationStatus> {
+  if (isV3MvuStore(store)) return store.migrationStatus();
+  return Promise.resolve({
+    mode: "v2_compat",
+    error: {
+      code: "MVU_V3_STORE_NOT_CONFIGURED",
+      message: "The runtime was explicitly constructed with a v2-only store.",
+    },
   });
 }
 

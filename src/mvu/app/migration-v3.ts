@@ -54,7 +54,7 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
     effectGroups,
     activeEffects,
     stateValues: cloneJson(source.stateValues),
-    records: cloneJson(source.records),
+    recordManifest: { segments: [], recordCount: 0, nextSegmentIndex: 1 },
     lastSettled: cloneJson(source.lastSettled),
     turnCounters: cloneJson(source.turnCounters),
     processedMessageIds: source.processedMessageIds.slice(-MAX_PROCESSED_MESSAGE_IDS_V3),
@@ -66,6 +66,7 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
 
   return {
     dataset,
+    records: cloneJson(source.records),
     report: {
       migratedFields: dataset.fields.length,
       migratedRules: dataset.rules.length,

@@ -7,6 +7,7 @@ import {
   evaluateLinkRules,
   MAX_MESSAGE_FACTS_PER_SCOPE_V3,
   MAX_PROCESSED_MESSAGE_IDS_V3,
+  retainHourlyMessageBuckets,
   type AutomationMessageFacts,
 } from "./automation";
 import { activateEffectGroup, applyActiveEffects } from "./effect-engine";
@@ -59,6 +60,7 @@ import type {
 } from "./system-model";
 import type { MvuStore } from "./store";
 import { StaleRevisionError } from "./store";
+import { isV3MvuStore, type V3MvuStore } from "./store-v3";
 import {
   assertMvuDataset,
   assertMvuDatasetV3,
@@ -105,6 +107,10 @@ export interface PersistedMessageInput extends PersistedMessageIdentity {
   signals: MessageAutomationSignals;
   aiChanges: readonly PersistedAiChange[];
   aiRuleJudgements: readonly AiRuleJudgement[];
+  /** v3-only actor/model context; ignored by the v2 compatibility path. */
+  currentActorId?: string | null;
+  actorNamesById?: Readonly<Record<string, string>>;
+  judgeConditions?: (request: ConditionJudgementRequest) => Promise<ConditionJudgementResult>;
 }
 
 export interface PersistedAiChange {
@@ -124,6 +130,7 @@ export interface ProcessPersistedMessageResult {
   duplicate: boolean;
   records: DataChangeRecord[];
   matchedRuleIds: string[];
+  diagnostics?: RuleDiagnostic[];
 }
 
 export interface PersistedMessageV3Input extends PersistedMessageIdentity {
@@ -332,7 +339,6 @@ export async function processPersistedMessageV3(
   }
   draft.processedMessageIds.push(messageKey);
   draft.processedMessageIds = draft.processedMessageIds.slice(-MAX_PROCESSED_MESSAGE_IDS_V3);
-  draft.records.push(...records);
   assertMvuDatasetV3(draft);
   return {
     dataset: draft,
@@ -793,6 +799,94 @@ export class MvuService {
 
   async processPersistedMessage(input: PersistedMessageInput): Promise<ProcessPersistedMessageResult> {
     validatePersistedMessageInput(input);
+    const store = this.store;
+    if (isV3MvuStore(store) && (await store.migrationStatus()).mode === "v3") {
+      const run = this.mutationTail.then(
+        () => this.executePersistedMessageV3(store, input),
+        () => this.executePersistedMessageV3(store, input),
+      );
+      this.mutationTail = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    }
+    return this.processPersistedMessageV2(input);
+  }
+
+  private async executePersistedMessageV3(
+    store: V3MvuStore,
+    input: PersistedMessageInput,
+  ): Promise<ProcessPersistedMessageResult> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const snapshot = await store.readV3();
+      const messageKey = processedMessageKey(input);
+      if (snapshot.dataset.processedMessageIds.includes(messageKey)) {
+        return { duplicate: true, records: [], matchedRuleIds: [], diagnostics: [] };
+      }
+
+      let baseDataset = snapshot.dataset;
+      let baseRecords: DataChangeRecord[] = [];
+      expireActiveEffectsV3(baseDataset, input.occurredAt);
+      if (input.context.actorId !== null) {
+        const legacy = await applyLegacyFieldBehaviorV3(
+          baseDataset,
+          input,
+        );
+        baseDataset = legacy.dataset;
+        baseRecords = legacy.records;
+      }
+      const result = await processPersistedMessageV3({
+        dataset: baseDataset,
+        context: input.context,
+        currentActorId: input.currentActorId ?? input.context.actorId,
+        actorNamesById: input.actorNamesById,
+        messageId: input.messageId,
+        variantId: input.variantId,
+        content: input.content,
+        role: input.role,
+        occurredAt: input.occurredAt,
+        signals: input.signals,
+        judgeConditions: input.judgeConditions,
+      });
+      if (!result.duplicate) {
+        for (const [eventKey, buckets] of Object.entries(result.dataset.hourlyMessageBuckets)) {
+          result.dataset.hourlyMessageBuckets[eventKey] = retainHourlyMessageBuckets(
+            buckets,
+            result.dataset.conditions,
+            input.occurredAt,
+          );
+        }
+        if (input.role === "character") consumeActiveEffectTurnsV3(result.dataset, input.context);
+      }
+      const records = [...baseRecords, ...result.records];
+      if (result.duplicate || JSON.stringify(result.dataset) === JSON.stringify(snapshot.dataset)) {
+        return {
+          duplicate: result.duplicate,
+          records,
+          matchedRuleIds: result.matchedRuleIds,
+          diagnostics: result.diagnostics,
+        };
+      }
+      try {
+        await store.transactV3(snapshot.revision, result.dataset, records);
+        return {
+          duplicate: false,
+          records,
+          matchedRuleIds: result.matchedRuleIds,
+          diagnostics: result.diagnostics,
+        };
+      } catch (error) {
+        if (error instanceof StaleRevisionError && attempt < 7) continue;
+        throw error;
+      }
+    }
+    throw new Error("MVU_V3_MUTATION_CONFLICT");
+  }
+
+  private async processPersistedMessageV2(
+    input: PersistedMessageInput,
+  ): Promise<ProcessPersistedMessageResult> {
     return (await this.transact(async (draft) => {
       const messageKey = processedMessageKey(input);
       if (draft.processedMessageIds.includes(messageKey)) {
@@ -1029,6 +1123,310 @@ export class MvuService {
     validateScopeContext(identity.context);
     return (await this.getDataset()).processedMessageIds.includes(processedMessageKey(identity));
   }
+}
+
+async function applyLegacyFieldBehaviorV3(
+  dataset: MvuDatasetV3,
+  input: PersistedMessageInput,
+): Promise<{ dataset: MvuDatasetV3; records: DataChangeRecord[] }> {
+  const draft = klona(dataset);
+  validateV3AiChangesForDataset(draft, input.context, input.aiChanges);
+  const records: DataChangeRecord[] = [];
+  const messageKey = processedMessageKey(input);
+  let recordSequence = 0;
+  const nextRecordId = (): string =>
+    `record_v3_legacy_${stableV3IdPart(messageKey)}_${recordSequence++}`;
+
+  const naturalStateBefore = stateValuesForV3Context(draft, input.context);
+  const naturalRecords: DataChangeRecord[] = [];
+  for (const field of draft.fields) {
+    if (!fieldAppliesToContext(field, input.context) || !field.naturalChange.enabled) continue;
+    const key = scopeKey(field.scope, input.context);
+    draft.lastSettled[key] = draft.lastSettled[key] ?? {};
+    const last = draft.lastSettled[key][field.id];
+    if (last === undefined) {
+      draft.lastSettled[key][field.id] = input.occurredAt;
+      continue;
+    }
+    if (input.occurredAt < last) throw new Error(`MVU_NATURAL_CLOCK_REVERSED:${field.id}`);
+    const units = Math.floor((input.occurredAt - last) / field.naturalChange.unitMs);
+    if (units === 0) continue;
+    draft.lastSettled[key][field.id] = last + units * field.naturalChange.unitMs;
+    const record = applyLegacyV3Change({
+      draft,
+      field,
+      context: input.context,
+      sourceDelta: units * field.naturalChange.amount,
+      source: "natural",
+      reason: "按时间自然变化",
+      ruleIds: [],
+      confidence: null,
+      input,
+      recordId: nextRecordId(),
+    });
+    if (record !== null) naturalRecords.push(record);
+  }
+  records.push(...naturalRecords);
+  records.push(...applyLegacyV3LinkedChanges({
+    draft,
+    context: input.context,
+    stateValuesBefore: naturalStateBefore,
+    baseRecords: naturalRecords,
+    input,
+    nextRecordId,
+  }));
+
+  const pendingStateBefore = stateValuesForV3Context(draft, input.context);
+  const pendingRecords: DataChangeRecord[] = [];
+  const perTurnDeltas = collectPerTurnDeltasV3(draft, input);
+  for (const [fieldId, delta] of perTurnDeltas) {
+    const field = requireApplicableV3Field(draft, input.context, fieldId);
+    const record = applyLegacyV3Change({
+      draft,
+      field,
+      context: input.context,
+      sourceDelta: delta,
+      source: "per_turn",
+      reason: "每轮变化",
+      ruleIds: [],
+      confidence: null,
+      input,
+      recordId: nextRecordId(),
+    });
+    if (record !== null) pendingRecords.push(record);
+  }
+  for (const change of input.aiChanges) {
+    const field = requireApplicableV3Field(draft, input.context, change.fieldId);
+    const record = applyLegacyV3Change({
+      draft,
+      field,
+      context: input.context,
+      sourceDelta: change.delta,
+      source: "ai",
+      reason: change.reason,
+      ruleIds: [],
+      confidence: change.confidence,
+      input,
+      recordId: nextRecordId(),
+    });
+    if (record !== null) pendingRecords.push(record);
+  }
+  records.push(...pendingRecords);
+  records.push(...applyLegacyV3LinkedChanges({
+    draft,
+    context: input.context,
+    stateValuesBefore: pendingStateBefore,
+    baseRecords: pendingRecords,
+    input,
+    nextRecordId,
+  }));
+  assertMvuDatasetV3(draft);
+  return { dataset: draft, records };
+}
+
+function collectPerTurnDeltasV3(
+  dataset: MvuDatasetV3,
+  input: PersistedMessageInput,
+): Map<string, number> {
+  const deltas = new Map<string, number>();
+  for (const field of dataset.fields) {
+    if (!fieldAppliesToContext(field, input.context) || !field.perTurnChange.enabled) continue;
+    const key = scopeKey(field.scope, input.context);
+    dataset.turnCounters[key] = dataset.turnCounters[key] ?? {};
+    const counter = dataset.turnCounters[key][field.id] ?? {
+      userMessages: 0,
+      characterMessages: 0,
+    };
+    const before = counterValue(counter, field);
+    if (input.role === "user") counter.userMessages += 1;
+    else counter.characterMessages += 1;
+    dataset.turnCounters[key][field.id] = counter;
+    const after = counterValue(counter, field);
+    const units = Math.floor(after / field.perTurnChange.intervalTurns) -
+      Math.floor(before / field.perTurnChange.intervalTurns);
+    if (units > 0) deltas.set(field.id, units * field.perTurnChange.amount);
+  }
+  return deltas;
+}
+
+function validateV3AiChangesForDataset(
+  dataset: MvuDatasetV3,
+  context: StateScopeContext,
+  changes: readonly PersistedAiChange[],
+): void {
+  if (changes.length === 0) return;
+  if (!dataset.settings.aiEnabled) throw new Error("MVU_AI_DISABLED");
+  const seenFields = new Set<string>();
+  for (const change of changes) {
+    if (seenFields.has(change.fieldId)) {
+      throw new Error(`MVU_AI_CHANGE_DUPLICATE_FIELD:${change.fieldId}`);
+    }
+    seenFields.add(change.fieldId);
+    const field = requireApplicableV3Field(dataset, context, change.fieldId);
+    if (!field.ai.enabled) throw new Error(`MVU_FIELD_AI_DISABLED:${field.id}`);
+    if (change.confidence < field.ai.minConfidence) {
+      throw new Error(`MVU_AI_CONFIDENCE_TOO_LOW:${field.id}`);
+    }
+    if (Math.abs(change.delta) > field.ai.maxDelta) {
+      throw new Error(`MVU_AI_DELTA_EXCEEDED:${field.id}`);
+    }
+  }
+}
+
+function requireApplicableV3Field(
+  dataset: MvuDatasetV3,
+  context: StateScopeContext,
+  fieldId: string,
+): DataField {
+  const field = dataset.fields.find((candidate) => candidate.id === fieldId);
+  if (field === undefined) throw new Error(`MVU_FIELD_NOT_FOUND:${fieldId}`);
+  if (!fieldAppliesToContext(field, context)) throw new Error(`MVU_FIELD_NOT_BOUND:${fieldId}`);
+  return field;
+}
+
+function applyLegacyV3Change(input: {
+  draft: MvuDatasetV3;
+  field: DataField;
+  context: StateScopeContext;
+  sourceDelta: number;
+  source: DataChangeRecord["source"];
+  reason: string;
+  ruleIds: string[];
+  confidence: number | null;
+  input: PersistedMessageInput;
+  recordId: string;
+}): DataChangeRecord | null {
+  if (input.sourceDelta === 0) return null;
+  const key = scopeKey(input.field.scope, input.context);
+  const before = input.draft.stateValues[key]?.[input.field.id] ?? input.field.initialValue;
+  const applied = applyActiveEffects({
+    field: input.field,
+    actorId: input.context.actorId,
+    scopeKey: key,
+    source: input.source,
+    sourceDelta: input.sourceDelta,
+    currentValue: before,
+    activeEffects: input.draft.activeEffects,
+    effectGroups: input.draft.effectGroups,
+    occurredAt: new Date(input.input.occurredAt).toISOString(),
+  });
+  if (applied.effectiveDelta === 0) return null;
+  input.draft.stateValues[key] = input.draft.stateValues[key] ?? {};
+  input.draft.stateValues[key][input.field.id] = applied.nextValue;
+  const effectReason = applied.reasons.map((reason) => reason.text).join("、");
+  return {
+    id: input.recordId,
+    scope: input.field.scope,
+    scopeKey: key,
+    fieldId: input.field.id,
+    fieldName: input.field.name,
+    actorId: input.context.actorId,
+    actorName: input.context.actorName,
+    chatId: input.context.chatId,
+    groupId: input.context.groupId,
+    before,
+    after: applied.nextValue,
+    requestedDelta: input.sourceDelta,
+    effectiveRequestedDelta: applied.effectiveDelta,
+    delta: applied.nextValue - before,
+    stageBefore: deriveStage(input.field, before).id,
+    stageAfter: deriveStage(input.field, applied.nextValue).id,
+    reason: effectReason.length === 0 ? input.reason : `${input.reason}；效果：${effectReason}`,
+    source: input.source,
+    ruleIds: [...input.ruleIds],
+    effectIds: applied.effectIds,
+    confidence: input.confidence,
+    messageId: input.input.messageId,
+    variantId: input.input.variantId,
+    occurredAt: input.input.occurredAt,
+  };
+}
+
+function applyLegacyV3LinkedChanges(input: {
+  draft: MvuDatasetV3;
+  context: StateScopeContext;
+  stateValuesBefore: Readonly<Record<string, number>>;
+  baseRecords: readonly DataChangeRecord[];
+  input: PersistedMessageInput;
+  nextRecordId: () => string;
+}): DataChangeRecord[] {
+  if (input.baseRecords.length === 0) return [];
+  const rules = input.draft.linkRules.filter((rule) => {
+    const source = input.draft.fields.find((field) => field.id === rule.sourceFieldId);
+    const target = input.draft.fields.find((field) => field.id === rule.targetFieldId);
+    return source !== undefined && target !== undefined &&
+      fieldAppliesToContext(source, input.context) && fieldAppliesToContext(target, input.context);
+  });
+  const linkResult = evaluateLinkRules({
+    rules,
+    stateValues: input.stateValuesBefore,
+    baseDeltas: input.baseRecords.map((record) => ({ fieldId: record.fieldId, delta: record.delta })),
+    triggerFieldIds: input.baseRecords.map((record) => record.fieldId),
+  });
+  if (linkResult.selfLoopRuleIds.length > 0 || linkResult.cycleRuleIds.length > 0 ||
+    linkResult.depthLimitedRuleIds.length > 0) {
+    throw new Error("MVU_LINK_EVALUATION_REJECTED");
+  }
+  const records: DataChangeRecord[] = [];
+  for (const change of linkResult.changes) {
+    if (change.triggeredRuleIds.length === 0) continue;
+    const linkedDelta = change.finalDelta - change.baseDelta;
+    if (linkedDelta === 0) continue;
+    const field = requireApplicableV3Field(input.draft, input.context, change.fieldId);
+    const record = applyLegacyV3Change({
+      draft: input.draft,
+      field,
+      context: input.context,
+      sourceDelta: linkedDelta,
+      source: "rule",
+      reason: "联动规则结算",
+      ruleIds: uniqueStrings(change.triggeredRuleIds),
+      confidence: null,
+      input: input.input,
+      recordId: input.nextRecordId(),
+    });
+    if (record !== null) records.push(record);
+  }
+  return records;
+}
+
+function expireActiveEffectsV3(dataset: MvuDatasetV3, occurredAt: number): void {
+  dataset.activeEffects = dataset.activeEffects.filter((instance) => {
+    if (instance.duration.remainingTurns !== null && instance.duration.remainingTurns <= 0) return false;
+    if (instance.duration.expiresAt === null) return true;
+    const expiresAt = Date.parse(instance.duration.expiresAt);
+    return Number.isFinite(expiresAt) && expiresAt > occurredAt;
+  });
+}
+
+function consumeActiveEffectTurnsV3(dataset: MvuDatasetV3, context: StateScopeContext): void {
+  dataset.activeEffects = dataset.activeEffects.flatMap((instance) => {
+    const remaining = instance.duration.remainingTurns;
+    if (remaining === null || !instance.resolvedTargets.some((target) =>
+      v3EffectTargetMatchesContext(target.scope, target.scopeKey, context))) {
+      return [instance];
+    }
+    const nextRemaining = remaining - 1;
+    if (nextRemaining <= 0) return [];
+    return [{
+      ...instance,
+      duration: { ...instance.duration, remainingTurns: nextRemaining },
+    }];
+  });
+}
+
+function v3EffectTargetMatchesContext(
+  scope: DataField["scope"],
+  targetScopeKey: string,
+  context: StateScopeContext,
+): boolean {
+  if (scope === "global") return targetScopeKey === "global";
+  const identity = scope === "character"
+    ? context.actorId
+    : scope === "group"
+      ? context.groupId
+      : context.chatId;
+  return identity !== null && targetScopeKey === `${scope}:${identity}`;
 }
 
 interface V3ResolvedRuleTarget {
