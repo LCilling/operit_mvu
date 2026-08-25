@@ -5,6 +5,7 @@ import { assertDataChangeRecord } from "./validation";
 
 export const RECORDS_PER_SEGMENT = 500;
 const MAX_SEGMENT_SCAN_COUNT = 1_024;
+const MAX_LATEST_CHANGE_TARGETS = 100_000;
 
 export interface SegmentedRecordStoreOptions {
   getConfigDir: () => string;
@@ -26,6 +27,15 @@ export interface RecordQueryResult {
   totalCount: number;
   hasMore: boolean;
   nextOffset: number | null;
+}
+
+export interface LatestFieldChangeTarget {
+  fieldId: string;
+  scopeKey: string;
+}
+
+export interface LatestFieldChange extends LatestFieldChangeTarget {
+  occurredAt: number;
 }
 
 export interface StagedRecordWrite {
@@ -247,6 +257,53 @@ export class SegmentedRecordStore {
       hasMore,
       nextOffset: hasMore ? offset + items.length : null,
     };
+  }
+
+  /**
+   * Finds one latest committed timestamp per exact `(fieldId, scopeKey)` target.
+   * Segments are visited serially at most once, index metadata skips unrelated
+   * segments, and no per-field async work is spawned.
+   */
+  async queryLatestFieldChanges(
+    manifest: RecordManifest,
+    targets: readonly LatestFieldChangeTarget[],
+  ): Promise<LatestFieldChange[]> {
+    assertRecordManifest(manifest);
+    if (targets.length > MAX_LATEST_CHANGE_TARGETS) {
+      throw new Error("MVU_V3_LATEST_CHANGE_TARGET_LIMIT");
+    }
+    const orderedKeys: string[] = [];
+    const targetByKey = new Map<string, LatestFieldChangeTarget>();
+    for (const target of targets) {
+      if (typeof target.fieldId !== "string" || target.fieldId.length === 0 ||
+        typeof target.scopeKey !== "string" || target.scopeKey.length === 0) {
+        throw new Error("MVU_V3_LATEST_CHANGE_TARGET_INVALID");
+      }
+      const key = recordFilterKey(target.fieldId, target.scopeKey);
+      if (targetByKey.has(key)) continue;
+      targetByKey.set(key, { fieldId: target.fieldId, scopeKey: target.scopeKey });
+      orderedKeys.push(key);
+    }
+    const latest = new Map<string, number>();
+    for (let index = manifest.segments.length - 1; index >= 0; index -= 1) {
+      const segment = manifest.segments[index];
+      const possibleKeys = orderedKeys.filter((key) =>
+        (segment.filterCounts === undefined || (segment.filterCounts[key] ?? 0) > 0) &&
+        segment.lastOccurredAt > (latest.get(key) ?? Number.NEGATIVE_INFINITY));
+      if (possibleKeys.length === 0) continue;
+      const possible = new Set(possibleKeys);
+      for (const record of await this.readSegmentRecords(segment)) {
+        const key = recordFilterKey(record.fieldId, record.scopeKey);
+        if (!possible.has(key)) continue;
+        const previous = latest.get(key);
+        if (previous === undefined || record.occurredAt > previous) latest.set(key, record.occurredAt);
+      }
+    }
+    return orderedKeys.flatMap((key) => {
+      const occurredAt = latest.get(key);
+      const target = targetByKey.get(key);
+      return occurredAt === undefined || target === undefined ? [] : [{ ...target, occurredAt }];
+    });
   }
 
   private async queryFilteredRecords(

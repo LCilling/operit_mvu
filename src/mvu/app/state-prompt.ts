@@ -1,4 +1,4 @@
-/** Deterministic model projection for an explicit host scope context. */
+/** Deterministic, bounded model projection for explicit host scope contexts. */
 import type { DataChangeRecord, DataField, MvuDataset, StateScopeContext } from "./model";
 import type {
   ConditionExpression,
@@ -9,11 +9,16 @@ import type {
 import {
   deriveStage,
   fieldAppliesToContext,
+  scopeKey,
   stateValueForField,
 } from "./scope";
 
 export const MODEL_FIELD_LIMIT = 40;
 const MODEL_DIAGNOSTIC_LIMIT = 32;
+const MODEL_DIAGNOSTIC_TEXT_LIMIT = 256;
+const MODEL_LABEL_LIMIT = 32;
+const MODEL_DESCRIPTION_LIMIT = 48;
+const MODEL_ID_LIMIT = 256;
 
 export interface ModelFieldBudgetStats {
   used: number;
@@ -30,76 +35,131 @@ export interface ModelFieldSelection {
   stats: ModelFieldBudgetStats;
 }
 
+export interface ModelFieldRecency {
+  fieldId: string;
+  scopeKey: string;
+  occurredAt: number;
+}
+
 export interface SelectModelFieldsOptions {
   /** A lower caller budget is allowed, but the product hard limit is always 40. */
   maxFields?: number;
-  /** Bounded callers can provide their most recent committed record window. */
-  recentChanges?: readonly Pick<DataChangeRecord, "fieldId" | "occurredAt">[];
-  /** Group prompts rank one shared field definition across every visible member context. */
-  additionalContexts?: readonly StateScopeContext[];
+  /** Exact field/scope recency supplied by the bounded persistent record lookup. */
+  recentChanges?: readonly ModelFieldRecency[];
+  /** Persisted event actor. Undefined means a projection across possible visible actors. */
+  eventActorId?: string | null;
+  /** Selected actor, intentionally distinct from the persisted event actor. */
+  currentActorId?: string | null;
+  /** Optional event time used with the durable cooldown map. */
+  occurredAt?: number;
+  lastTriggeredAtByRuleId?: Readonly<Record<string, number>>;
+}
+
+export interface ModelStateEntry {
+  field: DataField;
+  context: StateScopeContext;
+  scopeKey: string;
+}
+
+export interface ModelStateEntrySelection {
+  entries: ModelStateEntry[];
+  stats: ModelFieldBudgetStats;
+}
+
+export interface ScopedStateSectionProjection {
+  section: string;
+  budget: ModelFieldBudgetStats;
 }
 
 type ModelFieldDataset = MvuDataset | MvuDatasetV3;
 
-/**
- * Deterministically selects the model-visible field definitions. Referenced fields
- * win over visibility and recency. If references alone exceed the hard limit, the
- * same ranking (visibility, recency, order, id) chooses the first 40 and emits an
- * explicit overflow diagnostic; model input never exceeds the hard limit.
- */
+/** Single-context compatibility API backed by the final entry budget. */
 export function selectModelFields(
   dataset: ModelFieldDataset,
   context: StateScopeContext,
   options: SelectModelFieldsOptions = {},
 ): ModelFieldSelection {
+  const selected = selectModelStateEntries(dataset, context, [], options);
+  return { fields: selected.entries.map((entry) => entry.field), stats: selected.stats };
+}
+
+/**
+ * The hard budget unit is one final `(fieldId, scopeKey)` state entry. A group
+ * with 20 members and 40 character fields therefore has 800 candidates but can
+ * serialize at most 40 field rows.
+ */
+export function selectModelStateEntries(
+  dataset: ModelFieldDataset,
+  context: StateScopeContext,
+  memberContexts: readonly StateScopeContext[] = [],
+  options: SelectModelFieldsOptions = {},
+): ModelStateEntrySelection {
   const requestedLimit = options.maxFields ?? MODEL_FIELD_LIMIT;
   if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
     throw new Error("MVU_MODEL_FIELD_LIMIT_INVALID");
   }
   const limit = Math.min(requestedLimit, MODEL_FIELD_LIMIT);
-  const contexts = uniqueScopeContexts([context, ...(options.additionalContexts ?? [])]);
+  const contexts = uniqueScopeContexts([context, ...memberContexts]);
   const diagnostics: string[] = [];
-  const referencedIds = collectReferencedFieldIds(dataset, contexts, diagnostics);
-  const latestChanges = collectLatestChanges(dataset, options.recentChanges);
-  const eligible = dataset.fields.filter((field) => {
-    if (!field.enabled || !contexts.some((candidate) => fieldAppliesToContext(field, candidate))) {
-      return false;
-    }
-    return field.modelVisibility !== "hidden" || referencedIds.has(field.id);
-  });
-  const eligibleIds = new Set(eligible.map((field) => field.id));
-  const referencedTotal = [...referencedIds].filter((id) => eligibleIds.has(id)).length;
-  const ranked = [...eligible].sort((left, right) =>
-    compareModelFields(left, right, referencedIds, latestChanges));
-  const fields = ranked.slice(0, limit);
-  const selectedIds = new Set(fields.map((field) => field.id));
-  const referencedIncluded = [...referencedIds].filter((id) => selectedIds.has(id)).length;
+  const references = collectReferencedEntries(dataset, context, contexts, options, diagnostics);
+  const candidates = buildStateEntries(dataset, context, contexts, references);
+  const candidateKeys = new Set(candidates.map(modelEntryKey));
+  const latestChanges = collectLatestChanges(dataset, options.recentChanges, candidateKeys);
+  const ranked = [...candidates].sort((left, right) =>
+    compareModelEntries(left, right, references, latestChanges));
+  const entries = ranked.slice(0, limit);
+  const selectedKeys = new Set(entries.map(modelEntryKey));
+  const referencedTotal = [...references].filter((key) => candidateKeys.has(key)).length;
+  const referencedIncluded = [...references].filter((key) => selectedKeys.has(key)).length;
   if (referencedTotal > limit) {
     diagnostics.push(`MVU_MODEL_REFERENCED_FIELDS_OVERFLOW:${referencedTotal}:${limit}`);
   }
   return {
-    fields,
+    entries,
     stats: {
-      used: fields.length,
-      total: eligible.length,
+      used: entries.length,
+      total: candidates.length,
       limit,
       referencedIncluded,
       referencedTotal,
-      overflow: eligible.length > limit,
+      overflow: candidates.length > limit,
       diagnostics: boundedDiagnostics(diagnostics),
     },
   };
 }
 
-export function buildStateSectionBlock(
-  dataset: MvuDataset,
+export function modelRecencyTargets(
+  dataset: ModelFieldDataset,
   context: StateScopeContext,
-  fields: readonly DataField[]
+  memberContexts: readonly StateScopeContext[] = [],
+): Array<{ fieldId: string; scopeKey: string }> {
+  const contexts = uniqueScopeContexts([context, ...memberContexts]);
+  const seen = new Set<string>();
+  const result: Array<{ fieldId: string; scopeKey: string }> = [];
+  for (const field of dataset.fields) {
+    if (!field.enabled) continue;
+    const targetContexts = field.scope === "character" ? contexts : [context];
+    for (const candidate of targetContexts) {
+      if (!fieldAppliesToContext(field, candidate)) continue;
+      const key = scopeKey(field.scope, candidate);
+      const identity = modelScopeIdentity(field.id, key);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      result.push({ fieldId: field.id, scopeKey: key });
+    }
+  }
+  return result;
+}
+
+export function buildStateSectionBlock(
+  dataset: ModelFieldDataset,
+  context: StateScopeContext,
+  fields: readonly DataField[],
 ): string {
-  const actorLabel = context.actorName.length > 0 ? context.actorName : "当前上下文";
+  const actorLabel = boundedLine(context.actorName.length > 0 ? context.actorName : "当前上下文", MODEL_LABEL_LIMIT);
   const lines: string[] = [
-    `<WorldState actorId="${escapeXml(context.actorId ?? "")}" actor="${escapeXml(actorLabel)}">`,
-    `[动态状态 · ${sanitizeLine(actorLabel)}]`,
+    `<WorldState actorId="${escapeXml(boundedLine(context.actorId ?? "", MODEL_ID_LIMIT))}" actor="${escapeXml(actorLabel)}">`,
+    `[动态状态 · ${actorLabel}]`,
   ];
   const permittedIds = new Set(fields.map((field) => field.id));
   const selected = selectModelFields(dataset, context).fields.filter((field) => permittedIds.has(field.id));
@@ -108,96 +168,102 @@ export function buildStateSectionBlock(
   return lines.join("\n");
 }
 
-/**
- * Group-aware projection. Character-scoped fields are rendered once for each
- * explicit member identity; group/chat/global fields are rendered once from
- * the active context, so a group prompt cannot duplicate shared state.
- */
-export function buildScopedStateSectionBlock(
-  dataset: MvuDataset,
+export function buildScopedStateSectionProjection(
+  dataset: ModelFieldDataset,
   context: StateScopeContext,
-  memberContexts: readonly StateScopeContext[] = []
-): string {
+  memberContexts: readonly StateScopeContext[] = [],
+  options: SelectModelFieldsOptions = {},
+): ScopedStateSectionProjection {
+  const selection = selectModelStateEntries(dataset, context, memberContexts, options);
+  if (selection.entries.length === 0) return { section: "", budget: selection.stats };
   const lines: string[] = [
-    `<WorldState chatId="${escapeXml(context.chatId ?? "")}" groupId="${escapeXml(context.groupId ?? "")}">`,
+    `<WorldState chatId="${escapeXml(boundedLine(context.chatId ?? "", MODEL_ID_LIMIT))}" groupId="${escapeXml(boundedLine(context.groupId ?? "", MODEL_ID_LIMIT))}">`,
   ];
-  const selectedFields = selectModelFields(dataset, context, {
-    additionalContexts: memberContexts,
-  }).fields;
-  const sharedFields = selectedFields.filter((field) =>
-    field.scope !== "character" && fieldAppliesToContext(field, context));
-  if (sharedFields.length > 0) {
+  const shared = selection.entries.filter((entry) => entry.field.scope !== "character");
+  if (shared.length > 0) {
     lines.push("[共享动态状态]");
-    appendFieldLines(lines, dataset, context, sharedFields);
+    appendEntryLines(lines, dataset, shared);
   }
-
-  const uniqueMembers = new Map<string, StateScopeContext>();
-  if (context.actorId !== null) uniqueMembers.set(context.actorId, context);
-  for (const member of memberContexts) {
-    if (member.actorId !== null && !uniqueMembers.has(member.actorId)) {
-      uniqueMembers.set(member.actorId, member);
-    }
+  const characterGroups = new Map<string, ModelStateEntry[]>();
+  for (const entry of selection.entries) {
+    if (entry.field.scope !== "character" || entry.context.actorId === null) continue;
+    const existing = characterGroups.get(entry.context.actorId) ?? [];
+    existing.push(entry);
+    characterGroups.set(entry.context.actorId, existing);
   }
-  for (const member of uniqueMembers.values()) {
-    const characterFields = selectedFields.filter((field) =>
-      field.scope === "character" && fieldAppliesToContext(field, member));
-    if (characterFields.length === 0) continue;
-    const actorLabel = member.actorName.length > 0 ? member.actorName : member.actorId ?? "";
+  for (const actorId of [...characterGroups.keys()].sort(compareStableText)) {
+    const entries = characterGroups.get(actorId) ?? [];
+    const member = entries[0]?.context;
+    if (member === undefined) continue;
+    const actorLabel = boundedLine(member.actorName.length > 0 ? member.actorName : actorId, MODEL_LABEL_LIMIT);
     lines.push(
-      `<ActorState actorId="${escapeXml(member.actorId ?? "")}" actor="${escapeXml(actorLabel)}">`,
-      `[角色动态状态 · ${sanitizeLine(actorLabel)}]`
+      `<ActorState actorId="${escapeXml(boundedLine(actorId, MODEL_ID_LIMIT))}" actor="${escapeXml(actorLabel)}">`,
+      `[角色动态状态 · ${actorLabel}]`,
     );
-    appendFieldLines(lines, dataset, member, characterFields);
+    appendEntryLines(lines, dataset, entries);
     lines.push("</ActorState>");
   }
-  if (lines.length === 1) return "";
   lines.push("</WorldState>");
-  return lines.join("\n");
+  return { section: lines.join("\n"), budget: selection.stats };
+}
+
+export function buildScopedStateSectionBlock(
+  dataset: ModelFieldDataset,
+  context: StateScopeContext,
+  memberContexts: readonly StateScopeContext[] = [],
+): string {
+  return buildScopedStateSectionProjection(dataset, context, memberContexts).section;
 }
 
 export function visibleFieldsForContext(
-  dataset: MvuDataset,
-  context: StateScopeContext
-): DataField[] {
-  return selectModelFields(dataset, context).fields;
-}
-
-function appendFieldLines(
-  lines: string[],
-  dataset: MvuDataset,
+  dataset: ModelFieldDataset,
   context: StateScopeContext,
-  fields: readonly DataField[]
-): void {
-  for (const field of fields) {
-    if (!fieldAppliesToContext(field, context)) continue;
-    const value = stateValueForField(dataset, field, context);
-    const stage = deriveStage(field, value);
-    if (field.modelVisibility === "stage_only") {
-      lines.push(`- ${sanitizeLine(field.name)}: 阶段「${sanitizeLine(stage.name)}」`);
-      if (stage.description.length > 0) lines.push(`  ${sanitizeLine(stage.description)}`);
-      continue;
-    }
-    lines.push(`- ${sanitizeLine(field.name)}: ${value}（阶段：${sanitizeLine(stage.name)}）`);
-    if (field.description.length > 0) lines.push(`  ${sanitizeLine(field.description)}`);
-    if (stage.description.length > 0) lines.push(`  阶段说明：${sanitizeLine(stage.description)}`);
-  }
+): DataField[] {
+  return dataset.fields.filter((field) =>
+    fieldAppliesToContext(field, context) && field.modelVisibility !== "hidden");
 }
 
-function compareModelFields(
-  left: DataField,
-  right: DataField,
-  referencedIds: ReadonlySet<string>,
+function buildStateEntries(
+  dataset: ModelFieldDataset,
+  rootContext: StateScopeContext,
+  contexts: readonly StateScopeContext[],
+  references: ReadonlySet<string>,
+): ModelStateEntry[] {
+  const entries: ModelStateEntry[] = [];
+  const seen = new Set<string>();
+  for (const field of dataset.fields) {
+    if (!field.enabled) continue;
+    const targetContexts = field.scope === "character" ? contexts : [rootContext];
+    for (const candidate of targetContexts) {
+      if (!fieldAppliesToContext(field, candidate)) continue;
+      const key = scopeKey(field.scope, candidate);
+      const identity = modelScopeIdentity(field.id, key);
+      if (seen.has(identity) || (field.modelVisibility === "hidden" && !references.has(identity))) continue;
+      seen.add(identity);
+      entries.push({ field, context: candidate, scopeKey: key });
+    }
+  }
+  return entries;
+}
+
+function compareModelEntries(
+  left: ModelStateEntry,
+  right: ModelStateEntry,
+  referenced: ReadonlySet<string>,
   latestChanges: ReadonlyMap<string, number>,
 ): number {
-  const referenced = Number(referencedIds.has(right.id)) - Number(referencedIds.has(left.id));
-  if (referenced !== 0) return referenced;
-  const visibility = visibilityRank(right.modelVisibility) - visibilityRank(left.modelVisibility);
+  const leftKey = modelEntryKey(left);
+  const rightKey = modelEntryKey(right);
+  const referenceOrder = Number(referenced.has(rightKey)) - Number(referenced.has(leftKey));
+  if (referenceOrder !== 0) return referenceOrder;
+  const visibility = visibilityRank(right.field.modelVisibility) - visibilityRank(left.field.modelVisibility);
   if (visibility !== 0) return visibility;
-  const leftRecent = latestChanges.get(left.id) ?? Number.NEGATIVE_INFINITY;
-  const rightRecent = latestChanges.get(right.id) ?? Number.NEGATIVE_INFINITY;
+  const leftRecent = latestChanges.get(leftKey) ?? Number.NEGATIVE_INFINITY;
+  const rightRecent = latestChanges.get(rightKey) ?? Number.NEGATIVE_INFINITY;
   if (leftRecent !== rightRecent) return rightRecent > leftRecent ? 1 : -1;
-  if (left.order !== right.order) return left.order - right.order;
-  return compareStableText(left.id, right.id);
+  if (left.field.order !== right.field.order) return left.field.order - right.field.order;
+  const fieldId = compareStableText(left.field.id, right.field.id);
+  return fieldId !== 0 ? fieldId : compareStableText(left.scopeKey, right.scopeKey);
 }
 
 function visibilityRank(visibility: DataField["modelVisibility"]): number {
@@ -208,61 +274,80 @@ function visibilityRank(visibility: DataField["modelVisibility"]): number {
 
 function collectLatestChanges(
   dataset: ModelFieldDataset,
-  explicit: readonly Pick<DataChangeRecord, "fieldId" | "occurredAt">[] | undefined,
+  explicit: readonly ModelFieldRecency[] | undefined,
+  eligible: ReadonlySet<string>,
 ): Map<string, number> {
   const latest = new Map<string, number>();
-  const records = explicit ?? (dataset.formatVersion === 2 ? dataset.records : []);
+  const records: readonly ModelFieldRecency[] = explicit ??
+    (dataset.formatVersion === 2 ? dataset.records : []);
   for (const record of records) {
     if (!Number.isFinite(record.occurredAt)) continue;
-    const previous = latest.get(record.fieldId);
-    if (previous === undefined || record.occurredAt > previous) {
-      latest.set(record.fieldId, record.occurredAt);
-    }
+    const identity = modelScopeIdentity(record.fieldId, record.scopeKey);
+    if (!eligible.has(identity)) continue;
+    const previous = latest.get(identity);
+    if (previous === undefined || record.occurredAt > previous) latest.set(identity, record.occurredAt);
   }
   return latest;
 }
 
-function collectReferencedFieldIds(
+function collectReferencedEntries(
   dataset: ModelFieldDataset,
+  rootContext: StateScopeContext,
   contexts: readonly StateScopeContext[],
+  options: SelectModelFieldsOptions,
+  diagnostics: string[],
+): Set<string> {
+  const references = new Set<string>();
+  const fieldsById = new Map(dataset.fields.map((field) => [field.id, field]));
+  const eventContexts = eventContextsForSelection(rootContext, contexts, options.eventActorId);
+  const referencesByEvent = eventContexts.map((eventContext) => ({
+    eventContext,
+    fieldIds: dataset.formatVersion === 3
+      ? collectV3ReferenceIds(dataset, rootContext, eventContext, options, diagnostics)
+      : collectV2ReferenceIds(dataset, diagnostics),
+  }));
+  for (const { eventContext, fieldIds } of referencesByEvent) {
+    for (const fieldId of fieldIds) {
+      const field = fieldsById.get(fieldId);
+      if (field === undefined) {
+        diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_MISSING:${fieldId}`);
+        continue;
+      }
+      if (!field.enabled) {
+        diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_DISABLED:${fieldId}`);
+        continue;
+      }
+      if (field.scope === "character") {
+        if (!fieldAppliesToContext(field, eventContext)) {
+          diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_OUT_OF_SCOPE:${fieldId}`);
+          continue;
+        }
+        references.add(modelScopeIdentity(fieldId, scopeKey(field.scope, eventContext)));
+        continue;
+      }
+      if (!fieldAppliesToContext(field, rootContext)) {
+        diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_OUT_OF_SCOPE:${fieldId}`);
+        continue;
+      }
+      references.add(modelScopeIdentity(fieldId, scopeKey(field.scope, rootContext)));
+    }
+  }
+  return references;
+}
+
+function collectV3ReferenceIds(
+  dataset: MvuDatasetV3,
+  rootContext: StateScopeContext,
+  eventContext: StateScopeContext,
+  options: SelectModelFieldsOptions,
   diagnostics: string[],
 ): Set<string> {
   const referenced = new Set<string>();
-  const fieldsById = new Map(dataset.fields.map((field) => [field.id, field]));
-  const addField = (fieldId: string): void => {
-    const field = fieldsById.get(fieldId);
-    if (field === undefined) {
-      diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_MISSING:${fieldId}`);
-      return;
-    }
-    if (!field.enabled) {
-      diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_DISABLED:${fieldId}`);
-      return;
-    }
-    if (!contexts.some((context) => fieldAppliesToContext(field, context))) {
-      diagnostics.push(`MVU_MODEL_REFERENCE_FIELD_OUT_OF_SCOPE:${fieldId}`);
-      return;
-    }
-    referenced.add(fieldId);
-  };
-  if (dataset.formatVersion === 3) {
-    collectV3References(dataset, contexts, addField, diagnostics);
-  } else {
-    collectV2References(dataset, addField, diagnostics);
-  }
-  return referenced;
-}
-
-function collectV3References(
-  dataset: MvuDatasetV3,
-  contexts: readonly StateScopeContext[],
-  addField: (fieldId: string) => void,
-  diagnostics: string[],
-): void {
   const conditions = new Map(dataset.conditions.map((condition) => [condition.id, condition]));
   const effects = new Map(dataset.effectGroups.map((effect) => [effect.id, effect]));
-  for (const rule of [...dataset.rules].sort((left, right) => compareRule(left, right))) {
-    if (!rule.enabled || !ruleAppliesToContexts(rule, contexts)) continue;
+  const currentActorId = options.currentActorId === undefined ? rootContext.actorId : options.currentActorId;
+  for (const rule of [...dataset.rules].sort(compareRule)) {
+    if (!ruleIsReachable(rule, eventContext, currentActorId, options)) continue;
     const condition = conditions.get(rule.conditionId);
     if (condition === undefined) {
       diagnostics.push(`MVU_MODEL_REFERENCE_CONDITION_MISSING:${rule.conditionId}`);
@@ -272,32 +357,30 @@ function collectV3References(
       diagnostics.push(`MVU_MODEL_REFERENCE_CONDITION_DISABLED:${condition.id}`);
       continue;
     }
-    collectConditionFields(condition.expression, addField);
+    collectConditionFields(condition.expression, referenced);
     for (const action of rule.actions) {
       if (action.kind === "change_field") {
-        addField(action.fieldId);
+        referenced.add(action.fieldId);
         for (const effectGroupId of action.effectGroupIds) {
-          collectEffectFields(effectGroupId, effects, addField, diagnostics);
+          collectEffectFields(effectGroupId, effects, referenced, diagnostics);
         }
       } else {
-        collectEffectFields(action.effectGroupId, effects, addField, diagnostics);
+        collectEffectFields(action.effectGroupId, effects, referenced, diagnostics);
       }
     }
   }
+  return referenced;
 }
 
-function collectV2References(
-  dataset: MvuDataset,
-  addField: (fieldId: string) => void,
-  diagnostics: string[],
-): void {
+function collectV2ReferenceIds(dataset: MvuDataset, diagnostics: string[]): Set<string> {
+  const referenced = new Set<string>();
   const effects = new Map(dataset.temporaryEffects.map((effect) => [effect.id, effect]));
   for (const rule of [...dataset.autoRules].sort((left, right) =>
     left.order - right.order || compareStableText(left.id, right.id))) {
     if (!rule.enabled) continue;
-    if (rule.condition.kind === "stateThreshold") addField(rule.condition.fieldId);
+    if (rule.condition.kind === "stateThreshold") referenced.add(rule.condition.fieldId);
     for (const effect of rule.effects) {
-      addField(effect.fieldId);
+      referenced.add(effect.fieldId);
       for (const effectId of effect.temporaryEffectIds) {
         const temporary = effects.get(effectId);
         if (temporary === undefined) {
@@ -308,31 +391,62 @@ function collectV2References(
           diagnostics.push(`MVU_MODEL_REFERENCE_EFFECT_GROUP_DISABLED:${effectId}`);
           continue;
         }
-        for (const target of temporary.targets) addField(target.fieldId);
+        for (const target of temporary.targets) referenced.add(target.fieldId);
       }
     }
   }
+  return referenced;
 }
 
-function collectConditionFields(
-  expression: ConditionExpression,
-  addField: (fieldId: string) => void,
-): void {
+function ruleIsReachable(
+  rule: RuleDefinitionV3,
+  eventContext: StateScopeContext,
+  currentActorId: string | null,
+  options: SelectModelFieldsOptions,
+): boolean {
+  if (!rule.enabled || eventContext.actorId === null) return false;
+  const selector = rule.triggerActorSelector;
+  const actorMatches = selector.kind === "any" ||
+    (selector.kind === "current_actor" && currentActorId !== null && eventContext.actorId === currentActorId) ||
+    (selector.kind === "selected" && selector.actorIds.includes(eventContext.actorId)) ||
+    (selector.kind === "group" && eventContext.groupId !== null && selector.groupIds.includes(eventContext.groupId));
+  if (!actorMatches || !Number.isFinite(rule.cooldownHours) || rule.cooldownHours < 0) return false;
+  if (options.occurredAt === undefined) return true;
+  if (!Number.isFinite(options.occurredAt)) return false;
+  const lastTriggered = options.lastTriggeredAtByRuleId?.[rule.id];
+  return lastTriggered === undefined ||
+    options.occurredAt - lastTriggered >= rule.cooldownHours * 3_600_000;
+}
+
+function eventContextsForSelection(
+  rootContext: StateScopeContext,
+  contexts: readonly StateScopeContext[],
+  eventActorId: string | null | undefined,
+): StateScopeContext[] {
+  if (eventActorId !== undefined) {
+    if (eventActorId === null) return [];
+    const exact = contexts.find((context) => context.actorId === eventActorId);
+    return [exact ?? { ...rootContext, actorId: eventActorId }];
+  }
+  return contexts.filter((context) => context.actorId !== null);
+}
+
+function collectConditionFields(expression: ConditionExpression, output: Set<string>): void {
   if (expression.kind === "and" || expression.kind === "or") {
-    for (const child of expression.children) collectConditionFields(child, addField);
+    for (const child of expression.children) collectConditionFields(child, output);
     return;
   }
   if (expression.kind === "not") {
-    collectConditionFields(expression.child, addField);
+    collectConditionFields(expression.child, output);
     return;
   }
-  if (expression.predicate.kind === "field_comparison") addField(expression.predicate.fieldId);
+  if (expression.predicate.kind === "field_comparison") output.add(expression.predicate.fieldId);
 }
 
 function collectEffectFields(
   effectGroupId: string,
   effects: ReadonlyMap<string, EffectGroupDefinition>,
-  addField: (fieldId: string) => void,
+  output: Set<string>,
   diagnostics: string[],
 ): void {
   const effect = effects.get(effectGroupId);
@@ -344,20 +458,48 @@ function collectEffectFields(
     diagnostics.push(`MVU_MODEL_REFERENCE_EFFECT_GROUP_DISABLED:${effectGroupId}`);
     return;
   }
-  for (const fieldEffect of effect.fieldEffects) addField(fieldEffect.fieldId);
+  for (const fieldEffect of effect.fieldEffects) output.add(fieldEffect.fieldId);
 }
 
-function ruleAppliesToContexts(
-  rule: RuleDefinitionV3,
-  contexts: readonly StateScopeContext[],
-): boolean {
-  const selector = rule.triggerActorSelector;
-  if (selector.kind === "any") return true;
-  if (selector.kind === "current_actor") return contexts.some((context) => context.actorId !== null);
-  if (selector.kind === "selected") {
-    return contexts.some((context) => context.actorId !== null && selector.actorIds.includes(context.actorId));
+function appendEntryLines(
+  lines: string[],
+  dataset: ModelFieldDataset,
+  entries: readonly ModelStateEntry[],
+): void {
+  for (const entry of entries) appendFieldLine(lines, dataset, entry.context, entry.field);
+}
+
+function appendFieldLines(
+  lines: string[],
+  dataset: ModelFieldDataset,
+  context: StateScopeContext,
+  fields: readonly DataField[],
+): void {
+  for (const field of fields) {
+    if (fieldAppliesToContext(field, context)) appendFieldLine(lines, dataset, context, field);
   }
-  return contexts.some((context) => context.groupId !== null && selector.groupIds.includes(context.groupId));
+}
+
+function appendFieldLine(
+  lines: string[],
+  dataset: ModelFieldDataset,
+  context: StateScopeContext,
+  field: DataField,
+): void {
+  const value = stateValueForField(dataset, field, context);
+  const stage = deriveStage(field, value);
+  const fieldName = boundedLine(field.name, MODEL_LABEL_LIMIT);
+  const stageName = boundedLine(stage.name, MODEL_LABEL_LIMIT);
+  if (field.modelVisibility === "stage_only") {
+    lines.push(`- ${fieldName}: 阶段「${stageName}」`);
+    if (stage.description.length > 0) lines.push(`  ${boundedLine(stage.description, MODEL_DESCRIPTION_LIMIT)}`);
+    return;
+  }
+  lines.push(`- ${fieldName}: ${value}（阶段：${stageName}）`);
+  if (field.description.length > 0) lines.push(`  ${boundedLine(field.description, MODEL_DESCRIPTION_LIMIT)}`);
+  if (stage.description.length > 0) {
+    lines.push(`  阶段说明：${boundedLine(stage.description, MODEL_DESCRIPTION_LIMIT)}`);
+  }
 }
 
 function compareRule(left: RuleDefinitionV3, right: RuleDefinitionV3): number {
@@ -371,29 +513,39 @@ function uniqueScopeContexts(contexts: readonly StateScopeContext[]): StateScope
     const key = `${context.chatId ?? ""}\u0000${context.actorId ?? ""}\u0000${context.groupId ?? ""}`;
     if (!unique.has(key)) unique.set(key, context);
   }
-  return [...unique.values()];
+  return [...unique.values()].sort((left, right) => compareStableText(
+    `${left.actorId ?? ""}\u0000${left.groupId ?? ""}\u0000${left.chatId ?? ""}`,
+    `${right.actorId ?? ""}\u0000${right.groupId ?? ""}\u0000${right.chatId ?? ""}`,
+  ));
+}
+
+function modelEntryKey(entry: ModelStateEntry): string {
+  return modelScopeIdentity(entry.field.id, entry.scopeKey);
+}
+
+function modelScopeIdentity(fieldId: string, key: string): string {
+  return `${fieldId.length}:${fieldId}${key}`;
 }
 
 function boundedDiagnostics(diagnostics: readonly string[]): string[] {
-  const unique = [...new Set(diagnostics)].sort(compareStableText);
+  const unique = [...new Set(diagnostics.map((diagnostic) =>
+    boundedLine(diagnostic, MODEL_DIAGNOSTIC_TEXT_LIMIT)))].sort(compareStableText);
   if (unique.length <= MODEL_DIAGNOSTIC_LIMIT) return unique;
   const retained = unique.slice(0, MODEL_DIAGNOSTIC_LIMIT - 1);
   retained.push(`MVU_MODEL_DIAGNOSTICS_TRUNCATED:${unique.length}`);
   return retained;
 }
 
-function compareStableText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function sanitizeLine(value: string): string {
-  return value.replace(/[\r\n]+/g, " ").trim();
+function boundedLine(value: string, maximum: number): string {
+  const sanitized = value.replace(/[\r\n]+/g, " ").trim();
+  const characters = Array.from(sanitized);
+  return characters.length <= maximum ? sanitized : characters.slice(0, maximum).join("");
 }
 
 function escapeXml(value: string): string {
-  return sanitizeLine(value)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function compareStableText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

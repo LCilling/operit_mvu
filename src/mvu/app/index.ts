@@ -1,7 +1,9 @@
 /** MVU application runtime composition. */
 import type { CommandExecutorHooks } from "../core/command-executor";
 import { createEventBus, type MvuEventBus } from "../core/events";
+import { generateSchema } from "../core/schema";
 import { createDefaultPortContext, type MvuPortContext } from "../port/context";
+import { klona } from "../port/util";
 import { HostActorDirectory } from "./actor-source";
 import {
   createFullBackupExport,
@@ -40,6 +42,7 @@ import {
 import {
   buildScopedStateSectionBlock,
   buildStateSectionBlock,
+  type ModelFieldBudgetStats,
   visibleFieldsForContext,
 } from "./state-prompt";
 import type { MvuFileApi, MvuStore } from "./store";
@@ -84,6 +87,7 @@ export interface MvuRuntime {
   importDataset(request: DatasetImportRestoreRequest): Promise<DatasetImportRestoreResult>;
   snapshot(context: StateScopeContext): Promise<MvuSnapshotView>;
   buildMvuData(context: StateScopeContext): Promise<ReturnType<typeof buildMvuData>>;
+  modelBudget(context: StateScopeContext): Promise<ModelFieldBudgetStats>;
   applyCommand(
     context: StateScopeContext,
     commandText: string,
@@ -159,14 +163,33 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
       };
     },
     async buildMvuData(activeContext) {
-      return buildMvuData(await service.getDataset(), activeContext);
+      const [dataset, projection] = await Promise.all([
+        service.getDataset(),
+        service.projectModelFields(activeContext),
+      ]);
+      const data = buildMvuData(modelProjectionDataset(dataset, projection.fields), activeContext);
+      const states = data.stat_data.states as Record<string, unknown>;
+      for (const field of projection.fields) {
+        if (field.definition.modelVisibility !== "stage_only" || field.currentStage === null) continue;
+        states[field.definition.id] = [field.currentStage.name, field.definition.description];
+      }
+      const schema = generateSchema(klona(data.stat_data));
+      if (schema.type === "object") {
+        data.schema = schema;
+        data.schema.strictSet = true;
+        data.schema.strictTemplate = true;
+        data.schema.concatTemplateArray = false;
+      }
+      return data;
+    },
+    async modelBudget(activeContext) {
+      return (await service.projectModelFields(activeContext)).budget;
     },
     async applyCommand(activeContext, commandText, audit) {
       return service.applyCommand(activeContext, commandText, audit);
     },
     async buildStateSection(activeContext, memberContexts = []) {
-      const dataset = await service.getDataset();
-      return buildScopedStateSectionBlock(dataset, activeContext, memberContexts);
+      return (await service.buildModelStateSection(activeContext, memberContexts)).section;
     },
     listActors() {
       return actors.listCharacters();
@@ -193,6 +216,23 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
       return service.clearRecords();
     },
   };
+}
+
+function modelProjectionDataset(
+  dataset: MvuDataset,
+  projections: readonly FieldStateProjection[],
+): MvuDataset {
+  const projected: MvuDataset = {
+    ...dataset,
+    fields: projections.map((projection) => projection.definition),
+    stateValues: {},
+  };
+  for (const projection of projections) {
+    if (!projection.bound || projection.scopeKey === null || projection.currentValue === null) continue;
+    projected.stateValues[projection.scopeKey] ??= {};
+    projected.stateValues[projection.scopeKey]![projection.definition.id] = projection.currentValue;
+  }
+  return projected;
 }
 
 interface ToolFileOperationResult {

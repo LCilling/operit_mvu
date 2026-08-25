@@ -1656,13 +1656,13 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
     ToolPkg.ipc.on<unknown, JudgeStateResponse>(
       MVU_IPC.judgeState,
       guarded("judgeState", MVU_REQUEST_PARSERS.judgeState, async (request) => {
-        const [fields, recentFacts] = await Promise.all([
-          runtime.service.projectFields(request.scopeContext),
+        const [projection, recentFacts] = await Promise.all([
+          runtime.service.projectModelFields(request.scopeContext),
           runtime.getRecentMessageFacts(request.scopeContext, 20),
         ]);
         const judgement = await deps.systemModel.judgeState({
           context: request.scopeContext,
-          fields,
+          fields: projection.fields,
           recentFacts,
           message: request.message,
         });

@@ -12,10 +12,21 @@ import type {
 import type { AiSemanticPredicate } from "./model-v3";
 import { MODEL_FIELD_LIMIT } from "./state-prompt";
 
-const MODEL_MESSAGE_CONTENT_MAX_LENGTH = 8_192;
-const MODEL_FACT_CONTENT_MAX_LENGTH = 2_048;
+const MODEL_PROMPT_MAX_BYTES = 65_536;
+const MODEL_MESSAGE_CONTENT_MAX_LENGTH = 4_096;
+const MODEL_FACT_CONTENT_MAX_LENGTH = 512;
 const MODEL_ID_MAX_LENGTH = 256;
 const MODEL_NAME_MAX_LENGTH = 128;
+const MODEL_FIELD_NAME_MAX_LENGTH = 32;
+const MODEL_FIELD_DESCRIPTION_MAX_LENGTH = 48;
+const MODEL_STAGE_NAME_MAX_LENGTH = 32;
+const MODEL_STAGE_DESCRIPTION_MAX_LENGTH = 48;
+const MODEL_FIELD_INSTRUCTION_MAX_LENGTH = 64;
+const MODEL_RULE_NAME_MAX_LENGTH = 32;
+const MODEL_TRIGGER_TYPE_MAX_LENGTH = 64;
+const MODEL_REQUIREMENT_MAX_LENGTH = 128;
+const MODEL_RULE_LIMIT = 20;
+const MODEL_CONDITION_LIMIT = 40;
 
 export interface BackgroundModelProbeResult {
   available: boolean;
@@ -61,6 +72,8 @@ export interface RoleAwareConditionMessage {
 }
 
 export interface ConditionJudgementRequest {
+  /** Trusted production scope; omitted only by the v2 compatibility API. */
+  context?: StateScopeContext;
   predicates: readonly AiSemanticPredicate[];
   message: RoleAwareConditionMessage;
 }
@@ -207,9 +220,12 @@ export class HostSystemModelApi implements SystemModelApi {
     }
 
     try {
+      const systemPrompt = buildJudgementSystemPrompt(request.context, eligibleFields);
+      const userPrompt = buildJudgementUserPrompt(request.recentFacts, message);
+      requireBoundedPrompts(systemPrompt, userPrompt);
       const completion = await this.host.complete({
-        systemPrompt: buildJudgementSystemPrompt(request.context, eligibleFields),
-        userPrompt: buildJudgementUserPrompt(request.recentFacts, message),
+        systemPrompt,
+        userPrompt,
         // Reasoning-capable local models can expose private reasoning separately while the
         // provider constrains the public content to this schema. Without this request, some
         // models prepend <think> text and correctly fail the strict whole-response parser.
@@ -235,18 +251,22 @@ export class HostSystemModelApi implements SystemModelApi {
       rule.enabled && rule.condition.kind === "aiJudgement"
     );
     if (rules.length === 0) throw new Error("MVU_AI_RULES_EMPTY");
+    if (rules.length > MODEL_RULE_LIMIT) throw new Error("MVU_AI_RULE_LIMIT_EXCEEDED");
 
     const capability = await this.probe();
     if (!capability.available) return { available: false, judgements: [], raw: "" };
 
     try {
+      const systemPrompt = buildRuleJudgementSystemPrompt(
+        request.context,
+        rules,
+        request.fields.slice(0, MODEL_FIELD_LIMIT),
+      );
+      const userPrompt = buildJudgementUserPrompt(request.recentFacts, message);
+      requireBoundedPrompts(systemPrompt, userPrompt);
       const completion = await this.host.complete({
-        systemPrompt: buildRuleJudgementSystemPrompt(
-          request.context,
-          rules,
-          request.fields.slice(0, MODEL_FIELD_LIMIT),
-        ),
-        userPrompt: buildJudgementUserPrompt(request.recentFacts, message),
+        systemPrompt,
+        userPrompt,
         jsonSchema: RULE_JUDGEMENT_JSON_SCHEMA,
       });
       const document = parseStrictRuleJudgement(completion.text);
@@ -264,6 +284,9 @@ export class HostSystemModelApi implements SystemModelApi {
 
   async judgeConditions(request: ConditionJudgementRequest): Promise<ConditionJudgementResult> {
     if (request.predicates.length === 0) throw new Error("MVU_AI_CONDITIONS_EMPTY");
+    if (request.predicates.length > MODEL_CONDITION_LIMIT) {
+      throw new Error("MVU_AI_CONDITION_LIMIT_EXCEEDED");
+    }
     if (request.message.content.trim().length === 0) throw new Error("MVU_AI_CONDITION_MESSAGE_EMPTY");
     const predicateIds = request.predicates.map((predicate) => predicate.id);
     if (new Set(predicateIds).size !== predicateIds.length) {
@@ -273,9 +296,12 @@ export class HostSystemModelApi implements SystemModelApi {
     if (!capability.available) return { available: false, judgements: [], raw: "" };
 
     try {
+      const systemPrompt = buildConditionJudgementSystemPrompt(request.predicates, request.context);
+      const userPrompt = JSON.stringify(normalizeConditionMessage(request.message, request.context));
+      requireBoundedPrompts(systemPrompt, userPrompt);
       const completion = await this.host.complete({
-        systemPrompt: buildConditionJudgementSystemPrompt(request.predicates),
-        userPrompt: JSON.stringify(normalizeConditionMessage(request.message)),
+        systemPrompt,
+        userPrompt,
         jsonSchema: CONDITION_JUDGEMENT_JSON_SCHEMA,
       });
       const document = parseStrictConditionJudgement(completion.text);
@@ -288,13 +314,23 @@ export class HostSystemModelApi implements SystemModelApi {
   }
 }
 
-function buildConditionJudgementSystemPrompt(predicates: readonly AiSemanticPredicate[]): string {
+function buildConditionJudgementSystemPrompt(
+  predicates: readonly AiSemanticPredicate[],
+  context: StateScopeContext | undefined,
+): string {
+  const contract = predicates.map((predicate) => ({
+    id: requireBoundedIdentifier(predicate.id),
+    triggerType: boundedModelText(predicate.triggerType, MODEL_TRIGGER_TYPE_MAX_LENGTH),
+    requirement: boundedModelText(predicate.requirement, MODEL_REQUIREMENT_MAX_LENGTH),
+    minimumConfidence: predicate.minimumConfidence,
+  }));
   return [
     "你是规则条件判断器，只根据给定的单条角色感知消息判断每个语义条件。",
     "只输出一个 JSON 对象，禁止 Markdown、代码围栏、解释或字段修改命令。",
     'JSON 必须严格符合：{"judgements":[{"predicateId":"条件ID","matched":true或false,"confidence":0到1数字}]}。',
     "每个候选条件必须恰好返回一次，不得添加、遗漏或改写 predicateId。",
-    `候选条件：${JSON.stringify(predicates)}`,
+    ...(context === undefined ? [] : [`上下文：${JSON.stringify(boundedScopeContext(context))}`]),
+    `候选条件：${JSON.stringify(contract)}`,
   ].join("\n");
 }
 
@@ -309,10 +345,14 @@ function buildJudgementSystemPrompt(
       throw new Error(`MVU_AI_FIELD_PROJECTION_INCOMPLETE:${field.id}`);
     }
     return {
-      fieldId: field.id,
-      name: field.name,
-      description: field.description,
-      currentStage: currentStage.name,
+      fieldId: requireBoundedIdentifier(field.id),
+      name: boundedModelText(field.name, MODEL_FIELD_NAME_MAX_LENGTH),
+      description: boundedModelText(field.description, MODEL_FIELD_DESCRIPTION_MAX_LENGTH),
+      currentStage: boundedModelText(currentStage.name, MODEL_STAGE_NAME_MAX_LENGTH),
+      currentStageDescription: boundedModelText(
+        currentStage.description,
+        MODEL_STAGE_DESCRIPTION_MAX_LENGTH,
+      ),
       ...(field.modelVisibility === "stage_only" ? {} : {
         currentValue: projection.currentValue,
         minimum: field.minimum,
@@ -320,7 +360,7 @@ function buildJudgementSystemPrompt(
       }),
       maxAbsoluteDelta: field.ai.maxDelta,
       minimumConfidence: field.ai.minConfidence,
-      fieldInstruction: field.ai.prompt,
+      fieldInstruction: boundedModelText(field.ai.prompt, MODEL_FIELD_INSTRUCTION_MAX_LENGTH),
     };
   });
   return [
@@ -328,7 +368,7 @@ function buildJudgementSystemPrompt(
     "只输出一个 JSON 对象，禁止 Markdown、代码围栏、解释或命令文本。",
     'JSON 必须严格符合：{"changes":[{"fieldId":"字段ID","delta":数字,"reason":"简短事实理由","confidence":0到1数字}]}。',
     "没有可靠变化时输出 {\"changes\":[]}。每个字段最多出现一次，不得输出未列出的字段。",
-    `上下文：${JSON.stringify(context)}`,
+    `上下文：${JSON.stringify(boundedScopeContext(context))}`,
     `可判断字段：${JSON.stringify(fieldContract)}`,
   ].join("\n");
 }
@@ -359,9 +399,11 @@ function buildRuleJudgementSystemPrompt(
   const fieldStates = fields
     .filter((projection) => projection.bound && projection.currentValue !== null)
     .map((projection) => ({
-      fieldId: projection.definition.id,
-      name: projection.definition.name,
-      stage: projection.currentStage?.name ?? null,
+      fieldId: requireBoundedIdentifier(projection.definition.id),
+      name: boundedModelText(projection.definition.name, MODEL_FIELD_NAME_MAX_LENGTH),
+      stage: projection.currentStage === null
+        ? null
+        : boundedModelText(projection.currentStage.name, MODEL_STAGE_NAME_MAX_LENGTH),
       ...(projection.definition.modelVisibility === "stage_only"
         ? {}
         : { value: projection.currentValue }),
@@ -371,10 +413,10 @@ function buildRuleJudgementSystemPrompt(
       throw new Error(`MVU_AI_RULE_CONDITION_INVALID:${rule.id}`);
     }
     return {
-      ruleId: rule.id,
-      name: rule.name,
-      triggerType: rule.condition.triggerType,
-      requirement: rule.condition.requirement,
+      ruleId: requireBoundedIdentifier(rule.id),
+      name: boundedModelText(rule.name, MODEL_RULE_NAME_MAX_LENGTH),
+      triggerType: boundedModelText(rule.condition.triggerType, MODEL_TRIGGER_TYPE_MAX_LENGTH),
+      requirement: boundedModelText(rule.condition.requirement, MODEL_REQUIREMENT_MAX_LENGTH),
       minimumConfidence: rule.condition.minimumConfidence,
     };
   });
@@ -384,7 +426,7 @@ function buildRuleJudgementSystemPrompt(
     "只输出一个 JSON 对象，禁止 Markdown、代码围栏、解释或字段修改命令。",
     'JSON 必须严格符合：{"matches":[{"ruleId":"规则ID","matched":true或false,"confidence":0到1数字,"reason":"简短事实理由"}]}。',
     "每个候选规则必须恰好返回一次；未满足时 matched 为 false。不得输出未列出的规则。",
-    `上下文：${JSON.stringify(context)}`,
+    `上下文：${JSON.stringify(boundedScopeContext(context))}`,
     `当前状态：${JSON.stringify(fieldStates)}`,
     `候选规则：${JSON.stringify(ruleContract)}`,
   ].join("\n");
@@ -406,8 +448,8 @@ function normalizeCurrentMessage(
   const structured = typeof message === "string" ? null : message;
   return {
     role: structured?.role ?? "unknown",
-    actorId: boundedNullableText(structured?.actorId ?? context.actorId, MODEL_ID_MAX_LENGTH),
-    actorName: boundedModelText(structured?.actorName ?? context.actorName, MODEL_NAME_MAX_LENGTH),
+    actorId: boundedNullableText(context.actorId, MODEL_ID_MAX_LENGTH),
+    actorName: boundedModelText(context.actorName, MODEL_NAME_MAX_LENGTH),
     chatId: boundedNullableText(context.chatId, MODEL_ID_MAX_LENGTH),
     groupId: boundedNullableText(context.groupId, MODEL_ID_MAX_LENGTH),
     content: boundedModelText(
@@ -417,12 +459,28 @@ function normalizeCurrentMessage(
   };
 }
 
-function normalizeConditionMessage(message: RoleAwareConditionMessage): RoleAwareConditionMessage {
+function normalizeConditionMessage(
+  message: RoleAwareConditionMessage,
+  context: StateScopeContext | undefined,
+): RoleAwareConditionMessage & { chatId?: string | null; groupId?: string | null } {
   return {
     role: message.role,
-    actorId: boundedNullableText(message.actorId, MODEL_ID_MAX_LENGTH),
-    actorName: boundedModelText(message.actorName, MODEL_NAME_MAX_LENGTH),
+    actorId: boundedNullableText(context?.actorId ?? message.actorId, MODEL_ID_MAX_LENGTH),
+    actorName: boundedModelText(context?.actorName ?? message.actorName, MODEL_NAME_MAX_LENGTH),
+    ...(context === undefined ? {} : {
+      chatId: boundedNullableText(context.chatId, MODEL_ID_MAX_LENGTH),
+      groupId: boundedNullableText(context.groupId, MODEL_ID_MAX_LENGTH),
+    }),
     content: boundedModelText(message.content, MODEL_MESSAGE_CONTENT_MAX_LENGTH).trim(),
+  };
+}
+
+function boundedScopeContext(context: StateScopeContext): StateScopeContext {
+  return {
+    chatId: boundedNullableText(context.chatId, MODEL_ID_MAX_LENGTH),
+    actorId: boundedNullableText(context.actorId, MODEL_ID_MAX_LENGTH),
+    groupId: boundedNullableText(context.groupId, MODEL_ID_MAX_LENGTH),
+    actorName: boundedModelText(context.actorName, MODEL_NAME_MAX_LENGTH),
   };
 }
 
@@ -432,8 +490,43 @@ function boundedNullableText(value: string | null, maximum: number): string | nu
 }
 
 function boundedModelText(value: string, maximum: number): string {
-  const characters = Array.from(value);
-  return characters.length <= maximum ? value : characters.slice(0, maximum).join("");
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, " ");
+  const characters = Array.from(normalized);
+  return characters.length <= maximum ? normalized : characters.slice(0, maximum).join("");
+}
+
+function requireBoundedIdentifier(value: string): string {
+  if (Array.from(value).length > MODEL_ID_MAX_LENGTH) throw new Error("MVU_AI_IDENTIFIER_TOO_LONG");
+  return value;
+}
+
+function requireBoundedPrompts(systemPrompt: string, userPrompt: string): void {
+  const systemBytes = utf8ByteLength(systemPrompt);
+  const userBytes = utf8ByteLength(userPrompt);
+  if (systemBytes > MODEL_PROMPT_MAX_BYTES) {
+    throw new Error("MVU_AI_SYSTEM_PROMPT_LIMIT_EXCEEDED");
+  }
+  if (userBytes > MODEL_PROMPT_MAX_BYTES) {
+    throw new Error("MVU_AI_USER_PROMPT_LIMIT_EXCEEDED");
+  }
+  if (systemBytes + userBytes > MODEL_PROMPT_MAX_BYTES) {
+    throw new Error("MVU_AI_TOTAL_PROMPT_LIMIT_EXCEEDED");
+  }
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x7f) bytes += 1;
+    else if (codeUnit <= 0x7ff) bytes += 2;
+    else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+      bytes += 4;
+      index += 1;
+    } else bytes += 3;
+  }
+  return bytes;
 }
 
 function parseStrictJudgement(raw: string): StrictJudgementDocument {

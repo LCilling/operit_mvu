@@ -4,10 +4,18 @@ import test from "node:test";
 import {
   MODEL_FIELD_LIMIT,
   buildStateSectionBlock,
+  buildScopedStateSectionProjection,
   selectModelFields,
+  visibleFieldsForContext,
 } from "../dist/mvu/app/state-prompt.js";
 import { HostSystemModelApi } from "../dist/mvu/app/system-model.js";
 import { MvuService } from "../dist/mvu/app/service.js";
+import { createRuntime } from "../dist/mvu/app/index.js";
+import { createEmptyRecordManifest, SegmentedRecordStore } from "../dist/mvu/app/record-store.js";
+import { FileMvuStore } from "../dist/mvu/app/store.js";
+import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
+import { installMvuIpc } from "../dist/shared/ipc.js";
+import { createFakeMvuFileApi } from "./helpers.mjs";
 
 const CONTEXT = { chatId: "chat-main", actorId: "actor-t", groupId: "group-main", actorName: "T" };
 
@@ -156,16 +164,19 @@ test("uses every eligible field below the limit and reports bounded budget stati
   });
 });
 
-test("service preserves projectFields while exposing the same bounded statistics separately", async () => {
+test("service preserves all projectFields for runtime/UI while model projection stays bounded", async () => {
   const source = legacyDataset(Array.from({ length: 44 }, (_, index) => field(`service-${index}`, index)));
   const store = {
     async read() { return { revision: source.revision, dataset: structuredClone(source) }; },
     async transact() { throw new Error("unexpected mutation"); },
   };
   const service = new MvuService(store, {});
+  const runtime = createRuntime({ store, initialActors: [] });
 
   const detailed = await service.projectModelFields(CONTEXT);
   const compatible = await service.projectFields(CONTEXT);
+  const snapshot = await runtime.snapshot(CONTEXT);
+  const modelData = await runtime.buildMvuData(CONTEXT);
 
   assert.equal(detailed.fields.length, 40);
   assert.deepEqual(detailed.budget, {
@@ -177,7 +188,11 @@ test("service preserves projectFields while exposing the same bounded statistics
     overflow: true,
     diagnostics: [],
   });
-  assert.deepEqual(compatible, detailed.fields);
+  assert.equal(compatible.length, 44);
+  assert.deepEqual(compatible.map((item) => item.definition.id), source.fields.map((item) => item.id));
+  assert.equal(snapshot.fields.length, 44);
+  assert.equal(Object.keys(modelData.stat_data.states).length, 40);
+  assert.equal(visibleFieldsForContext(source, CONTEXT).length, 44);
 });
 
 test("caps ordinary fields at 40 and is deterministic for identical and reordered input", () => {
@@ -274,13 +289,188 @@ test("uses visibility, recent change, order and stable id as deterministic tie-b
   const selected = selectModelFields(input, CONTEXT, {
     maxFields: 3,
     recentChanges: [
-      { fieldId: "recent-a", occurredAt: 20 },
-      { fieldId: "recent-b", occurredAt: 20 },
-      { fieldId: "old", occurredAt: 10 },
+      { fieldId: "recent-a", scopeKey: "character:actor-t", occurredAt: 20 },
+      { fieldId: "recent-b", scopeKey: "character:actor-t", occurredAt: 20 },
+      { fieldId: "old", scopeKey: "character:actor-t", occurredAt: 10 },
     ],
   });
 
   assert.deepEqual(ids(selected), ["recent-a", "recent-b", "old"]);
+});
+
+test("recent ordering is exact to field and scope and never leaks another actor", () => {
+  const input = dataset([
+    field("same-field", 0),
+    field("actor-peer", 1),
+    field("chat-state", 2, { scope: "chat", bindingIds: ["chat-main"] }),
+    field("group-state", 3, { scope: "group", bindingIds: ["group-main"] }),
+    field("global-state", 4, { scope: "global", bindingIds: [] }),
+  ]);
+  const selected = selectModelFields(input, CONTEXT, {
+    maxFields: 4,
+    recentChanges: [
+      { fieldId: "same-field", scopeKey: "character:actor-u", occurredAt: 10_000 },
+      { fieldId: "same-field", scopeKey: "character:actor-t", occurredAt: 10 },
+      { fieldId: "actor-peer", scopeKey: "character:actor-t", occurredAt: 20 },
+      { fieldId: "chat-state", scopeKey: "chat:chat-main", occurredAt: 30 },
+      { fieldId: "group-state", scopeKey: "group:group-main", occurredAt: 40 },
+      { fieldId: "global-state", scopeKey: "global", occurredAt: 50 },
+    ],
+  });
+
+  assert.deepEqual(ids(selected), ["global-state", "group-state", "chat-state", "actor-peer"]);
+  assert.equal(ids(selected).includes("same-field"), false);
+});
+
+test("rule reachability matches event actor current actor group and cooldown semantics", () => {
+  const hidden = field("hidden-rule-field", 100, { modelVisibility: "hidden" });
+  const input = dataset([field("ordinary", 0), hidden], {
+    conditions: [condition("condition-rule", {
+      kind: "predicate", predicate: { kind: "sender", senders: ["user"] },
+    })],
+    rules: [rule("rule-current", "condition-rule", [{
+      kind: "change_field", fieldId: hidden.id, target: { kind: "trigger_actor" }, delta: 1, effectGroupIds: [],
+    }], { cooldownHours: 2 })],
+  });
+
+  const wrongActor = selectModelFields(input, CONTEXT, {
+    eventActorId: "actor-u",
+    currentActorId: "actor-t",
+    occurredAt: 20_000,
+    lastTriggeredAtByRuleId: {},
+  });
+  const coolingDown = selectModelFields(input, CONTEXT, {
+    eventActorId: "actor-t",
+    currentActorId: "actor-t",
+    occurredAt: 20_000,
+    lastTriggeredAtByRuleId: { "rule-current": 19_000 },
+  });
+  const reachable = selectModelFields(input, CONTEXT, {
+    eventActorId: "actor-t",
+    currentActorId: "actor-t",
+    occurredAt: 20_000,
+    lastTriggeredAtByRuleId: { "rule-current": -8_000_000 },
+  });
+
+  assert.deepEqual(ids(wrongActor), ["ordinary"]);
+  assert.deepEqual(ids(coolingDown), ["ordinary"]);
+  assert.deepEqual(ids(reachable), ["hidden-rule-field", "ordinary"]);
+});
+
+test("group prompt budgets final field-scope entries rather than field definitions", () => {
+  const members = Array.from({ length: 20 }, (_, index) => ({
+    chatId: "chat-main",
+    actorId: `actor-${String(index).padStart(2, "0")}`,
+    groupId: "group-main",
+    actorName: `Actor ${index}`,
+  }));
+  const bindings = members.map((member) => member.actorId);
+  const fields = Array.from({ length: 40 }, (_, index) => field(`group-field-${String(index).padStart(2, "0")}`, index, {
+    bindingIds: bindings,
+  }));
+  const input = dataset(fields);
+
+  const first = buildScopedStateSectionProjection(input, {
+    chatId: "chat-main", actorId: null, groupId: "group-main", actorName: "Group",
+  }, members);
+  const retry = buildScopedStateSectionProjection(input, {
+    chatId: "chat-main", actorId: null, groupId: "group-main", actorName: "Group",
+  }, [...members].reverse());
+
+  assert.equal(first.budget.used, 40);
+  assert.equal(first.budget.total, 800);
+  assert.equal(first.section.split("\n").filter((line) => line.startsWith("- ")).length, 40);
+  assert.equal(first.section, retry.section);
+  assert.deepEqual(first.budget, retry.budget);
+});
+
+test("record store finds latest exact-scope changes despite 500 newer unrelated records", async () => {
+  const files = createFakeMvuFileApi();
+  const records = new SegmentedRecordStore({ getConfigDir: () => "/budget", files });
+  const change = (id, fieldId, scopeKey, occurredAt) => ({
+    id, scope: scopeKey.startsWith("character:") ? "character" : scopeKey.startsWith("chat:") ? "chat" :
+      scopeKey.startsWith("group:") ? "group" : "global",
+    scopeKey, fieldId, fieldName: fieldId, actorId: scopeKey.startsWith("character:") ? scopeKey.slice(10) : null,
+    actorName: "", chatId: "chat-main", groupId: "group-main", before: 0, after: 1,
+    requestedDelta: 1, effectiveRequestedDelta: 1, delta: 1, stageBefore: "low", stageAfter: "low",
+    reason: "test", source: "manual", ruleIds: [], effectIds: [], confidence: null,
+    messageId: id, variantId: null, occurredAt,
+  });
+  const source = [
+    change("target-t", "same-field", "character:actor-t", 10),
+    change("target-chat", "chat-state", "chat:chat-main", 11),
+    change("target-group", "group-state", "group:group-main", 12),
+    change("target-global", "global-state", "global", 13),
+    ...Array.from({ length: 500 }, (_, index) =>
+      change(`noise-${index}`, "same-field", "character:actor-u", 1_000 + index)),
+  ];
+  const staged = await records.stageAppend(createEmptyRecordManifest(), source, 1);
+
+  const latest = await records.queryLatestFieldChanges(staged.manifest, [
+    { fieldId: "same-field", scopeKey: "character:actor-t" },
+    { fieldId: "chat-state", scopeKey: "chat:chat-main" },
+    { fieldId: "group-state", scopeKey: "group:group-main" },
+    { fieldId: "global-state", scopeKey: "global" },
+  ]);
+
+  assert.deepEqual(latest, [
+    { fieldId: "same-field", scopeKey: "character:actor-t", occurredAt: 10 },
+    { fieldId: "chat-state", scopeKey: "chat:chat-main", occurredAt: 11 },
+    { fieldId: "group-state", scopeKey: "group:group-main", occurredAt: 12 },
+    { fieldId: "global-state", scopeKey: "global", occurredAt: 13 },
+  ]);
+});
+
+test("runtime v3 prompt and model data use authoritative references instead of compatibility projection", async () => {
+  const fields = [
+    field("ordinary_field", 0),
+    field("hidden_enabled_ref", 1, { modelVisibility: "hidden" }),
+    field("hidden_disabled_ref", 2, { modelVisibility: "hidden" }),
+  ];
+  const legacy = legacyDataset(fields);
+  const files = createFakeMvuFileApi();
+  const legacyStore = new FileMvuStore({
+    getConfigDir: () => "/authority",
+    files,
+    createInitialDataset: () => structuredClone(legacy),
+  });
+  const store = new V3MvuStore({
+    getConfigDir: () => "/authority",
+    files,
+    legacyStore,
+    createInitialDataset: () => structuredClone(legacy),
+    now: () => Date.parse("2036-01-01T00:00:00.000Z"),
+  });
+  await store.initialize();
+  const before = await store.readV3();
+  const next = structuredClone(before.dataset);
+  next.conditions = [
+    condition("condition_enabled_ref", { kind: "and", children: [
+      { kind: "predicate", predicate: { kind: "sender", senders: ["user"] } },
+      { kind: "predicate", predicate: { kind: "field_comparison", fieldId: "hidden_enabled_ref", operator: ">=", value: 0 } },
+    ] }),
+    condition("condition_disabled_ref", { kind: "predicate", predicate: {
+      kind: "field_comparison", fieldId: "hidden_disabled_ref", operator: ">=", value: 0,
+    } }, { enabled: false }),
+  ];
+  next.rules = [
+    rule("rule_enabled_ref", "condition_enabled_ref", [{
+      kind: "change_field", fieldId: "ordinary_field", target: { kind: "trigger_actor" }, delta: 1, effectGroupIds: [],
+    }]),
+    rule("rule_disabled_ref", "condition_disabled_ref", [{
+      kind: "change_field", fieldId: "ordinary_field", target: { kind: "trigger_actor" }, delta: 1, effectGroupIds: [],
+    }]),
+  ];
+  await store.transactV3(before.revision, next, []);
+  const runtime = createRuntime({ store });
+
+  const section = await runtime.buildStateSection(CONTEXT);
+  const modelData = await runtime.buildMvuData(CONTEXT);
+
+  assert.match(section, /hidden_enabled_ref/);
+  assert.doesNotMatch(section, /hidden_disabled_ref/);
+  assert.ok(Object.hasOwn(modelData.stat_data.states, "hidden_enabled_ref"));
+  assert.equal(Object.hasOwn(modelData.stat_data.states, "hidden_disabled_ref"), false);
 });
 
 test("returns deterministic overflow diagnostics when valid references exceed the hard limit", () => {
@@ -335,6 +525,96 @@ test("stage_only projection exposes the stage but not its numeric value", () => 
   assert.doesNotMatch(block, /73/);
 });
 
+test("runtime model data preserves stage_only semantics without serializing its numeric value", async () => {
+  const stage = field("stage-only-runtime", 0, { modelVisibility: "stage_only" });
+  const source = legacyDataset([stage], {
+    stateValues: { "character:actor-t": { "stage-only-runtime": 73 } },
+  });
+  const store = {
+    async read() { return { revision: source.revision, dataset: structuredClone(source) }; },
+    async transact() { throw new Error("unexpected mutation"); },
+  };
+
+  const modelData = await createRuntime({ store, initialActors: [] }).buildMvuData(CONTEXT);
+  const state = modelData.stat_data.states["stage-only-runtime"];
+
+  assert.doesNotMatch(JSON.stringify(state), /73/);
+  assert.match(JSON.stringify(state), /高/);
+});
+
+test("manual judgeState IPC uses the bounded model projection for more than 40 runtime fields", async (t) => {
+  const previousToolPkg = globalThis.ToolPkg;
+  const handlers = {};
+  globalThis.ToolPkg = {
+    ipc: {
+      on(channel, handler) {
+        handlers[channel] = handler;
+        return () => { delete handlers[channel]; };
+      },
+    },
+  };
+  t.after(() => {
+    if (previousToolPkg === undefined) delete globalThis.ToolPkg;
+    else globalThis.ToolPkg = previousToolPkg;
+  });
+
+  const definitions = Array.from({ length: 44 }, (_, index) =>
+    field(`manual-ipc-${String(index).padStart(2, "0")}`, index));
+  const projections = definitions.map((definition) => ({
+    definition,
+    bound: true,
+    scopeKey: "character:actor-t",
+    currentValue: 20,
+    currentStage: definition.stages[0],
+  }));
+  let compatibleCalls = 0;
+  let modelCalls = 0;
+  const runtime = {
+    service: {
+      async projectFields() {
+        compatibleCalls += 1;
+        return projections;
+      },
+      async projectModelFields() {
+        modelCalls += 1;
+        return {
+          fields: projections.slice(0, 40),
+          budget: {
+            used: 40, total: 44, limit: 40,
+            referencedIncluded: 0, referencedTotal: 0, overflow: true, diagnostics: [],
+          },
+        };
+      },
+    },
+    async getRecentMessageFacts() { return []; },
+    async applyAiJudgement() { throw new Error("unexpected commit"); },
+  };
+  const uninstall = installMvuIpc(runtime, {
+    async snapshot() { throw new Error("unexpected snapshot"); },
+    systemModel: {
+      async judgeState(request) {
+        if (request.fields.length > 40) {
+          throw new Error(`MANUAL_JUDGE_RECEIVED_UNBOUNDED_FIELDS:${request.fields.length}`);
+        }
+        return { available: true, changes: [], raw: '{"changes":[]}' };
+      },
+    },
+    queries: {},
+  });
+  t.after(uninstall);
+
+  const response = await handlers["operit_mvu:judge_state"]({
+    scopeContext: CONTEXT,
+    message: "manual bounded judgement",
+    commit: false,
+  });
+
+  assert.equal(response.available, true);
+  assert.equal(response.applied, false);
+  assert.equal(compatibleCalls, 0);
+  assert.equal(modelCalls, 1);
+});
+
 test("sends bounded role and actor metadata for the current message with one completion", async () => {
   const completions = [];
   let probeCount = 0;
@@ -373,6 +653,72 @@ test("sends bounded role and actor metadata for the current message with one com
     content: "hello",
   });
   assert.equal(completions[0].jsonSchema.name, "mvu_state_judgement");
+});
+
+test("bounds every model DTO and gives condition judgement the trusted chat and group context", async () => {
+  const completions = [];
+  const api = new HostSystemModelApi({
+    async probe() { return { available: true }; },
+    async complete(request) {
+      completions.push(request);
+      if (request.jsonSchema.name === "mvu_condition_judgement") {
+        return { text: '{"judgements":[{"predicateId":"predicate-long","matched":false,"confidence":0.2}]}' };
+      }
+      if (request.jsonSchema.name === "mvu_rule_judgement") {
+        return { text: '{"matches":[{"ruleId":"rule-long","matched":false,"confidence":0.2,"reason":"no"}]}' };
+      }
+      return { text: '{"changes":[]}' };
+    },
+  });
+  const long = "界".repeat(20_000);
+  const definitions = Array.from({ length: 40 }, (_, index) => field(`bounded-${index}`, index, {
+    name: long,
+    description: long,
+    ai: { enabled: true, minConfidence: 0.7, maxDelta: 10, prompt: long },
+    stages: [{ id: "low", name: long, description: long, threshold: 0 }],
+  }));
+  const projections = definitions.map((definition) => ({
+    definition, bound: true, scopeKey: "character:actor-t", currentValue: 20, currentStage: definition.stages[0],
+  }));
+  const message = { role: "user", actorId: "spoofed-actor", actorName: "spoofed name", content: long };
+
+  await api.judgeState({ context: { ...CONTEXT, actorName: long }, fields: projections, recentFacts: [], message });
+  await api.judgeRules({
+    context: { ...CONTEXT, actorName: long },
+    fields: projections,
+    recentFacts: [],
+    message,
+    rules: [{
+      id: "rule-long", name: long, description: long, enabled: true,
+      condition: { kind: "aiJudgement", triggerType: long, requirement: long, minimumConfidence: 0.7 },
+      effects: [], cooldownMs: 0, order: 0,
+    }],
+  });
+  await api.judgeConditions({
+    context: CONTEXT,
+    predicates: [{ id: "predicate-long", triggerType: long, requirement: long, minimumConfidence: 0.7 }],
+    message,
+  });
+
+  assert.equal(completions.length, 3);
+  assert.equal(completions.every((request) => request.systemPrompt.length <= 65_536), true);
+  assert.equal(completions.every((request) => request.userPrompt.length <= 65_536), true);
+  assert.equal(completions.every((request) =>
+    Buffer.byteLength(request.systemPrompt, "utf8") + Buffer.byteLength(request.userPrompt, "utf8") <= 65_536), true);
+  const conditionMessage = JSON.parse(completions.find((request) =>
+    request.jsonSchema.name === "mvu_condition_judgement").userPrompt);
+  assert.equal(conditionMessage.role, "user");
+  assert.equal(conditionMessage.actorId, "actor-t");
+  assert.equal(conditionMessage.chatId, "chat-main");
+  assert.equal(conditionMessage.groupId, "group-main");
+  assert.ok(conditionMessage.actorName.length <= 128);
+  assert.ok(conditionMessage.content.length <= 8_192);
+  const stateMessageLine = completions.find((request) =>
+    request.jsonSchema.name === "mvu_state_judgement").userPrompt.split("\n")
+    .find((line) => line.startsWith("本次消息："));
+  const stateMessage = JSON.parse(stateMessageLine.slice("本次消息：".length));
+  assert.equal(stateMessage.actorId, "actor-t");
+  assert.equal(stateMessage.actorName.length <= 128, true);
 });
 
 test("stage_only state and rule model contracts never expose the numeric value", async () => {

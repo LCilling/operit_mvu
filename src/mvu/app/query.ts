@@ -9,6 +9,10 @@ import type {
 } from "./model-v3";
 import type { RecordQueryRequest, RecordQueryResult } from "./record-store";
 import type { MigrationStatus, V3MvuStoreSnapshot } from "./store-v3";
+import {
+  selectModelFields,
+  type ModelFieldBudgetStats,
+} from "./state-prompt";
 import { assertEditableEffectReasonConfig, assertMvuDatasetV3 } from "./validation";
 import {
   commitFieldTemplateImport,
@@ -35,6 +39,8 @@ const SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS = 32;
 const SNAPSHOT_REASON_MAX_CODE_POINTS = 40;
 const SNAPSHOT_CONTEXT_MAX_CODE_POINTS = 40;
 const SNAPSHOT_MIGRATION_WARNING_LIMIT = 8;
+const SNAPSHOT_MODEL_DIAGNOSTIC_LIMIT = 32;
+const SNAPSHOT_MODEL_DIAGNOSTIC_MAX_CODE_POINTS = 256;
 
 const MANAGEMENT_PAGE_SIZES = {
   fields: 5,
@@ -131,6 +137,8 @@ export interface MvuQuerySource {
   listGroups(): Promise<QueryGroup[]>;
   activeContext(): Promise<StateScopeContext>;
   migrationStatus(): Promise<MigrationStatus>;
+  /** Authoritative production budget; omitted by compatibility/test sources. */
+  modelBudget?(): Promise<ModelFieldBudgetStats>;
 }
 
 export interface MvuQueryServiceOptions {
@@ -272,6 +280,7 @@ export interface MvuCompactPageSnapshot {
   activeContext: SnapshotScopeContext;
   settings: MvuSettings;
   migrationStatus: SnapshotMigrationStatus;
+  modelBudget: ModelFieldBudgetStats;
   counts: {
     fields: number;
     actors: number;
@@ -616,6 +625,11 @@ export class MvuQueryService {
       this.queryRecords({ page: 1 }),
     ]);
     const dataset = snapshot.dataset;
+    const modelBudget = summarizeModelBudget(
+      this.source.modelBudget === undefined
+        ? selectModelFields(dataset, activeContext).stats
+        : await this.source.modelBudget(),
+    );
     const applicableFields = dataset.fields.filter((field) => field.enabled && contextScopeKey(field, activeContext) !== null);
     const fields = queryCollectionFromValidated("fields", applicableFields, {}, MANAGEMENT_PAGE_SIZES.fields, false, {
       key: "order", direction: "asc",
@@ -641,6 +655,7 @@ export class MvuQueryService {
       activeContext: summarizeScopeContext(activeContext),
       settings: klona(dataset.settings),
       migrationStatus: summarizeMigrationStatus(migrationStatus),
+      modelBudget,
       counts: {
         fields: dataset.fields.length,
         actors: actors.length,
@@ -1510,6 +1525,31 @@ function summarizeContextLabels(labels: SnapshotDisplayLabels): SnapshotContextL
     groupName: groupName.value,
     chatName: chatName.value,
     truncated: anyTruncated([groupName, chatName]),
+  };
+}
+
+function summarizeModelBudget(stats: ModelFieldBudgetStats): ModelFieldBudgetStats {
+  for (const value of [
+    stats.used,
+    stats.total,
+    stats.limit,
+    stats.referencedIncluded,
+    stats.referencedTotal,
+  ]) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error("MVU_MODEL_BUDGET_INVALID");
+  }
+  return {
+    used: stats.used,
+    total: stats.total,
+    limit: stats.limit,
+    referencedIncluded: stats.referencedIncluded,
+    referencedTotal: stats.referencedTotal,
+    overflow: stats.overflow,
+    diagnostics: stats.diagnostics.slice(0, SNAPSHOT_MODEL_DIAGNOSTIC_LIMIT)
+      .map((diagnostic) => boundedText(
+        diagnostic,
+        SNAPSHOT_MODEL_DIAGNOSTIC_MAX_CODE_POINTS,
+      ).value),
   };
 }
 

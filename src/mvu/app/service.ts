@@ -80,8 +80,13 @@ import {
   validateTemporaryEffect,
 } from "./validation";
 import {
+  buildScopedStateSectionProjection,
+  modelRecencyTargets,
   selectModelFields,
   type ModelFieldBudgetStats,
+  type ModelFieldRecency,
+  type ScopedStateSectionProjection,
+  type SelectModelFieldsOptions,
 } from "./state-prompt";
 
 export function makeId(prefix: string): string {
@@ -177,6 +182,8 @@ export interface ModelFieldProjectionResult {
   budget: ModelFieldBudgetStats;
 }
 
+export type ModelProjectionOptions = Omit<SelectModelFieldsOptions, "recentChanges">;
+
 interface PendingFieldChange {
   delta: number;
   perTurn: boolean;
@@ -242,6 +249,7 @@ export async function processPersistedMessageV3(
     try {
       if (input.judgeConditions === undefined) throw new Error("MVU_AI_CONDITION_JUDGE_UNAVAILABLE");
       const judged = await input.judgeConditions({
+        context: input.context,
         predicates: plan.aiPredicates,
         message: {
           role: input.role,
@@ -443,26 +451,87 @@ export class MvuService {
   }
 
   async projectFields(context: StateScopeContext): Promise<FieldStateProjection[]> {
-    return (await this.projectModelFields(context)).fields;
+    return this.projectAllFields(await this.getDataset(), context);
   }
 
   /** Bounded model projection; statistics are exposed separately from compact UI snapshots. */
-  async projectModelFields(context: StateScopeContext): Promise<ModelFieldProjectionResult> {
-    let dataset: MvuDataset | MvuDatasetV3;
-    let recentChanges: readonly Pick<DataChangeRecord, "fieldId" | "occurredAt">[] = [];
+  async projectModelFields(
+    context: StateScopeContext,
+    options: ModelProjectionOptions = {},
+  ): Promise<ModelFieldProjectionResult> {
+    const source = await this.readModelProjectionSource(context);
+    const selection = selectModelFields(source.dataset, context, {
+      ...this.withDatasetRuleTiming(source.dataset, context, options),
+      recentChanges: source.recentChanges,
+    });
+    return {
+      fields: this.projectSelectedFields(source.dataset, context, selection.fields),
+      budget: selection.stats,
+    };
+  }
+
+  async buildModelStateSection(
+    context: StateScopeContext,
+    memberContexts: readonly StateScopeContext[] = [],
+    options: ModelProjectionOptions = {},
+  ): Promise<ScopedStateSectionProjection> {
+    const source = await this.readModelProjectionSource(context, memberContexts);
+    return buildScopedStateSectionProjection(source.dataset, context, memberContexts, {
+      ...this.withDatasetRuleTiming(source.dataset, context, options),
+      recentChanges: source.recentChanges,
+    });
+  }
+
+  private async readModelProjectionSource(
+    context: StateScopeContext,
+    memberContexts: readonly StateScopeContext[] = [],
+  ): Promise<{
+    dataset: MvuDataset | MvuDatasetV3;
+    recentChanges: readonly ModelFieldRecency[];
+  }> {
     if (isV3MvuStore(this.store) && (await this.store.migrationStatus()).mode === "v3") {
-      const [snapshot, records] = await Promise.all([
-        this.store.readV3(),
-        this.store.queryRecords({ limit: 500, direction: "desc" }),
-      ]);
-      dataset = snapshot.dataset;
-      recentChanges = records.items;
-    } else {
-      dataset = await this.getDataset();
-      recentChanges = dataset.records;
+      const snapshot = await this.store.readV3();
+      const targets = modelRecencyTargets(snapshot.dataset, context, memberContexts);
+      const recentChanges = await this.store.queryLatestFieldChanges(targets);
+      return { dataset: snapshot.dataset, recentChanges };
     }
-    const selection = selectModelFields(dataset, context, { recentChanges });
-    const fields = selection.fields.map((field) => {
+    const dataset = await this.getDataset();
+    return { dataset, recentChanges: dataset.records };
+  }
+
+  private withDatasetRuleTiming(
+    dataset: MvuDataset | MvuDatasetV3,
+    context: StateScopeContext,
+    options: ModelProjectionOptions,
+  ): ModelProjectionOptions {
+    if (dataset.formatVersion !== 3 || options.occurredAt === undefined ||
+      options.lastTriggeredAtByRuleId !== undefined) return options;
+    return {
+      ...options,
+      lastTriggeredAtByRuleId: dataset.ruleLastTriggered[automationScopeKey(context)] ?? {},
+    };
+  }
+
+  private projectAllFields(
+    dataset: MvuDataset | MvuDatasetV3,
+    context: StateScopeContext,
+  ): FieldStateProjection[] {
+    return dataset.fields.map((field) => this.projectField(dataset, context, field));
+  }
+
+  private projectSelectedFields(
+    dataset: MvuDataset | MvuDatasetV3,
+    context: StateScopeContext,
+    fields: readonly DataField[],
+  ): FieldStateProjection[] {
+    return fields.map((field) => this.projectField(dataset, context, field));
+  }
+
+  private projectField(
+    dataset: MvuDataset | MvuDatasetV3,
+    context: StateScopeContext,
+    field: DataField,
+  ): FieldStateProjection {
       const bound = fieldAppliesToContext(field, context);
       if (!bound) {
         return {
@@ -481,8 +550,6 @@ export class MvuService {
         currentValue: value,
         currentStage: deriveStage(field, value),
       };
-    });
-    return { fields, budget: selection.stats };
   }
 
   async getApplicableAiRules(

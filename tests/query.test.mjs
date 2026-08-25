@@ -743,6 +743,15 @@ test("compact snapshot contains summaries counts and first pages without option 
       nextOffset: offset + limit,
     }),
   });
+  fixture.source.modelBudget = async () => ({
+    used: 40,
+    total: 500,
+    limit: 40,
+    referencedIncluded: 3,
+    referencedTotal: 4,
+    overflow: true,
+    diagnostics: ["MVU_MODEL_REFERENCE_FIELD_MISSING:field_missing"],
+  });
   const service = new MvuQueryService(fixture.source, fixture.options);
   const snapshot = await service.pageSnapshot();
 
@@ -762,6 +771,15 @@ test("compact snapshot contains summaries counts and first pages without option 
   });
   assert.equal(snapshot.selected.actor.characterId, "actor_000");
   assert.equal(snapshot.selected.group.characterGroupId, "group_000");
+  assert.deepEqual(snapshot.modelBudget, {
+    used: 40,
+    total: 500,
+    limit: 40,
+    referencedIncluded: 3,
+    referencedTotal: 4,
+    overflow: true,
+    diagnostics: ["MVU_MODEL_REFERENCE_FIELD_MISSING:field_missing"],
+  });
   const projectedField = snapshot.pages.fields.items.find((item) => item.id === "field_0000");
   assert.deepEqual(projectedField.current, {
     value: 48,
