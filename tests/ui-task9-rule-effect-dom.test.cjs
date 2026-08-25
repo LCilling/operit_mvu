@@ -166,6 +166,33 @@ test("rule library uses exact five-row production paging with search statistics 
   assert.match(document.querySelector("[data-rule-row]").textContent, /演示规则 12/);
 });
 
+test("rule label hydration stays below the host per-origin async quota", async (t) => {
+  const window = await createApp("rules");
+  t.after(() => window.close());
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let activeLookups = 0;
+  let maximumActiveLookups = 0;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method !== "getEntityById") return originalCall(method, params);
+    activeLookups += 1;
+    maximumActiveLookups = Math.max(maximumActiveLookups, activeLookups);
+    try {
+      if (activeLookups > 4) throw new Error("ToolPkg async per-origin quota exceeded");
+      await new Promise((resolve) => setTimeout(resolve, 8));
+      return await originalCall(method, params);
+    } finally {
+      activeLookups -= 1;
+    }
+  };
+
+  await window.MvuUi.navigate("rule-library");
+
+  assert.ok(maximumActiveLookups <= 2, `rule label hydration reached ${maximumActiveLookups} concurrent calls`);
+  const labels = Array.from(window.MvuUi.state.ruleLabels.values());
+  assert.equal(labels.length, 5);
+  assert.ok(labels.every((label) => !/待修复|需修复/.test(`${label.condition} ${label.actions}`)));
+});
+
 test("effect library uses exact ten-row production paging with search statistics and visible creation", async (t) => {
   const window = await createApp("effect-library");
   t.after(() => window.close());

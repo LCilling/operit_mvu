@@ -178,6 +178,12 @@ MVU 先通过既有 `Tools.Files.write` 把完整提交写入正式文件同目�
 
 MVU 不得用普通 `move`、覆盖写或删除后重建代替该接口提交权威数据；宿主没有此接口时，插件应明确报告宿主版本不兼容，不能静默降低数据安全保证。
 
+## `Tools.Files.readPart` 截断兼容
+
+现有官方 `Tools.Files.readPart` 会在请求正文超过 32,000 个字符时截断内容，并在独立末行追加固定标记 `... (file content truncated) ...`。该标记属于机器可判定的兼容契约；宿主不得翻译、改变空白或把它混入普通正文行。
+
+MVU 通常以最多 32 行为一段读取记录。发现该标记时，必须丢弃不完整结果，只对当前记录段回退到既有官方 `Tools.Files.read` 做一次完整读取，再截取所需行；不能解析部分 JSON，也不能通过递归缩小行区间制造大量宿主调用。这个回退不引入新的宿主接口。若未来返回结构增加 `truncated: boolean`，固定标记仍应保留至少一个兼容周期。
+
 ## Prompt 组合
 
 MVU 使用 `registerSystemPromptComposeHook`，但只接受 `promptFunctionType === "CHAT"` 的请求。返回的新 `systemPrompt` 必须包含事件中 Operit 已组合好的完整 `systemPrompt`，再追加 MVU 当前可见状态段。

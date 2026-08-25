@@ -362,6 +362,48 @@ test("every field query page and field detail carry the active-context value sta
   });
 });
 
+test("field queries and detail honor an explicit UI projection context", async () => {
+  const dataset = makeDataset();
+  dataset.fields = [{
+    ...field(0),
+    scope: "character",
+    bindingIds: ["actor_000", "actor_001"],
+    stages: [
+      { id: "low", name: "低", description: "低阶段", threshold: 0 },
+      { id: "high", name: "高", description: "高阶段", threshold: 50 },
+    ],
+  }];
+  dataset.stateValues["character:actor_000"] = { field_0000: 10 };
+  dataset.stateValues["character:actor_001"] = { field_0000: 80 };
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+  const scopeContext = {
+    chatId: "chat_main",
+    actorId: "actor_001",
+    groupId: "group_000",
+    actorName: "Actor 001",
+  };
+
+  const list = await service.queryFields({ page: 1, scopeContext });
+  const detail = await service.getEntityById({ entityType: "field", id: "field_0000", scopeContext });
+
+  assert.equal(list.items[0].currentValue, 80);
+  assert.equal(list.items[0].currentStage.id, "high");
+  assert.equal(list.items[0].scopeKey, "character:actor_001");
+  assert.equal(detail.currentValue, 80);
+  assert.equal(detail.scopeKey, "character:actor_001");
+  assert.deepEqual(MVU_REQUEST_PARSERS.queryFields({ page: 1, scopeContext }), { page: 1, scopeContext });
+  assert.deepEqual(MVU_REQUEST_PARSERS.getEntityById({
+    entityType: "field", id: "field_0000", scopeContext,
+  }), { entityType: "field", id: "field_0000", scopeContext });
+  assert.throws(
+    () => MVU_REQUEST_PARSERS.getEntityById({ entityType: "actor", id: "actor_001", scopeContext }),
+    /MVU_GET_ENTITY_REQUEST_INVALID/,
+  );
+});
+
 test("group membership filtering is server-owned and cursor tokens cannot be reused", async () => {
   const fixture = createSource(makeDataset(), {
     queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),

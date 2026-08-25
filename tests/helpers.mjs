@@ -121,6 +121,7 @@ export function createFakeMvuFileApi(initialFiles = {}, options = {}) {
   const barriers = [];
   const operations = [];
   const partialReadLineLimit = options.partialReadLineLimit ?? Number.POSITIVE_INFINITY;
+  const partialReadCharacterLimit = options.partialReadCharacterLimit ?? Number.POSITIVE_INFINITY;
 
   function failIfRequested(operation, details) {
     const index = failures.findIndex((failure) =>
@@ -167,12 +168,17 @@ export function createFakeMvuFileApi(initialFiles = {}, options = {}) {
       const lines = requireFile(path).replace(/\r\n/g, "\n").split("\n");
       if (lines.at(-1) === "") lines.pop();
       const selected = lines.slice(startLine - 1, endLine);
-      const truncated = selected.length > partialReadLineLimit;
-      const visible = selected.slice(0, partialReadLineLimit);
-      const width = Math.max(3, String(endLine).length);
+      const lineTruncated = selected.length > partialReadLineLimit;
+      const lineLimited = selected.slice(0, partialReadLineLimit);
+      const selectedContent = lineLimited.join("\n");
+      const characterTruncated = selectedContent.length > partialReadCharacterLimit;
+      const visible = (characterTruncated
+        ? selectedContent.slice(0, partialReadCharacterLimit)
+        : selectedContent).split("\n");
+      const width = Math.max(3, String(lines.length).length);
       const decorated = visible.map((line, offset) =>
         `${String(startLine + offset).padStart(width, " ")}| ${line}`);
-      if (truncated) decorated.push("... (file content truncated) ...");
+      if (lineTruncated || characterTruncated) decorated.push("... (file content truncated) ...");
       return decorated.join("\n");
     },
     async writeText(path, content) {
