@@ -100,3 +100,56 @@ The host authority is `D:\ProjectFile\OperitAI\app\src\main\java\com\ai\assistan
 - Post-fix browser and Impeccable reruns were intentionally omitted by the final priority checkpoint, not reported as passing.
 - Modified APK/MuMu and real-host acceptance remain the existing Task 11 release gate.
 - Release target/version and OperitAI sources were not modified.
+
+## Independent review fix round 2 — 2026-08-25
+
+### Code checkpoint
+
+- Code/tests/package commit: `5d7ef15da555fc66b2c2e527898903e2ce4d6de4` (`fix: close task 8 independent review gaps`).
+- The checkpoint contains findings 1–4 first, then the executable DOM gate and bounded browser-smoke increment. No artifact path is tracked by the commit.
+- Release target/version, release metadata, and the separate OperitAI worktree remain untouched.
+
+### Six confirmed findings and fixes
+
+1. The status actor finder now derives its visible total from the authoritative current-group `queryActors` result, sends the active `groupId` through `openStatusPicker`, and locks that server filter. The demo's `group-a` has 50 authoritative members, including tail members beyond 30; an outsider is absent from both pages and cannot be selected into the group context.
+2. The former 3,840-total fatal gate is gone. Valid first pages with totals 3,841, 100,000, or larger remain usable and searchable. The retained-page cap pauses only a subsequent auto-fetch, preserves retained rows and selected pins, asks the user to narrow search, and deliberately offers no destructive retry action.
+3. `patchManagementList` records and re-resolves logical search/filter/pagination focus, preserves the live scroll container and `scrollTop`, and falls back to the remaining enabled pagination control at a tail page. Status context commits await `ViewTransition.updateCallbackDone`, then resolve the logical opener in the newly rendered context instead of focusing a detached node or `BODY`.
+4. Query response validation now uses method/mode page ceilings plus safe-integer totals rather than a global 10,000 ceiling. `queryRecords` accepts 100,000 and the selected edge policy accepts `Number.MAX_SAFE_INTEGER`; negative values and values above the safe-integer boundary fail closed. Existing 5/10/30 item ceilings, loaded-count coherence, cursor progress/non-reuse, and `hasMore`/`nextCursor` equivalence remain enforced.
+5. The DOM regression is now an executable repository gate. `pnpm run test:dom` performs a fresh web build and runs three live-DOM behavioral tests through declared `happy-dom@20.11.6`; `pnpm run check` invokes it. A deliberate mutation that removed pagination focus restoration failed the gate with an undefined logical route/direction/page, then the restored production line returned GREEN. Declared `playwright-core@1.62.1` and system Chrome/Edge executable discovery support the optional real-browser smoke without `NODE_PATH` or an undeclared full Playwright package.
+6. The smoke now uses current opaque `demo_c1_*` cursors, asserts 60 retained rows with only 15–16 rendered rows (bounded at 24), verifies spacers/back-window accessibility, exact noun-bearing count copy, four roots, no `加载更多`, and zero horizontal overflow. The 130% fixture scales both font size and line height. A 320px/130% RED first exposed title line-height remaining 28px instead of 36.4px; after fixing the fixture it exposed a 38px/39px title clipping edge, fixed by one pixel of block padding without shrinking the 21px title or 14px body.
+
+Count-copy behavior is asserted independently with the required noun/unit form, including `已显示 5 个字段 / 匹配 51 个字段 / 共 51 个字段` and page-two semantics. The stable browser demo has 13 fields, so its exact page-one and page-two evidence is `已显示 5 个字段 / 匹配 13 个字段 / 共 13 个字段`.
+
+### RED, GREEN, and mutation evidence
+
+- Finding 1 RED: three focused assertions failed because the status page used the all-actor total, the actor picker request omitted the active `groupId`, and the current-group filter could be broadened to expose an outsider.
+- Findings 2 and 4 RED: four focused assertions failed on valid huge totals, the retained-page boundary, retry behavior, and noun-bearing count output. The old validator rejected 3,841+/100,000 responses before the first page could render.
+- Finding 3 RED: two focused DOM/controller assertions left pagination/status focus on a detached/BODY surrogate and did not preserve the expected scroll/focus identity across the asynchronous patch.
+- Finding 5 environment RED: the fresh-build DOM command failed with `Cannot find module 'playwright'`, proving the dormant script depended on an undeclared environment. The final mandatory gate instead uses the declared live-DOM runtime; the optional browser runner uses declared `playwright-core` plus executable discovery.
+- Finding 6 RED: the actual 320px/130% run first reported unscaled title line-height, then a clipped title after line-height scaling. Both defects were corrected before the final matrix.
+- Focused `node --test tests/query.test.mjs tests/ui-shell.test.mjs`: 91/91 pass.
+- Full `pnpm run check`: PASS — audits/typecheck/effects pass, 192/192 Node tests pass, and the fresh-build DOM gate passes 3/3.
+- `pnpm run build`: PASS; `dist/app.html` is 9,248,481 UTF-8 bytes.
+- `git diff --check` and staged diff checks: PASS.
+
+### Browser and typography evidence
+
+The bounded local Chrome matrix passed 8/8 at 320/360/393/430 CSS pixels × 100%/130%. It covers title, body, management and picker search/filter controls, pagination, stage, and trend typography; every checked text target uses `Roboto, "Noto Sans SC", system-ui, sans-serif` with no `Segoe UI`. Body/title are 14px/21px at 100% and 18.2px/27.3px at 130%; line-height scales from 21px/28px to 27.3px/36.4px. No checked target clips, overlaps, leaves the viewport, or creates horizontal overflow.
+
+Evidence is untracked under `D:\ProjectFile\operit_mvu\.worktrees\mvu-v3-complete-redesign\artifacts\task-8-remediation-r2`:
+
+- `picker-{320,360,393,430}-{100,130}.png`
+- `detail-320-130.png` and `detail-430-100.png`
+- `result.json`
+
+The final evidence folder has 11 files with manifest SHA-256 `51266be73fb2380ed8620fb8187689477c3a2c40bb009557c66a45b497cb6361` (sorted `relative-path|length|file-sha256` records).
+
+One final Impeccable detector invocation scanned all changed production UI targets plus the text-scale fixture. It reported one `overused-font` finding for `Roboto`. That heuristic conflicts directly with the approved OperitAI host authority in `D:\ProjectFile\OperitAI\app\src\main\java\com\ai\assistance\operit\ui\theme\Type.kt` (`FontFamily.Default`), so the existing design authority wins: the required Android-default stack is retained, Material Symbols remains icon-only, and there were no other detector findings.
+
+### Artifact preservation and residuals
+
+- Every one of the 15 pre-existing files in `artifacts/task-8-browser-smoke` still matches the baseline per-file SHA-256 recorded before this round. Its aggregate sorted manifest SHA-256 is `8721de91cab97af41039bdace2b4c1c962c68323c1effbec922009770f0c4a52`.
+- Only `artifacts/task-8-remediation-r2` received new evidence. No artifact path is staged or committed.
+- No local Task 8 server/process remains running.
+- No known Task 8 production, test, DOM, or browser regression remains. The sole detector item is the intentional host-font requirement described above.
+- Modified APK/MuMu and real-host acceptance remain the existing Task 11 gate.
