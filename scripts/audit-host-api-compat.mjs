@@ -77,14 +77,14 @@ function memberName(node, sourceFile) {
   return node.getText(sourceFile);
 }
 
-function expressionChain(node, sourceFile) {
-  if (ts.isIdentifier(node)) return node.text;
+function expressionChain(node, sourceFile, aliases = new Map()) {
+  if (ts.isIdentifier(node)) return aliases.get(node.text) ?? node.text;
   if (ts.isPropertyAccessExpression(node)) {
-    const prefix = expressionChain(node.expression, sourceFile);
+    const prefix = expressionChain(node.expression, sourceFile, aliases);
     return prefix === null ? null : `${prefix}.${node.name.text}`;
   }
   if (ts.isElementAccessExpression(node)) {
-    const prefix = expressionChain(node.expression, sourceFile);
+    const prefix = expressionChain(node.expression, sourceFile, aliases);
     if (prefix === null) return null;
     if (ts.isStringLiteral(node.argumentExpression)) {
       return `${prefix}.${node.argumentExpression.text}`;
@@ -150,6 +150,7 @@ function auditSourceFile(filePath, sourceText, rootDirectory) {
   const sourceFile = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.Latest, true, scriptKind);
   const violations = [];
   const dependencies = new Set();
+  const aliases = new Map();
 
   function auditSymbol(node, symbol) {
     if (!isHostRooted(symbol) || symbol === "ToolPkg" || symbol === "Tools.Files" || symbol === "Icons") {
@@ -171,11 +172,33 @@ function auditSourceFile(filePath, sourceText, rootDirectory) {
   }
 
   function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.initializer !== undefined) {
+      const initializerSymbol = expressionChain(node.initializer, sourceFile, aliases);
+      if (initializerSymbol !== null) {
+        if (ts.isIdentifier(node.name)) {
+          if (initializerSymbol === "Tools" || isHostRooted(initializerSymbol)) {
+            aliases.set(node.name.text, initializerSymbol);
+          }
+        } else if (ts.isObjectBindingPattern(node.name)) {
+          for (const element of node.name.elements) {
+            if (!ts.isIdentifier(element.name)) continue;
+            const propertyName = element.propertyName === undefined
+              ? element.name.text
+              : memberName(element.propertyName, sourceFile);
+            const symbol = `${initializerSymbol}.${propertyName}`;
+            if (symbol === "Tools" || isHostRooted(symbol)) {
+              aliases.set(element.name.text, symbol);
+              auditSymbol(element, symbol);
+            }
+          }
+        }
+      }
+    }
     if (
       (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
       && !isNestedMember(node)
     ) {
-      const symbol = expressionChain(node, sourceFile);
+      const symbol = expressionChain(node, sourceFile, aliases);
       if (symbol !== null) auditSymbol(node, symbol);
     }
     if (
