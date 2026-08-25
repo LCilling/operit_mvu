@@ -280,8 +280,8 @@
     const card = button.closest("[data-range-card]");
     const errorNode = card && card.querySelector("[data-range-error]");
     if (!card || !errorNode) return;
-    const minimum = Number(card.querySelector('[data-range-number="minimum"]').value);
-    const maximum = Number(card.querySelector('[data-range-number="maximum"]').value);
+    const minimumInput = card.querySelector('[data-range-number="minimum"]').value;
+    const maximumInput = card.querySelector('[data-range-number="maximum"]').value;
     const field = ui.state.entities.get("field:" + button.dataset.fieldId);
     if (!field) {
       errorNode.textContent = "字段定义尚未载入，请重新进入本页。";
@@ -289,12 +289,14 @@
     }
     const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
     const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
-    const validation = validateFieldRangeDraft(field, { minimum, maximum }, currentValue);
+    const validation = validateFieldRangeDraft(field, { minimum: minimumInput, maximum: maximumInput }, currentValue);
     errorNode.textContent = "";
     if (validation.error || !validation.changed) {
       errorNode.textContent = validation.error || "范围未变化，无需保存。";
       return;
     }
+    const minimum = Number(minimumInput);
+    const maximum = Number(maximumInput);
     setBusy(true);
     try {
       await ui.native.call("updateField", { id: button.dataset.fieldId, patch: { minimum, maximum } });
@@ -315,11 +317,11 @@
     const card = input.closest("[data-range-card]");
     const field = card && ui.state.entities.get("field:" + card.dataset.rangeCard);
     if (!card || !field) return;
-    const minimum = Number(card.querySelector('[data-range-number="minimum"]').value);
-    const maximum = Number(card.querySelector('[data-range-number="maximum"]').value);
+    const minimumInput = card.querySelector('[data-range-number="minimum"]').value;
+    const maximumInput = card.querySelector('[data-range-number="maximum"]').value;
     const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
     const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
-    const validation = validateFieldRangeDraft(field, { minimum, maximum }, currentValue);
+    const validation = validateFieldRangeDraft(field, { minimum: minimumInput, maximum: maximumInput }, currentValue);
     const error = card.querySelector("[data-range-error]");
     const save = card.querySelector('[data-action="save-field-range"]');
     const preview = card.querySelector("[data-range-preview]");
@@ -327,37 +329,43 @@
     if (save) save.disabled = !validation.changed || Boolean(validation.error);
     if (preview) preview.textContent = validation.previewValue === null ? "换算后 —" : "换算后 " + ui.formatNumber(validation.previewValue);
     if (validation.previewValue !== null) {
+      const minimum = Number(minimumInput);
+      const maximum = Number(maximumInput);
       const position = (validation.previewValue - minimum) / (maximum - minimum) * 100;
       card.style.setProperty("--range-position", Math.max(0, Math.min(100, position)) + "%");
     }
   }
 
   function validateFieldRangeDraft(field, draft, currentValue) {
-    const changed = draft.minimum !== field.minimum || draft.maximum !== field.maximum;
-    if (!Number.isFinite(draft.minimum) || !Number.isFinite(draft.maximum)) {
+    const minimumMissing = typeof draft.minimum === "string" && draft.minimum.trim().length === 0;
+    const maximumMissing = typeof draft.maximum === "string" && draft.maximum.trim().length === 0;
+    const minimum = minimumMissing ? Number.NaN : Number(draft.minimum);
+    const maximum = maximumMissing ? Number.NaN : Number(draft.maximum);
+    const changed = minimum !== field.minimum || maximum !== field.maximum;
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) {
       return { changed, error: "请输入有效的上下限数值。", previewValue: null, mappedStep: null };
     }
-    if (draft.minimum >= draft.maximum) {
+    if (minimum >= maximum) {
       return { changed, error: "下限必须小于上限。", previewValue: null, mappedStep: null };
     }
     const previousSpan = field.maximum - field.minimum;
-    const nextSpan = draft.maximum - draft.minimum;
+    const nextSpan = maximum - minimum;
     const scale = nextSpan / previousSpan;
     const mappedStep = field.step * scale;
-    const precisionFloor = Math.max(1, Math.abs(draft.minimum), Math.abs(draft.maximum)) * Number.EPSILON * 16;
+    const precisionFloor = Math.max(1, Math.abs(minimum), Math.abs(maximum)) * Number.EPSILON * 16;
     if (!Number.isFinite(scale) || scale <= 0 || !Number.isFinite(mappedStep) || mappedStep <= precisionFloor) {
       return { changed, error: "范围跨度超出可换算精度。", previewValue: null, mappedStep: null };
     }
     let previousThreshold = Number.NEGATIVE_INFINITY;
     for (const stage of field.stages) {
-      const threshold = draft.minimum + ((stage.threshold - field.minimum) / previousSpan) * nextSpan;
+      const threshold = minimum + ((stage.threshold - field.minimum) / previousSpan) * nextSpan;
       if (!Number.isFinite(threshold) || threshold - previousThreshold <= precisionFloor) {
         return { changed, error: "范围过窄，无法保留现有阶段间隔。", previewValue: null, mappedStep: null };
       }
       previousThreshold = threshold;
     }
     const sourceValue = Number.isFinite(currentValue) ? currentValue : field.initialValue;
-    const previewValue = draft.minimum + ((sourceValue - field.minimum) / previousSpan) * nextSpan;
+    const previewValue = minimum + ((sourceValue - field.minimum) / previousSpan) * nextSpan;
     if (!Number.isFinite(previewValue)) {
       return { changed, error: "当前值换算后超出数值范围。", previewValue: null, mappedStep: null };
     }

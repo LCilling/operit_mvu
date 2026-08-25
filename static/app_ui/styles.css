@@ -430,10 +430,10 @@ h1, h2, h3, p { margin: 0; }
 .card-heading { min-height: 30px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .card-heading strong { font-size: 16px; }
 .card-heading span, .card-heading button { color: var(--ink-soft); font-size: 12px; background: transparent; }
-.stage-map { min-height: 76px; margin: 8px 7px 0; position: relative; }
+.stage-map { min-height: 76px; margin: 24px 7px 0; position: relative; }
 .stage-track { height: 4px; position: absolute; inset: 35px 0 auto; border-radius: 4px; background: rgba(112,88,216,.17); }
 .stage-marker { width: clamp(44px, 18vw, 68px); position: absolute; top: -30px; left: var(--stage-position); display: grid; justify-items: center; color: var(--ink-soft); font-size: 11px; text-align: center; transform: translateX(-50%); }
-.stage-marker[data-stage-lane="1"] .stage-name { transform: translateY(-5px); }
+.stage-marker[data-stage-lane="1"] .stage-name { transform: translateY(-24px); }
 .stage-marker.edge-start .stage-name, .stage-marker.edge-start .stage-threshold { text-align: start; }
 .stage-marker.edge-end .stage-name, .stage-marker.edge-end .stage-threshold { text-align: end; }
 .stage-marker.active { color: var(--stage-color); font-weight: 650; }
@@ -582,10 +582,20 @@ output { display: block; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    scroll-behavior: auto !important;
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+  html, .screen-scroll, .identity-selector { scroll-behavior: auto !important; }
+  .drawer { animation: none !important; }
+  .toast, .button, .icon-button, .text-action, .bottom-nav button, .segmented-control button {
+    transition: none !important;
+  }
+  .button:active, .bottom-nav button:active, .segmented-control button:active {
+    transform: none !important;
+  }
+  ::view-transition-group(route-content),
+  ::view-transition-group(.segmented-selection),
+  ::view-transition-old(route-content),
+  ::view-transition-new(route-content),
+  ::view-transition-old(.segmented-selection),
+  ::view-transition-new(.segmented-selection) {
+    animation: none !important;
   }
 }

@@ -44,6 +44,7 @@ const index = await optional(path.join("static", "app_ui", "index.html"));
 const build = await optional(path.join("scripts", "build-web.mjs"));
 const container = await optional(path.join("src", "ui", "web_container", "index.ui.ts"));
 const textScaleFixture = await optional(path.join("tests", "fixtures", "ui-text-scale.html"));
+const malformedNativeFixture = await optional(path.join("tests", "fixtures", "ui-native-malformed.html"));
 const allUi = moduleNames.map((name) => files[name]).join("\n");
 const violations = [];
 
@@ -92,6 +93,10 @@ rejectMatch(styles, /\.segmented-control\.static\s+button\s*\{[\s\S]*?font-size:
 requireMatch(styles, /(?:180|200|220)ms/, "segmented/content motion must use a 180–220ms duration");
 requireMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)/,
   "reduced-motion support is required");
+rejectMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\*,\s*\*::before|0\.01ms/,
+  "reduced motion must use targeted immediate states, not blanket 0.01ms overrides");
+requireMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?::view-transition-(?:group|old|new)[\s\S]*?animation:\s*none/,
+  "reduced motion must disable spatial view-transition animation");
 requireMatch(allUi, /document\.startViewTransition/,
   "segmented and route content changes must use progressive view transitions");
 requireMatch(files["components.js"], /aria-controls=/,
@@ -127,6 +132,10 @@ requireMatch(allUi, /数据无法载入[\s\S]*?重新加载|页面数据有误[\
   "malformed snapshots and queries need readable recovery actions");
 requireMatch(files["runtime.js"], /validateQueryResponse/,
   "bounded query responses must be validated before rendering");
+requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,
+  "condition DTO validation must recurse with a hard depth bound");
+requireMatch(files["runtime.js"], /loadDirectory\(state\.snapshot\s*&&\s*state\.snapshot\.activeContext\.groupId\)/,
+  "initial actor directory must use the active group context");
 requireMatch(files["runtime.js"], /previousRevision[\s\S]*?state\.entities\.clear\(\)/,
   "snapshot revision changes must invalidate cached full entities");
 requireMatch(files["app.js"], /BACKGROUND_MAX_EDGE\s*=\s*1600[\s\S]*?toDataURL\("image\/jpeg",\s*0\.88\)/,
@@ -156,6 +165,10 @@ rejectMatch(styles, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/,
   "stage collision handling must not move the shared normalized marker anchor");
 requireMatch(textScaleFixture, /Number\(value\)\s*\*\s*1\.3/,
   "browser audit fixture must exercise a real 130% text-only scale");
+requireMatch(malformedNativeFixture, /window\.NativeMvu[\s\S]*?record_bad[\s\S]*?坏记录缺少 actorName/,
+  "browser audit needs a malformed NativeMvu recovery fixture");
+requireMatch(files["app.js"], /trim\(\)\.length\s*===\s*0[\s\S]*?Number\.NaN/,
+  "range validation must reject whitespace before numeric conversion");
 
 const expectedOrder = moduleNames.map((name) => `<script src="${name}"></script>`);
 let previousIndex = -1;
@@ -167,6 +180,8 @@ for (const tag of expectedOrder) {
 }
 requireMatch(build, /runtime\.js[\s\S]*?components\.js[\s\S]*?pages-status\.js[\s\S]*?pages-config\.js[\s\S]*?pages-rules\.js[\s\S]*?pages-advanced\.js[\s\S]*?app\.js/,
   "build must inline UI modules in dependency order");
+requireMatch(build, /Buffer\.byteLength\(out,\s*"utf8"\)/,
+  "build output must report actual UTF-8 bytes");
 
 if (violations.length > 0) {
   assert.fail(`MVU v3 UI audit failed (${violations.length}):\n- ${violations.join("\n- ")}`);
