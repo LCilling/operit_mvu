@@ -688,3 +688,97 @@ Result: exit 0; no output
 - A later higher v3 revision whose record manifest cannot be proven as a descendant retains the cleanup journal and warning indefinitely rather than risking deletion. This is fail-closed and may require operator/host intervention.
 - Existing scope limitations remain: one persistent ToolPkg main runtime, no interprocess/external-writer CAS claim, no directory listing for arbitrary crash-temp reclamation, a 1,024-path cleanup bound, and explicit export's intentional O(total history) cost.
 - No code-review subagent dispatcher was available. A direct full-diff safety audit was performed before final verification; the absence of independent review remains a process limitation.
+
+## Review round 5/5 fix — 2026-08-25
+
+### Starting state and Important root cause
+
+- Round-5 starting `HEAD`: `831fa48f5b342255a5876e428616b742cb60754f`; branch `codex/mvu-v3-complete-redesign` and the requested linked worktree were verified clean before edits.
+- Baseline `pnpm run check` passed all 92 existing tests: 92 pass, 0 fail, 0 skipped, 0 todo. Existing commits and ignored SDD artifacts were preserved; `progress.md` was not edited.
+- Round 4 correctly made startup and mutation preflight cleanup best-effort, but `commitLoaded()` still called throwing `resumeSegmentCleanup()` after `persistConfig()` had atomically committed the replacement/clear config.
+- A post-commit old-segment deletion failure therefore rejected the user operation even though its result was already durable. The same-runtime caller did not receive the committed snapshot/result or structured pending-cleanup status through the normal success path.
+
+### Honest round-5 RED evidence
+
+Tests were changed before production code. The focused run used the unchanged throwing post-publication call:
+
+```text
+Command: pnpm run typecheck; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; node --test --test-name-pattern="post-commit partial cleanup|cleanup journal whose config publication failed|valid v3 stays authoritative|production runtime keeps valid|production IPC import resolves" tests/record-store.test.mjs
+Result: exit 1; tests 5; pass 1; fail 4; skipped 0; todo 0
+Passing control: cleanup journal whose config publication failed (pre-publication `FAKE_REPLACEATOMICALLY_FAILED` still rejected).
+Four failures: direct clear, valid-v3 descendant mutation setup, production runtime setup, and production IPC import all rejected with `FAKE_DELETEFILE_FAILED` after config publication.
+```
+
+The production IPC regression was subsequently tightened to inject a pre-publication atomic-replace failure before its post-publication deletion failure. Its first assertion incorrectly assumed an uncommitted replacement segment would already be absent. The durable config correctly remained at the old revision and referenced only old segments; the known uncommitted segment is removed/reused by the next exclusive recovery. The assertion was corrected to test committed-manifest authority rather than physical absence before recovery. No production change resulted from that test-calibration failure.
+
+### Round-5 fix and invariants
+
+- `commitLoaded()` keeps atomic config publication as the commit point. All journal creation, record staging, safe-integer validation, and `persistConfig()` failures still reject before a committed result can be returned.
+- Only after `persistConfig()` succeeds does replacement/clear call `tryResumeSegmentCleanup(committed)`. The wrapper awaits the cleanup attempt, catches a deletion error, preserves its structured message, and lets the operation return its committed snapshot/result.
+- A partial delete leaves the exact cleanup journal in place. `migrationStatus()` in the same store/runtime reports `mode: "v3"` and `cleanup.state: "pending"` with the real `FAKE_DELETEFILE_FAILED` error.
+- Restart/retry uses the existing exact/descendant manifest proof and protected-live-path checks. It skips already-absent old paths, removes only superseded paths absent from the live manifest, then clears the journal and warning.
+- Direct coverage proves a clear returns revision `before + 1`, zero committed records, same-runtime pending status, restart cleanup, and byte-identical v2 with unchanged legacy revision.
+- Production coverage invokes the actually registered `operit_mvu:import_dataset` handler. A pre-publication atomic-replace failure rejects and leaves the old committed manifest authoritative; a later post-publication delete failure resolves, commits the one-record replacement in a new live segment, reports pending cleanup in the same runtime, and recovers safely on restart.
+- The production restart proves the live replacement segment and `record_7000` survive while only old superseded segments and the cleanup journal disappear. V2 bytes and revision remain unchanged throughout.
+
+### Files and implementation commit
+
+- `src/mvu/app/store-v3.ts`
+- `tests/record-store.test.mjs`
+
+```text
+ee7fe8ac38fe0fa22ef1f4b353aef212c2598341 fix: report post-commit cleanup as pending
+2 files changed, 91 insertions(+), 5 deletions(-)
+```
+
+### Exact round-5 GREEN verification
+
+Final focused coverage, including both pre- and post-publication production IPC failures:
+
+```text
+Command: pnpm run typecheck; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; node --test --test-name-pattern="post-commit partial cleanup|cleanup journal whose config publication failed|valid v3 stays authoritative|production runtime keeps valid|production IPC import resolves" tests/record-store.test.mjs
+Result: exit 0; tests 5; pass 5; fail 0; skipped 0; todo 0
+Expected diagnostics: production IPC logs `FAKE_REPLACEATOMICALLY_FAILED` for the asserted pre-publication rejection.
+```
+
+```text
+Command: pnpm run check
+Result: exit 0
+- Manifest audit: PASS (`operit-toolpkg-host`, API 3, 7 capabilities)
+- UI audit: PASS (15 screens, 42 declared actions, 48 handled actions, 20 native methods)
+- TypeScript: PASS
+- Temporary-effect audit: PASS
+- Node tests: 93 total, 93 pass, 0 fail, 0 skipped, 0 todo
+```
+
+```text
+Command: pnpm run pack
+Result: exit 0
+- Manifest/UI/type/effect audits: PASS
+- Web build: `dist/app.html` 9,323,226 bytes
+- Package: `release/operit_mvu-2.0.1.toolpkg`, 54 entries, 9,944,489 bytes data
+```
+
+```text
+Command: git diff --check
+Result: exit 0; no output
+```
+
+### Round-5 acceptance matrix
+
+- [x] **Post-commit cleanup is non-throwing.** Replacement/clear invokes `tryResumeSegmentCleanup()` only after atomic config publication and returns the committed result when deletion fails.
+- [x] **Same-runtime warning is exact.** The journal remains and migration status reports authoritative v3 plus pending cleanup carrying the injected deletion error.
+- [x] **Recovery is safe and resumable.** Later restart clears the journal and old segment remainder without deleting the live replacement path or losing the committed imported record.
+- [x] **V2 remains untouched.** Direct and production IPC regressions compare exact serialized v2 bytes and its legacy revision before and after failure/recovery.
+- [x] **Pre-publication failures still reject.** Both the existing direct config-publication test and production IPC import inject `replaceAtomically` failure, observe rejection, and prove the old config revision/manifest remains authoritative.
+- [x] **Direct and production wiring covered.** The store regression checks the returned snapshot; the production test invokes the registered IPC handler and checks the durable runtime/store result rather than an internal helper.
+- [x] **Prior guarantees preserved.** All 92 round-4 tests remain green; the added production IPC regression raises the suite to 93/93.
+- [x] **Required verification complete.** Focused RED/GREEN, `pnpm run check`, `pnpm run pack`, and `git diff --check` are recorded above and pass.
+
+### Residual limitations after round 5
+
+- Cleanup warning state remains runtime-local. Another store instance may clear the durable journal while an idle initialized instance retains its last warning until its next cleanup attempt; v3 authority and committed data are unaffected.
+- A pre-publication rejection can leave an uncommitted record segment until the next exclusive in-runtime recovery. The durable manifest never references it, so it is not visible as committed data; ordinary rejected-operation temp paths are still best-effort removed as documented in round 3.
+- The established scope remains one persistent ToolPkg main JavaScript runtime with owner-isolated storage; there is no cross-process/external-writer CAS claim.
+- Atomic durability depends on the host's declared same-directory `files.atomic_replace` capability. A true process crash may leave unique temporary files that cannot be enumerated through the available bounded host API.
+- No code-review subagent dispatcher was exposed in this session. The required review skill therefore ended in a direct contract-focused diff audit; no Critical, Important, or Minor issue was found in the round-5 change.
