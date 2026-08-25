@@ -30,7 +30,7 @@ import { publishOwnedTemporaryFile, StaleRevisionError } from "./store";
 import {
   assertMvuDataset,
   assertMvuDatasetV3,
-  backfillLegacyV3EffectReasonConfigs,
+  normalizeLegacyV3EffectReasonData,
 } from "./validation";
 
 const V2_FILE_NAME = "operit_mvu.dataset.v2.json";
@@ -334,9 +334,9 @@ export class V3MvuStore implements MvuStore {
     const path = this.v3Path(this.configDir());
     if (!(await this.files.exists(path))) throw new Error("MVU_V3_CONFIG_MISSING");
     const raw = await this.files.readText(path);
-    const parsed = JSON.parse(raw) as unknown;
+    const parsed = klona(JSON.parse(raw) as unknown);
     if (isMvuDatasetV3Candidate(parsed)) {
-      backfillLegacyV3EffectReasonConfigs(parsed);
+      normalizeLegacyV3EffectReasonData(parsed);
       hydrateLegacyActiveEffectSnapshots(parsed);
     }
     assertMvuDatasetV3(parsed);
@@ -358,6 +358,7 @@ export class V3MvuStore implements MvuStore {
     if (!Number.isSafeInteger(current.revision + 1)) {
       throw new Error("MVU_V3_REVISION_OVERFLOW");
     }
+    assertMvuDatasetV3(next);
     const commitRevision = current.revision + 1;
     const configPath = this.v3Path(this.configDir());
     let supersededPaths: string[] = [];
@@ -375,7 +376,6 @@ export class V3MvuStore implements MvuStore {
     const committed = klona(next);
     committed.revision = commitRevision;
     committed.recordManifest = staged.manifest;
-    backfillLegacyV3EffectReasonConfigs(committed);
     hydrateLegacyActiveEffectSnapshots(committed);
     assertMvuDatasetV3(committed);
     if (supersededPaths.length > 0) {

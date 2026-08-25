@@ -10,7 +10,12 @@ import {
   retainHourlyMessageBuckets,
   type AutomationMessageFacts,
 } from "./automation";
-import { activateEffectGroup, applyActiveEffects } from "./effect-engine";
+import {
+  activateEffectGroup,
+  applyActiveEffects,
+  normalizeEffectReasonVariable,
+  normalizeRenderedEffectReason,
+} from "./effect-engine";
 import type {
   AiRuleJudgement,
   DataActor,
@@ -29,9 +34,11 @@ import type {
   StateScopeContext,
   TurnCounter,
 } from "./model";
-import type {
-  MvuDatasetV3,
-  RuleTargetSelector,
+import {
+  EFFECT_REASON_RENDERED_MAX_LENGTH,
+  truncateEffectReasonText,
+  type MvuDatasetV3,
+  type RuleTargetSelector,
 } from "./model-v3";
 import {
   applyMvuCommand,
@@ -1505,9 +1512,7 @@ function applyV3RuleChange(input: {
     requestedDelta: input.sourceDelta,
     effectiveRequestedDelta: applied.effectiveDelta,
     effectIds: applied.effectIds,
-    reason: applied.reasons.length === 0
-      ? `规则触发：${input.ruleName}`
-      : `规则触发：${input.ruleName}；效果：${applied.reasons.map((reason) => reason.text).join("、")}`,
+    reason: composeV3RuleReason(input.ruleName, applied.reasons.map((reason) => reason.text)),
     ruleId: input.ruleId,
     input: input.input,
     recordId: input.recordId,
@@ -1541,11 +1546,23 @@ function applyV3ImmediateChange(input: {
     requestedDelta: input.delta,
     effectiveRequestedDelta: input.delta,
     effectIds: input.effectId === null ? [] : [input.effectId],
-    reason: `规则触发：${input.ruleName}；效果：${input.effectReason}`,
+    reason: composeV3RuleReason(input.ruleName, [input.effectReason]),
     ruleId: input.ruleId,
     input: input.input,
     recordId: input.recordId,
   });
+}
+
+function composeV3RuleReason(ruleName: string, effectReasons: readonly string[]): string {
+  let result = `规则触发：${normalizeEffectReasonVariable(ruleName) ?? ""}`;
+  for (let index = 0; index < effectReasons.length; index += 1) {
+    const separator = index === 0 ? "；效果：" : "、";
+    const remaining = EFFECT_REASON_RENDERED_MAX_LENGTH - result.length - separator.length;
+    if (remaining <= 0) break;
+    result += separator + truncateEffectReasonText(effectReasons[index], remaining);
+    if (result.length >= EFFECT_REASON_RENDERED_MAX_LENGTH) break;
+  }
+  return normalizeRenderedEffectReason(result);
 }
 
 function v3RuleRecord(input: {
@@ -1579,7 +1596,7 @@ function v3RuleRecord(input: {
     delta: input.after - input.before,
     stageBefore: deriveStage(input.field, input.before).id,
     stageAfter: deriveStage(input.field, input.after).id,
-    reason: input.reason,
+    reason: normalizeRenderedEffectReason(input.reason),
     source: "rule",
     ruleIds: [input.ruleId],
     effectIds: input.effectIds,

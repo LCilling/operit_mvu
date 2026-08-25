@@ -3,11 +3,16 @@ import test from "node:test";
 
 import { activateEffectGroup } from "../dist/mvu/app/effect-engine.js";
 import { migrateDatasetV2ToV3 } from "../dist/mvu/app/migration-v3.js";
+import {
+  EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+  EFFECT_REASON_RENDERED_MAX_LENGTH,
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
+} from "../dist/mvu/app/model-v3.js";
 import { MvuQueryService } from "../dist/mvu/app/query.js";
 import { processPersistedMessageV3 } from "../dist/mvu/app/service.js";
 import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
 import { FileMvuStore } from "../dist/mvu/app/store.js";
-import { assertMvuDatasetV3 } from "../dist/mvu/app/validation.js";
+import { assertDataChangeRecord, assertMvuDatasetV3 } from "../dist/mvu/app/validation.js";
 import { MVU_REQUEST_PARSERS } from "../dist/shared/ipc.js";
 import {
   createFakeMvuFileApi,
@@ -116,6 +121,41 @@ function effectGroupInput(defaultReason) {
   };
 }
 
+function changeRecord(reason) {
+  return {
+    id: "record_reason_bound",
+    scope: "character",
+    scopeKey: "character:actor_t",
+    fieldId: "field_affinity",
+    fieldName: "Affinity",
+    actorId: "actor_t",
+    actorName: "角色T",
+    chatId: "chat_main",
+    groupId: "group_main",
+    before: 50,
+    after: 51,
+    requestedDelta: 1,
+    effectiveRequestedDelta: 1,
+    delta: 1,
+    stageBefore: "stage_neutral",
+    stageAfter: "stage_neutral",
+    reason,
+    source: "rule",
+    ruleIds: ["rule_reason"],
+    effectIds: ["active_reason"],
+    confidence: null,
+    messageId: "message_reason",
+    variantId: null,
+    occurredAt: NOW,
+  };
+}
+
+function deepFreeze(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
 test("v2 migration preserves definition reason configuration and resolves the active snapshot", () => {
   const templateLegacy = legacyDatasetFixture();
   templateLegacy.temporaryEffects[0].reasonMode = "template";
@@ -189,6 +229,28 @@ test("old v3 files missing defaultReason backfill deterministically and persist 
   });
   assert.equal(restarted.dataset.activeEffects[0].reason.text, "frozen legacy instance");
   assert.deepEqual(restarted.dataset.activeEffects[0].definitionSnapshot, frozenSnapshot);
+});
+
+test("old persisted v3 normalizes pathological definition and active reason sizes only at the read boundary", async () => {
+  const oldV3 = migrateDatasetV2ToV3(legacyDatasetFixture(), NOW).dataset;
+  const definitionText = "定".repeat(EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH + 100);
+  const activeText = "例".repeat(EFFECT_REASON_RENDERED_MAX_LENGTH + 100);
+  oldV3.effectGroups[0].defaultReason = { mode: "custom", template: "general", text: definitionText };
+  oldV3.activeEffects[0].reason = { mode: "custom", template: "general", text: activeText };
+  const files = createFakeMvuFileApi({ [V3_PATH]: JSON.stringify(oldV3, null, 2) });
+  const store = v3Store(files);
+
+  assert.equal((await store.initialize()).mode, "v3");
+  const first = await store.readV3();
+  assert.equal(first.dataset.effectGroups[0].defaultReason.text, definitionText.slice(0, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH));
+  assert.equal(first.dataset.activeEffects[0].reason.text, activeText.slice(0, EFFECT_REASON_RENDERED_MAX_LENGTH));
+  const frozenActiveReason = structuredClone(first.dataset.activeEffects[0].reason);
+  first.dataset.effectGroups[0].defaultReason = { mode: "custom", template: "general", text: "新定义" };
+  await store.transactV3(first.revision, first.dataset, []);
+
+  const restarted = await v3Store(files).readV3();
+  assert.deepEqual(restarted.dataset.activeEffects[0].reason, frozenActiveReason);
+  assert.equal(restarted.dataset.effectGroups[0].defaultReason.text, "新定义");
 });
 
 test("effect-group create update copy query and restart preserve independent reason configs", async () => {
@@ -378,10 +440,15 @@ test("IPC and v3 validation accept exact reason configs and reject unknown blank
       patch: { defaultReason },
     }), /MVU_EFFECT_REASON_CONFIG_INVALID/);
 
+  }
+  for (const defaultReason of [invalidReasons[0], invalidReasons[2]]) {
     const dataset = baseV3Dataset();
     dataset.effectGroups = [effectGroup("effect_group_invalid", "无效", defaultReason)];
     assert.throws(() => assertMvuDatasetV3(dataset), /MVU_V3_EFFECT_REASON_CONFIG_INVALID/);
   }
+  const legacySized = baseV3Dataset();
+  legacySized.effectGroups = [effectGroup("effect_group_legacy_sized", "兼容", invalidReasons[1])];
+  assert.doesNotThrow(() => assertMvuDatasetV3(legacySized));
 });
 
 test("v2 compatibility reads definition reasons and updates defaults without rewriting active snapshots", async () => {
@@ -413,18 +480,222 @@ test("v2 compatibility reads definition reasons and updates defaults without rew
   const next = structuredClone(compatibility.dataset);
   next.temporaryEffects[0].reasonMode = "custom";
   next.temporaryEffects[0].reasonTemplate = "environment";
-  next.temporaryEffects[0].reason = "更新后的默认原因";
+  const updatedLegacyText = "更新".repeat(300);
+  next.temporaryEffects[0].reason = updatedLegacyText;
   await store.transact(compatibility.revision, next);
 
   const after = await store.readV3();
   assert.deepEqual(after.dataset.effectGroups[0].defaultReason, {
     mode: "custom",
     template: "environment",
-    text: "更新后的默认原因",
+    text: updatedLegacyText,
   });
   assert.deepEqual(after.dataset.activeEffects[0].reason, {
     mode: "custom",
     template: "general",
     text: "旧实例快照",
   });
+});
+
+test("million-character events and oversized display names render bounded deterministic snapshots and records", async () => {
+  const dataset = baseV3Dataset();
+  const hugeEvent = "事".repeat(1_000_000);
+  const hugeName = "名".repeat(20_000);
+  dataset.fields[0].name = hugeName;
+  dataset.conditions = [condition("condition_bounded")];
+  dataset.effectGroups = [effectGroup(
+    "effect_group_bounded",
+    hugeName,
+    {
+      mode: "custom",
+      template: "general",
+      text: "{{triggerActorName}}|{{ruleName}}|{{effectGroupName}}|{{fieldName}}|{{event}}",
+    },
+  )];
+  dataset.rules = [rule("rule_bounded", hugeName, "condition_bounded", "effect_group_bounded", 0)];
+  const input = {
+    dataset,
+    context: { chatId: "chat_main", actorId: "actor_t", groupId: "group_main", actorName: hugeName },
+    currentActorId: "actor_t",
+    messageId: "message_bounded",
+    variantId: null,
+    content: hugeEvent,
+    role: "user",
+    occurredAt: NOW,
+    signals: {
+      recentPositiveCount: null,
+      userCareDetected: null,
+      lastInteractionAt: null,
+      messageCountInLast24Hours: null,
+      specialDayDetected: null,
+    },
+  };
+
+  const first = await processPersistedMessageV3(structuredClone(input));
+  const second = await processPersistedMessageV3(structuredClone(input));
+  const firstReason = first.dataset.activeEffects[0].reason.text;
+  assert.equal(firstReason, second.dataset.activeEffects[0].reason.text);
+  assert.ok(firstReason.length > 0 && firstReason.length <= EFFECT_REASON_RENDERED_MAX_LENGTH);
+  assert.ok(first.records[0].reason.length <= EFFECT_REASON_RENDERED_MAX_LENGTH);
+  const persistedFact = Object.values(first.dataset.messageFacts).flat().at(-1);
+  assert.equal(persistedFact.content.length, 2_000);
+  assert.doesNotThrow(() => assertMvuDatasetV3(first.dataset));
+  assert.doesNotThrow(() => assertDataChangeRecord(first.records[0]));
+});
+
+test("legacy v2 reasons preserve ordinary oversized text and deterministically cap pathological text", async () => {
+  const compatibleText = "旧".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 88);
+  const compatibleV2 = legacyDatasetFixture();
+  compatibleV2.temporaryEffects[0].reasonMode = "custom";
+  compatibleV2.temporaryEffects[0].reason = compatibleText;
+  const compatible = migrateDatasetV2ToV3(compatibleV2, NOW);
+  assert.equal(compatible.dataset.effectGroups[0].defaultReason.text, compatibleText);
+  assert.equal(compatible.dataset.activeEffects[0].reason.text, compatibleText);
+  assert.deepEqual(compatible.report.warnings, []);
+
+  const compatibleFiles = filesWithV2(compatibleV2);
+  const compatibleStore = v3Store(compatibleFiles, compatibleV2);
+  assert.equal((await compatibleStore.initialize()).mode, "v3");
+  assert.equal((await compatibleStore.read()).dataset.temporaryEffects[0].reason, compatibleText);
+  assert.equal((await v3Store(compatibleFiles, compatibleV2).readV3()).dataset.effectGroups[0].defaultReason.text, compatibleText);
+
+  const pathologicalText = "病".repeat(EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH + 10_000);
+  const pathologicalV2 = legacyDatasetFixture();
+  pathologicalV2.temporaryEffects[0].reasonMode = "custom";
+  pathologicalV2.temporaryEffects[0].reason = pathologicalText;
+  const pathological = migrateDatasetV2ToV3(pathologicalV2, NOW);
+  assert.equal(pathological.dataset.effectGroups[0].defaultReason.text.length, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH);
+  assert.equal(
+    pathological.dataset.effectGroups[0].defaultReason.text,
+    pathologicalText.slice(0, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH),
+  );
+  assert.equal(pathological.dataset.activeEffects[0].reason.text.length, EFFECT_REASON_RENDERED_MAX_LENGTH);
+  assert.match(pathological.report.warnings.join("\n"), /MVU_EFFECT_REASON_LEGACY_TRUNCATED/);
+
+  const pathologicalFiles = filesWithV2(pathologicalV2);
+  const pathologicalStore = v3Store(pathologicalFiles, pathologicalV2);
+  const status = await pathologicalStore.initialize();
+  assert.equal(status.mode, "v3");
+  assert.match(status.report.warnings.join("\n"), /MVU_EFFECT_REASON_LEGACY_TRUNCATED/);
+  const beforeRestart = await pathologicalStore.readV3();
+  const afterRestart = await v3Store(pathologicalFiles, pathologicalV2).readV3();
+  assert.deepEqual(afterRestart.dataset.effectGroups[0].defaultReason, beforeRestart.dataset.effectGroups[0].defaultReason);
+  assert.deepEqual(afterRestart.dataset.activeEffects[0].reason, beforeRestart.dataset.activeEffects[0].reason);
+});
+
+test("v3 validation is pure and normal create or transact cannot backfill a missing default reason", async () => {
+  const valid = deepFreeze(baseV3Dataset());
+  const validJson = JSON.stringify(valid);
+  assert.doesNotThrow(() => assertMvuDatasetV3(valid));
+  assert.equal(JSON.stringify(valid), validJson);
+
+  const missing = baseV3Dataset();
+  missing.effectGroups = [effectGroup(
+    "effect_group_missing",
+    "缺少原因",
+    { mode: "template", template: "general", text: "" },
+  )];
+  delete missing.effectGroups[0].defaultReason;
+  const missingJson = JSON.stringify(missing);
+  deepFreeze(missing);
+  assert.throws(() => assertMvuDatasetV3(missing), /INVALID_MVU_V3_EFFECT_GROUP/);
+  assert.equal(JSON.stringify(missing), missingJson);
+
+  const files = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const snapshot = await store.readV3();
+  const invalidCommit = structuredClone(snapshot.dataset);
+  delete invalidCommit.effectGroups[0].defaultReason;
+  await assert.rejects(
+    store.transactV3(snapshot.revision, invalidCommit, []),
+    /INVALID_MVU_V3_EFFECT_GROUP/,
+  );
+  assert.equal((await store.readV3()).revision, snapshot.revision);
+  await assert.rejects(
+    store.transactV3(
+      snapshot.revision,
+      structuredClone(snapshot.dataset),
+      [changeRecord("x".repeat(EFFECT_REASON_RENDERED_MAX_LENGTH + 1))],
+    ),
+    /INVALID_MVU_CHANGE_RECORD/,
+  );
+  assert.equal((await store.readV3()).revision, snapshot.revision);
+
+  const queries = new MvuQueryService(store, { now: () => NOW, createId: (prefix) => `${prefix}_missing` });
+  const missingInput = effectGroupInput({ mode: "template", template: "general", text: "" });
+  delete missingInput.defaultReason;
+  await assert.rejects(
+    queries.createEffectGroup({ expectedRevision: snapshot.revision, effectGroup: missingInput }),
+    /MVU_EFFECT_REASON_CONFIG_INVALID/,
+  );
+});
+
+test("active snapshots and persisted records require exact bounded rendered reasons", () => {
+  const dataset = baseV3Dataset();
+  const definition = effectGroup(
+    "effect_group_active_validation",
+    "活动效果",
+    { mode: "template", template: "general", text: "" },
+  );
+  dataset.effectGroups = [definition];
+  dataset.activeEffects = activateEffectGroup({
+    definition,
+    fields: dataset.fields,
+    triggerActorId: "actor_t",
+    instanceId: "active_validation",
+    activatedAt: NOW_ISO,
+  }).instances;
+  dataset.activeEffects[0].reason.injected = true;
+  assert.throws(() => assertMvuDatasetV3(dataset), /MVU_V3_ACTIVE_EFFECT_REASON_INVALID/);
+
+  const oversized = structuredClone(dataset);
+  delete oversized.activeEffects[0].reason.injected;
+  oversized.activeEffects[0].reason.text = "x".repeat(EFFECT_REASON_RENDERED_MAX_LENGTH + 1);
+  assert.throws(() => assertMvuDatasetV3(oversized), /MVU_V3_ACTIVE_EFFECT_REASON_INVALID/);
+
+  const record = changeRecord("x".repeat(EFFECT_REASON_RENDERED_MAX_LENGTH + 1));
+  assert.throws(() => assertDataChangeRecord(record), /INVALID_MVU_CHANGE_RECORD/);
+});
+
+test("new query API keeps the 512 source limit while legacy definitions remain activatable", async () => {
+  const files = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const queries = new MvuQueryService(store, {
+    now: () => NOW,
+    createId: (prefix) => `${prefix}_source_bound`,
+  });
+  const revision = (await store.readV3()).revision;
+  const tooLong = { mode: "custom", template: "general", text: "x".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 1) };
+  await assert.rejects(
+    queries.createEffectGroup({ expectedRevision: revision, effectGroup: effectGroupInput(tooLong) }),
+    /MVU_EFFECT_REASON_CONFIG_INVALID/,
+  );
+  const existingId = (await store.readV3()).dataset.effectGroups[0].id;
+  await assert.rejects(
+    queries.updateEffectGroup({ id: existingId, expectedRevision: revision, patch: { defaultReason: tooLong } }),
+    /MVU_EFFECT_REASON_CONFIG_INVALID/,
+  );
+
+  const legacyText = "旧".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 1);
+  const legacyV2 = legacyDatasetFixture();
+  legacyV2.temporaryEffects[0].reasonMode = "custom";
+  legacyV2.temporaryEffects[0].reason = legacyText;
+  const legacyV3 = migrateDatasetV2ToV3(legacyV2, NOW).dataset;
+  const activation = activateEffectGroup({
+    definition: legacyV3.effectGroups[0],
+    fields: legacyV3.fields,
+    instanceId: "active_legacy_reason",
+    activatedAt: NOW_ISO,
+  });
+  assert.equal(activation.instances[0].reason.text, legacyText);
+
+  assert.throws(() => activateEffectGroup({
+    definition: legacyV3.effectGroups[0],
+    fields: legacyV3.fields,
+    instanceId: "active_explicit_reason",
+    activatedAt: NOW_ISO,
+    reason: tooLong,
+  }), /MVU_EFFECT_REASON_TOO_LONG/);
 });

@@ -53,6 +53,7 @@ function effectGroup(index, name = `Effect ${String(index).padStart(4, "0")}`) {
       actorSelector: { kind: "all_bound" },
       operations: [{ kind: "immediate_delta", value: 1 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: new Date(NOW + index).toISOString(),
     updatedAt: new Date(NOW + index).toISOString(),
   };
@@ -1269,6 +1270,7 @@ test("condition effect-group and rule CRUD copy toggle delete and references sta
       actorSelector: { kind: "all_bound" },
       operations: [{ kind: "immediate_delta", value: 1 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
   } });
   revision = createdEffectResult.revision;
   const createdEffect = createdEffectResult.entity;
@@ -1330,6 +1332,7 @@ test("all condition effect-group and rule mutations enforce revision CAS before 
       actorSelector: { kind: "all_bound" },
       operations: [{ kind: "immediate_delta", value: 1 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
   };
   const ruleInput = {
     name: "Matrix rule",

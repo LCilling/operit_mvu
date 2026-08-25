@@ -2,50 +2,59 @@
 
 ## Scope
 
-Task 9B2 makes an effect group's reusable reason configuration part of the v3 persisted definition and makes every activation path consume that configuration by default. No UI, release/version, field-template, package, manifest, progress ledger, or artifact file is part of this change.
+Task 9B2 persists an effect group's reusable reason configuration and makes every production activation path consume it by default. This review follow-up hardens size boundaries, legacy migration, validation purity, active snapshots, and record persistence. No UI, release/version, field-template implementation, package, manifest, progress ledger, or artifact file is part of this commit.
 
-## Persisted contract
+## Persisted contract and bounds
 
 - `EffectGroupDefinition.defaultReason` is a strict `{ mode, template, text }` object.
 - `mode` is `template` or `custom`; `template` is one of `general`, `positive`, `negative`, `environment`, or `relationship`.
-- Definition source text is bounded to 512 UTF-16 code units. Template mode may retain an empty or legacy compatibility text value, but rendering always uses the selected built-in template. Custom mode requires non-whitespace text.
-- Effect-group create and update IPC parsers require exact reason keys, reject unknown nested keys, and share the same bounds as persisted v3 validation.
-- Query input/patch DTOs derive the new required field from `EffectGroupDefinition`; the existing generic create/update/query/copy implementation already deep-clones nested data with `klona`, so no query implementation fork was needed.
+- New editor/query/IPC source text is limited to 512 UTF-16 code units. Template mode may use empty text; custom mode must contain non-whitespace text. Query create/update repeats the strict source check so callers cannot bypass the IPC parser.
+- A separate 16,384-unit compatibility ceiling permits valid historical v2/v3 source text above 512 to remain readable and round-trip through compatibility APIs.
+- Every reason variable is normalized and limited to 256 units before substitution. NUL/control characters are removed or normalized, and oversized message/name values therefore cannot amplify an active snapshot.
+- Fully rendered active-instance reasons and persisted `DataChangeRecord.reason` values share a 2,048-unit ceiling. Truncation is deterministic and never leaves a dangling UTF-16 high surrogate.
+- Active reason snapshots require exact keys and non-empty bounded rendered text. Record-store append/replace validates the same rendered limit before persistence.
 
-## Activation and snapshots
+## Activation and records
 
-- `activateEffectGroup` now uses `definition.defaultReason` when the caller does not provide an explicit override. This makes manual and future production activation paths consistent by construction.
-- Safe variables are resolved at activation: `triggerActorName`, `ruleName`, `effectGroupName`, a deterministic joined `fieldName`, and the current message content as `event`.
-- The resolved text is stored in `ActiveEffectInstance.reason`; later definition rename, reason edit, or field-effect edit does not rewrite an existing instance.
-- Rule-driven immediate change records include the resolved reason (`规则触发：…；效果：…`) instead of the generic `激活效果组` label.
+- `activateEffectGroup` uses `definition.defaultReason` unless a caller provides an explicit override. Explicit new overrides retain the 512 source limit; a migrated legacy definition above 512 remains activatable.
+- Supported variables are resolved at activation: `triggerActorName`, `ruleName`, `effectGroupName`, a bounded deterministic `fieldName`, and current message content as `event`.
+- The resolved text is frozen in `ActiveEffectInstance.reason`; later definition rename, reason edit, or field-effect edit cannot rewrite an old instance.
+- Rule-driven immediate records contain the resolved reason (`规则触发：…；效果：…`) and the complete record reason is normalized to the persistence limit. A million-character event and oversized names do not make ordinary message processing fail; message facts retain their existing 2,000-unit bound.
 
-## Migration and compatibility strategy
+## Migration and store-boundary strategy
 
-- v2 migration copies `reasonMode`, `reasonTemplate`, and `reason` losslessly into `defaultReason`. The active instance receives the fully resolved reason snapshot, including a localized built-in template string for template mode.
-- A v3 file written before this field existed receives deterministic `template/general` with empty source text at the validation/store boundary. The in-memory dataset is immediately complete; the next ordinary atomic commit persists the backfill. Repeated startup before that commit produces the same result.
-- Legacy active definition snapshots remain unchanged, and legacy active reason snapshots are never recomputed during backfill.
-- v3-to-v2 compatibility projection now reads the definition default rather than borrowing one active instance's frozen reason. A v2 compatibility edit updates the reusable definition and preserves every old active instance reason.
+- v2 migration preserves custom reason source text from 513 through 16,384 units without loss in the reusable definition. An active snapshot preserves it while it fits the 2,048 rendered ceiling.
+- Pathological legacy definition text above 16,384 is deterministically truncated and emits `MVU_EFFECT_REASON_LEGACY_TRUNCATED`. Historical records above 2,048 are likewise bounded with `MVU_CHANGE_RECORD_REASON_LEGACY_TRUNCATED`, so one pathological entry cannot block the overall migration.
+- Template-mode compatibility text remains stored for round-trip fidelity but rendering uses the selected localized built-in template.
+- `assertMvuDatasetV3` is now a pure strict validator. Frozen valid input passes without mutation; frozen input missing `defaultReason` fails and remains byte-for-byte unchanged.
+- Only `V3MvuStore.loadV3Config` clones a persisted old-v3 document and performs deterministic reason backfill/legacy size normalization before validation. The next successful ordinary commit makes that normalized clone durable.
+- v2 startup migration and v2 import/replace compatibility flow use the explicit migration boundary. Valid 513+ source text survives compatibility edits and restart.
+- `transactV3` and normal commit do not backfill missing `defaultReason`; they validate before record staging and fail closed. Query create/update also require the field. Copy remains a deep copy and can preserve an existing legacy-compatible definition.
+- Existing active instance reason snapshots are never recomputed from a changed definition. Legacy read normalization only bounds the snapshot's own historical text.
 
-## TDD evidence
+## TDD and verification evidence
 
-Initial RED after adding only `tests/effect-reason-config.test.mjs`:
+Review fixes were added to `tests/effect-reason-config.test.mjs` before their source implementation. The first RED run failed at module loading because the three separate boundary constants did not exist. Subsequent focused failures exposed the old shared-bound assumption, mutation-based backfill, missing active/record bounds, and unbounded rendering path. Existing backend fixtures that intentionally create new v3 effect groups were then updated to supply the now-required reason configuration rather than relying on silent commit repair.
 
-- 7 tests run: 1 passed, 6 failed for the intended missing behaviors.
-- Failures proved the old code had no definition reason, no old-v3 backfill, hard-coded rule activation, mandatory caller reason, no new IPC key, and instance-based compatibility projection.
+Final evidence:
 
-GREEN and focused verification:
+- `node --test tests/effect-reason-config.test.mjs`: 13/13 pass.
+- Related query/store/rule regression matrix: 109/109 pass.
+- `pnpm run check`: pass, including 234/234 Node tests and 4/4 DOM gate tests.
+- `pnpm run typecheck`: pass (also executed inside `check` and `build`).
+- `pnpm run audit:effects`: pass (also executed inside `check` and `build`).
+- `pnpm run build`: pass; all audits, typecheck, effects audit, and web build completed.
+- `git diff --check`: pass.
 
-- `pnpm run typecheck`: pass.
-- `node --test tests/effect-reason-config.test.mjs`: 7/7 pass.
-- Relevant backend regression matrix (`effect-engine`, `effect-immutability`, Task 9B2, `rule-engine-v3`, `record-store`, `record-store-hardening`, and `query`): 132/132 pass.
-- `pnpm run audit:effects`: pass.
-- `pnpm run build:web`: pass; generated `dist/app.html`.
-- Targeted `git diff --check`: pass.
+## Task 9B UI carry (intentionally not changed here)
 
-At the time of this report draft, whole-repository `pnpm run check` and `pnpm run build` are temporarily blocked by concurrent, uncommitted Task 9B field-template UI work outside this task's authorized paths. The first check stopped in the UI audit, and a later all-Node run reached 227/228 with only the concurrently edited UI shell failing. Final whole-repository evidence must be refreshed after that shared UI edit settles; these failures are not suppressed or changed by Task 9B2.
+Concurrent Task 9B UI work owns `static/**`, so this backend commit does not touch it. The UI owner must make these exact integrations:
 
-## Residual risks
+1. In `static/app_ui/runtime.js`, split `validateEffectReasonConfig` into response/persisted validation and editor-request validation. The current response validator hard-codes `reason.text.length > 512`; entity responses must accept the backend legacy-storage ceiling of 16,384, while create/update payloads must continue to reject source text above 512. Otherwise `getEntityById` will reject a valid imported legacy effect group containing 513+ characters.
+2. Preserve required `defaultReason` on both demo entity constructors (`effectEntities` and `demoEffectEntities`) and on every new effect-editor draft. The current concurrent tree already includes template/general defaults in the two demo constructors; the UI task should retain them.
+3. The effect editor must submit exact `{ mode, template, text }` keys, expose all five template values, require visible non-empty custom text, and provide a direct 512-character validation message before invoking create/update IPC.
 
-- Template-mode compatibility text is retained for round-trip fidelity but intentionally does not override the built-in localized template.
-- The `event` variable contains the current persisted message content. Existing message-fact validation bounds persisted message content; unknown template variables remain literal and no expression evaluation occurs.
-- Backfill does not create a special migration-only revision. It becomes durable on the next normal CAS commit, avoiding a startup revision jump while remaining deterministic across restarts.
+## Residual risk
+
+- The 16,384 compatibility ceiling is intentionally finite. Inputs above it migrate safely with a warning and deterministic truncation rather than preserving pathological payloads indefinitely.
+- Until Task 9B UI applies the response/editor validator split above, the current concurrent runtime can reject legacy-compatible 513+ definition responses even though the backend correctly stores and serves them.

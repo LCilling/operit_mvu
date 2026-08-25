@@ -30,7 +30,12 @@ import type {
   RuleActorSelector,
   RuleTargetSelector,
 } from "./model-v3";
-import { EFFECT_REASON_TEXT_MAX_LENGTH } from "./model-v3";
+import {
+  EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+  EFFECT_REASON_RENDERED_MAX_LENGTH,
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
+  truncateEffectReasonText,
+} from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
 } from "./temporary-effect";
@@ -461,6 +466,9 @@ function assertRecordShape(value: unknown): asserts value is DataChangeRecord {
 /** Public storage-boundary validator for one persisted JSONL record. */
 export function assertDataChangeRecord(value: unknown): asserts value is DataChangeRecord {
   assertRecordShape(value);
+  if (value.reason.length > EFFECT_REASON_RENDERED_MAX_LENGTH) {
+    fail("INVALID_MVU_CHANGE_RECORD");
+  }
 }
 
 function assertTurnCounterShape(value: unknown): asserts value is TurnCounter {
@@ -669,7 +677,6 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     new Set(value.processedMessageIds).size !== value.processedMessageIds.length) {
     fail("INVALID_MVU_V3_DATASET");
   }
-  backfillLegacyV3EffectReasonConfigs(value);
   assertSettingsShape(value.settings);
   assertNestedNumberMap(value.stateValues);
   assertNestedNumberMap(value.lastSettled);
@@ -888,13 +895,26 @@ function assertEffectGroupDefinitionShape(
 }
 
 function assertEffectReasonConfigShape(value: unknown): asserts value is EffectReasonConfig {
+  assertEffectReasonConfigWithin(value, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH, "MVU_V3_EFFECT_REASON_CONFIG_INVALID");
+}
+
+/** Strict source validator for new v3 create/update requests. */
+export function assertEditableEffectReasonConfig(value: unknown): asserts value is EffectReasonConfig {
+  assertEffectReasonConfigWithin(value, EFFECT_REASON_SOURCE_MAX_LENGTH, "MVU_EFFECT_REASON_CONFIG_INVALID");
+}
+
+function assertEffectReasonConfigWithin(
+  value: unknown,
+  maximumTextLength: number,
+  code: string,
+): asserts value is EffectReasonConfig {
   if (!isRecord(value) || !hasExactKeys(value, ["mode", "template", "text"]) ||
     (value.mode !== "template" && value.mode !== "custom") ||
     (value.template !== "general" && value.template !== "positive" && value.template !== "negative" &&
       value.template !== "environment" && value.template !== "relationship") ||
-    typeof value.text !== "string" || value.text.length > EFFECT_REASON_TEXT_MAX_LENGTH ||
+    typeof value.text !== "string" || value.text.length > maximumTextLength ||
     (value.mode === "custom" && value.text.trim().length === 0)) {
-    fail("MVU_V3_EFFECT_REASON_CONFIG_INVALID");
+    fail(code);
   }
 }
 
@@ -957,10 +977,12 @@ function assertActiveEffectInstanceShape(
     if (targetKeys.has(key)) fail("MVU_V3_ACTIVE_EFFECT_TARGET_DUPLICATE");
     targetKeys.add(key);
   }
-  if ((value.reason.mode !== "template" && value.reason.mode !== "custom") ||
+  if (!hasExactKeys(value.reason, ["mode", "template", "text"]) ||
+    (value.reason.mode !== "template" && value.reason.mode !== "custom") ||
     (value.reason.template !== "general" && value.reason.template !== "positive" && value.reason.template !== "negative" &&
       value.reason.template !== "environment" && value.reason.template !== "relationship") ||
-    typeof value.reason.text !== "string" || value.reason.text.trim().length === 0) {
+    typeof value.reason.text !== "string" || value.reason.text.trim().length === 0 ||
+    value.reason.text.length > EFFECT_REASON_RENDERED_MAX_LENGTH) {
     fail("MVU_V3_ACTIVE_EFFECT_REASON_INVALID");
   }
   if (value.definitionSnapshot !== undefined) {
@@ -989,13 +1011,37 @@ function assertActiveEffectInstanceShape(
   }
 }
 
-/** Deterministic compatibility fill for v3 files written before effect reasons lived on definitions. */
-export function backfillLegacyV3EffectReasonConfigs(value: unknown): boolean {
+/**
+ * Mutating normalization for a cloned, already-persisted legacy v3 document.
+ * Never call this from validation or a normal transaction commit.
+ */
+export function normalizeLegacyV3EffectReasonData(value: unknown): boolean {
   if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.effectGroups)) return false;
   let changed = false;
   for (const effectGroup of value.effectGroups) {
-    if (!isRecord(effectGroup) || Object.prototype.hasOwnProperty.call(effectGroup, "defaultReason")) continue;
-    effectGroup.defaultReason = { mode: "template", template: "general", text: "" };
+    if (!isRecord(effectGroup)) continue;
+    if (!Object.prototype.hasOwnProperty.call(effectGroup, "defaultReason")) {
+      effectGroup.defaultReason = { mode: "template", template: "general", text: "" };
+      changed = true;
+      continue;
+    }
+    if (isRecord(effectGroup.defaultReason) && typeof effectGroup.defaultReason.text === "string" &&
+      effectGroup.defaultReason.text.length > EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH) {
+      effectGroup.defaultReason.text = truncateEffectReasonText(
+        effectGroup.defaultReason.text,
+        EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+      );
+      changed = true;
+    }
+  }
+  if (!Array.isArray(value.activeEffects)) return changed;
+  for (const activeEffect of value.activeEffects) {
+    if (!isRecord(activeEffect) || !isRecord(activeEffect.reason) || typeof activeEffect.reason.text !== "string" ||
+      activeEffect.reason.text.length <= EFFECT_REASON_RENDERED_MAX_LENGTH) continue;
+    activeEffect.reason.text = truncateEffectReasonText(
+      activeEffect.reason.text,
+      EFFECT_REASON_RENDERED_MAX_LENGTH,
+    );
     changed = true;
   }
   return changed;
