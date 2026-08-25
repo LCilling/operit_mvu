@@ -2,7 +2,7 @@
 
 本文记录 Issue #998 在当前 Operit 宿主中实现的 ToolPkg 契约。它不是未来接口提案，也不是 MVU 自建的宿主替身。
 
-角色卡、角色组、聊天绑定、数据库消息身份和系统默认模型都属于 Operit 私有事实，必须由新版宿主提供。用户首次安装一次包含这些接口的 Operit 版本后，当前 MVU 只通过单一外部 `operit_mvu-2.0.1.toolpkg` 安装；后续更新也只替换这一外部 ToolPkg，不需要辅助 APK、第二个接口包或独立前端目录。MVU 不随宿主 APK 内置。
+角色卡、角色组、聊天绑定、数据库消息身份和系统默认模型都属于 Operit 私有事实，必须由新版宿主提供。用户首次安装一次包含这些接口的 Operit 版本后，当前 MVU 只通过单一外部 `operit_mvu-3.0.0.toolpkg` 安装；后续更新也只替换这一外部 ToolPkg，不需要辅助 APK、第二个接口包或独立前端目录。MVU 不随宿主 APK 内置。
 
 ## 接口总览
 
@@ -12,7 +12,8 @@
 | 已持久化消息事件 | `message_persisted` | 每轮变化、规则、记录和消息幂等 |
 | 系统默认模型 | `ToolPkg.systemModel.probe/complete` | 无聊天副作用的 AI 状态候选 |
 | Prompt 组合 | `registerSystemPromptComposeHook` | 仅向普通聊天追加当前状态投影 |
-| 插件私有存储 | `ToolPkg.getConfigDir(pluginId)` | v2 数据集文件和 revision 事务 |
+| 插件私有存储 | `ToolPkg.getConfigDir(pluginId)` | v3 数据集、分段记录与 revision 事务 |
+| 原子文件提交 | `Tools.Files.replaceAtomically(source, destination)` | 配置、记录和恢复结果的不可分割替换 |
 | main 与 UI 通信 | `ToolPkg.ipc` | 页面查询与类型化命令 |
 
 MVU 的 AI 路径只使用 `ToolPkg.systemModel`。`ToolPkg.localModels` 是另一个通用平台 API，不是 Issue #998 的系统默认模型实现，也不是 MVU 的依赖。
@@ -148,6 +149,35 @@ MVU 为判断结果提供 `jsonSchema`。宿主校验 schema 名称、对象根�
 
 `chatContext` 和 `systemModel` 都是运行期异步 API，不能在 `registerToolPkg()` 执行期间调用。
 
+## `Tools.Files.replaceAtomically`
+
+```ts
+interface FileOperationData {
+  env: "android" | "linux";
+  operation: string;
+  path: string;
+  successful: boolean;
+  details: string;
+}
+
+namespace Tools.Files {
+  function replaceAtomically(
+    source: string,
+    destination: string,
+  ): Promise<FileOperationData>;
+}
+```
+
+MVU 先通过既有 `Tools.Files.write` 把完整提交写入正式文件同目录的临时普通文件，再调用 `replaceAtomically`。宿主必须使用 Android 本地文件系统的一次 `ATOMIC_MOVE + REPLACE_EXISTING` 完成替换，并满足以下契约：
+
+- 源文件和目标文件必须位于同一已存在目录，源必须是普通文件；目标可以不存在。
+- 仅 Android 本地路径可用。Linux、SAF/`content://`、跨目录和文件系统不支持原子移动时必须失败。
+- 不得回退到普通 move、copy/delete 或先删除目标。失败时旧目标保持不变，源临时文件是否保留由调用方检查和清理。
+- 成功返回 `successful: true` 且 `operation: "atomic_replace"`；失败返回不成功结果或拒绝 Promise，不能仅靠 `details` 文本判断成败。
+- 该方法故意没有 `environment` 参数，避免把 Android 本地原子语义错误推广到其他存储后端。
+
+MVU 不得用普通 `move`、覆盖写或删除后重建代替该接口提交权威数据；宿主没有此接口时，插件应明确报告宿主版本不兼容，不能静默降低数据安全保证。
+
 ## Prompt 组合
 
 MVU 使用 `registerSystemPromptComposeHook`，但只接受 `promptFunctionType === "CHAT"` 的请求。返回的新 `systemPrompt` 必须包含事件中 Operit 已组合好的完整 `systemPrompt`，再追加 MVU 当前可见状态段。
@@ -172,4 +202,4 @@ MVU 使用 `registerSystemPromptComposeHook`，但只接受 `promptFunctionType 
 - Android 真机验证后台消息、群聊、编辑和变体事件
 - 最终 `.toolpkg` 的导入、同 ID 更新、重启持久化、完整按钮矩阵和视觉回归
 
-正式用户链路仍是先更新一次满足上述契约的 Operit，再只导入单一外部 `operit_mvu-2.0.1.toolpkg`。MVU 页面不提供专用退出按钮，离开插件统一使用 Android 返回手势、系统返回键或 Operit 自身导航。
+正式用户链路仍是先更新一次满足上述契约的 Operit，再只导入单一外部 `operit_mvu-3.0.0.toolpkg`。MVU 页面不提供专用退出按钮，离开插件统一使用 Android 返回手势、系统返回键或 Operit 自身导航。
