@@ -1,5 +1,6 @@
 import type { DataField, StateScope } from "./model";
 import type {
+  ActiveEffectDefinitionSnapshot,
   ActiveEffectInstance,
   EffectActorSelector,
   EffectDuration,
@@ -114,6 +115,7 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
       duration: input.duration ?? input.definition.defaultDuration ?? { expiresAt: null, remainingTurns: null },
       activatedAt: input.activatedAt,
       reason,
+      definitionSnapshot: snapshotEffectDefinition(input.definition),
     }],
     immediateChanges,
     diagnostics,
@@ -133,9 +135,10 @@ export function applyActiveEffects(input: ApplyActiveEffectsInput): AppliedField
 
   for (const instance of input.activeEffects) {
     if (!instanceApplies(instance, input.field.id, scopeKey, input.occurredAt)) continue;
-    const definition = groups.get(instance.definitionId);
-    const fieldEffect = definition?.fieldEffects.find((candidate) => candidate.fieldId === input.field.id);
-    if (definition === undefined || fieldEffect === undefined || !definition.enabled) continue;
+    const currentDefinition = groups.get(instance.definitionId);
+    const fieldEffects = instance.definitionSnapshot?.fieldEffects ?? currentDefinition?.fieldEffects;
+    const fieldEffect = fieldEffects?.find((candidate) => candidate.fieldId === input.field.id);
+    if (fieldEffect === undefined || (instance.definitionSnapshot === undefined && !currentDefinition?.enabled)) continue;
     applicableOperations.push(...fieldEffect.operations.filter((operation) => operationApplies(operation, input.source)));
     effectIds.push(instance.id);
     reasons.push(instance.reason);
@@ -158,6 +161,45 @@ export function applyActiveEffects(input: ApplyActiveEffectsInput): AppliedField
     effectIds,
     reasons: uniqueReasons(reasons),
   };
+}
+
+/** Upgrades pre-snapshot v3 instances once using the definition visible at load time. */
+export function hydrateLegacyActiveEffectSnapshots(dataset: {
+  effectGroups: readonly EffectGroupDefinition[];
+  activeEffects: ActiveEffectInstance[];
+}): void {
+  const groups = new Map(dataset.effectGroups.map((definition) => [definition.id, definition]));
+  for (const instance of dataset.activeEffects) {
+    if (instance.definitionSnapshot !== undefined) continue;
+    const definition = groups.get(instance.definitionId);
+    if (definition === undefined) throw new Error(`MVU_EFFECT_DEFINITION_NOT_FOUND:${instance.definitionId}`);
+    instance.definitionSnapshot = snapshotEffectDefinition(definition);
+  }
+}
+
+function snapshotEffectDefinition(definition: EffectGroupDefinition): ActiveEffectDefinitionSnapshot {
+  return {
+    name: definition.name,
+    description: definition.description,
+    updatedAt: definition.updatedAt,
+    fieldEffects: definition.fieldEffects.map((fieldEffect) => ({
+      ...fieldEffect,
+      actorSelector: cloneSelector(fieldEffect.actorSelector),
+      operations: fieldEffect.operations.map(cloneOperation),
+    })),
+  };
+}
+
+function cloneSelector(selector: EffectActorSelector): EffectActorSelector {
+  return selector.kind === "selected"
+    ? { kind: "selected", actorIds: [...selector.actorIds] }
+    : { kind: selector.kind };
+}
+
+function cloneOperation(operation: EffectOperation): EffectOperation {
+  return operation.kind === "immediate_delta"
+    ? { ...operation }
+    : { ...operation, sources: [...operation.sources] };
 }
 
 /** Renders only the supported visual variables and stores the completed text. */

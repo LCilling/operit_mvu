@@ -89,6 +89,13 @@ export interface EffectReasonSnapshot {
   text: string;
 }
 
+export interface ActiveEffectDefinitionSnapshot {
+  name: string;
+  description: string;
+  updatedAt: string;
+  fieldEffects: FieldEffectDefinition[];
+}
+
 export interface ActiveEffectInstance {
   id: string;
   definitionId: string;
@@ -97,6 +104,8 @@ export interface ActiveEffectInstance {
   duration: EffectDuration;
   activatedAt: string;
   reason: EffectReasonSnapshot;
+  /** Missing only on legacy v3 files; the store hydrates it before use. */
+  definitionSnapshot?: ActiveEffectDefinitionSnapshot;
 }
 
 export type ConditionSender = MessageFact["role"];
