@@ -313,6 +313,18 @@ function createQuerySource(
     async listActors() {
       return actorsFromHostSnapshot(await hostSnapshot());
     },
+    async listActorsForGroup(groupId) {
+      const groupSnapshot = await ToolPkg.chatContext.snapshot({ groupId });
+      if (groupSnapshot.activeGroup?.characterGroupId !== groupId) {
+        throw new Error(`MVU_HOST_GROUP_CONTEXT_MISMATCH:${groupId}`);
+      }
+      return groupSnapshot.members.map((member) => ({
+        characterId: member.characterCardId,
+        name: member.name,
+        avatarUri: member.avatarUri ?? undefined,
+        enabled: true,
+      }));
+    },
     async listGroups() {
       return (await hostSnapshot()).groups;
     },

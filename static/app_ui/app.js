@@ -9,6 +9,9 @@
   let toastTimer = 0;
 
   ui.render = render;
+  ui.switchStatusMode = switchStatusMode;
+  ui.importDatasetText = importDataset;
+  ui.exportDataset = exportDataset;
 
   function render(options) {
     const previous = appRoot.querySelector(".screen-scroll");
@@ -57,49 +60,44 @@
     if (!target) return;
     const routeButton = target.closest("[data-route]");
     if (routeButton) {
-      await go(routeButton.dataset.route);
+      await ui.navigate(routeButton.dataset.route);
       return;
     }
     const fieldButton = target.closest("[data-field-id]");
     if (fieldButton && fieldButton.dataset.action === "open-field") {
       ui.state.selectedFieldId = fieldButton.dataset.fieldId;
-      await go("field-detail");
+      await ui.navigate("field-detail");
       return;
     }
     const entityButton = target.closest("[data-open-entity]");
     if (entityButton) {
       ui.state.selectedEntityId = entityButton.dataset.entityId;
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[entityButton.dataset.openEntity];
-      await go(route);
+      await ui.navigate(route);
       return;
     }
     const newEntityButton = target.closest("[data-new-entity]");
     if (newEntityButton) {
       ui.state.selectedEntityId = "";
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[newEntityButton.dataset.newEntity];
-      await go(route);
+      await ui.navigate(route);
       return;
     }
     const editField = target.closest('[data-action="edit-field"]');
     if (editField) {
       ui.state.selectedEntityId = editField.dataset.fieldId;
-      await go("field-editor");
+      await ui.navigate("field-editor");
       return;
     }
     const statusMode = target.closest("[data-status-mode]");
     if (statusMode) {
-      ui.state.statusMode = statusMode.dataset.statusMode;
-      if (ui.state.statusMode === "character" && ui.state.lastActorId) {
-        await reloadContext({ groupId: ui.state.snapshot.activeContext.groupId, actorId: ui.state.lastActorId });
-      } else {
-        ui.transition(render);
-      }
+      await switchStatusMode(statusMode.dataset.statusMode);
       return;
     }
     const changeRoute = target.closest("[data-change-route]");
     if (changeRoute) {
       const route = { natural: "natural-settings", turn: "turn-settings", link: "link-settings" }[changeRoute.dataset.changeRoute];
-      await go(route);
+      await ui.navigate(route);
       return;
     }
     const actor = target.closest("[data-select-actor]");
@@ -123,9 +121,7 @@
 
   async function handleAction(action, element) {
     if (action === "go-back") {
-      const route = ui.routes[ui.state.route];
-      if (window.history.length > 1) window.history.back();
-      else await go(route.owner, true);
+      await ui.goBack();
     } else if (action === "open-drawer") {
       ui.state.drawerOpen = true;
       render();
@@ -148,37 +144,42 @@
       await saveFieldRange(element);
     } else if (action === "new-field") {
       ui.state.selectedEntityId = "";
-      await go("field-editor");
+      await ui.navigate("field-editor");
     } else if (action === "edit-current-field") {
       ui.state.selectedEntityId = ui.state.selectedFieldId;
-      await go("field-editor");
+      await ui.navigate("field-editor");
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker") {
       showToast("搜索选择框将在下一步的大数据界面中打开");
     }
   }
 
-  async function go(route, replace) {
-    if (!route) return;
-    const next = ui.routes[route];
-    if (!next) throw new Error("MVU_ROUTE_UNKNOWN:" + route);
-    ui.state.route = route;
-    ui.state.drawerOpen = false;
-    const url = new URL(window.location.href);
-    url.searchParams.delete("screen");
-    url.searchParams.set("route", route);
-    if (ui.state.selectedFieldId) url.searchParams.set("field", ui.state.selectedFieldId);
-    else url.searchParams.delete("field");
-    window.history[replace ? "replaceState" : "pushState"]({ route }, "", url);
-    await ui.loadRouteData(route);
-    ui.transition(function () { render({ resetScroll: true }); });
+  async function switchStatusMode(mode) {
+    if (mode !== "character" && mode !== "group") throw new Error("MVU_STATUS_MODE_INVALID");
+    ui.state.statusMode = mode;
+    if (mode === "group") {
+      const selected = ui.state.snapshot.activeContext.groupId ||
+        (ui.state.snapshot.selected.group && ui.state.snapshot.selected.group.characterGroupId) ||
+        (ui.state.directory.groups[0] && ui.state.directory.groups[0].characterGroupId);
+      if (!selected) {
+        ui.transition(render);
+        return;
+      }
+      await reloadContext({ groupId: selected }, selected);
+      return;
+    }
+    if (ui.state.lastActorId) {
+      const groupId = ui.state.snapshot.activeContext.groupId;
+      await reloadContext({ groupId, actorId: ui.state.lastActorId }, groupId);
+    } else {
+      ui.transition(render);
+    }
   }
 
-  ui.navigate = go;
-
-  async function reloadContext(request) {
+  async function reloadContext(request, directoryGroupId) {
     setBusy(true);
     try {
       await ui.loadSnapshot(request);
+      await ui.loadDirectory(directoryGroupId || null);
       await ui.loadRouteData(ui.state.route);
       ui.transition(function () { render({ resetScroll: false }); });
     } catch (error) {
@@ -232,14 +233,12 @@
   async function exportDataset() {
     setBusy(true);
     try {
-      const dataset = await ui.native.call("exportDataset", {});
-      const blob = new Blob([JSON.stringify(dataset, null, 2)], { type: "application/json" });
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = "operit-mvu-v3-backup.json";
-      link.click();
-      URL.revokeObjectURL(link.href);
-      showToast("数据已导出");
+      const result = await ui.native.call("exportDataset", {});
+      if (!result || typeof result.fileName !== "string" || typeof result.savedPath !== "string") {
+        throw new Error("MVU_EXPORT_RESPONSE_INVALID");
+      }
+      showToast("已导出到 " + result.savedPath);
+      return result;
     } finally {
       setBusy(false);
     }
@@ -297,8 +296,8 @@
   async function importDataset(source) {
     setBusy(true);
     try {
-      const dataset = JSON.parse(source);
-      await ui.native.call("importDataset", { dataset });
+      JSON.parse(source);
+      await ui.native.call("importDataset", { json: source });
       await ui.loadSnapshot();
       render();
       showToast("数据已导入");
