@@ -1549,7 +1549,7 @@ test("a cleanup journal whose config publication failed is discarded on restart 
   assert.equal((await restarted.queryRecords({ offset: 0, limit: 501 })).totalCount, 501);
 });
 
-test("retry after repeated cleanup failure never rebuilds or overwrites the valid published v3 config", async () => {
+test("valid v3 stays authoritative through cleanup failure, descendant append, and later recovery", async () => {
   const legacy = legacyDatasetFixture();
   legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
   const { files, serialized } = filesWithV2(legacy);
@@ -1560,17 +1560,100 @@ test("retry after repeated cleanup failure never rebuilds or overwrites the vali
   cleared.records = [];
   files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
   await assert.rejects(store.transact(before.revision, cleared), /FAKE_DELETEFILE_FAILED/);
-  const publishedV3 = files.snapshot()[V3_PATH];
-  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
   files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
   const restarted = v3Store(files, legacy);
 
-  assert.equal((await restarted.initialize()).mode, "v2_compat");
-  assert.equal((await restarted.retryMigration()).mode, "v2_compat");
-  assert.equal(files.snapshot()[V3_PATH], publishedV3);
-  assert.equal(JSON.parse(files.snapshot()[V3_PATH]).recordManifest.recordCount, 0);
+  const pending = await restarted.initialize();
+  assert.equal(pending.mode, "v3");
+  assert.equal(pending.cleanup?.state, "pending");
+  assert.match(pending.cleanup?.error.message ?? "", /FAKE_DELETEFILE_FAILED/);
+  assert.equal((await restarted.readV3()).dataset.recordManifest.recordCount, 0);
+  await assert.rejects(restarted.retryMigration(), /MVU_V3_MIGRATION_RETRY_NOT_ALLOWED/);
+
+  const beforeAppend = await restarted.readV3();
+  const next = structuredClone(beforeAppend.dataset);
+  next.settings.aiEnabled = false;
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  const committed = await restarted.transactV3(beforeAppend.revision, next, [changeRecord(9_000)]);
+  const retainedJournal = JSON.parse(files.snapshot()[V3_CLEANUP_PATH]);
+
+  assert.equal(committed.revision, beforeAppend.revision + 1);
+  assert.equal(committed.dataset.settings.aiEnabled, false);
+  assert.equal(committed.dataset.recordManifest.recordCount, 1);
+  assert.equal(retainedJournal.expectedRevision, beforeAppend.revision);
+  assert.equal(retainedJournal.expectedRevision < committed.revision, true);
+  assert.equal((await restarted.migrationStatus()).mode, "v3");
+  assert.equal((await restarted.migrationStatus()).cleanup?.state, "pending");
   assert.equal(files.snapshot()[V2_PATH], serialized);
-  assert.equal(typeof files.snapshot()[V3_CLEANUP_PATH], "string");
+  assert.equal(JSON.parse(files.snapshot()[V2_PATH]).revision, legacy.revision);
+
+  const recovered = v3Store(files, legacy);
+  const recoveredStatus = await recovered.initialize();
+  assert.equal(recoveredStatus.mode, "v3");
+  assert.equal(recoveredStatus.cleanup, undefined);
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], undefined);
+  assert.equal((await recovered.readV3()).dataset.settings.aiEnabled, false);
+  assert.deepEqual(
+    (await recovered.queryRecords({ offset: 0, limit: 10, direction: "asc" })).items.map(({ id }) => id),
+    ["record_9000"],
+  );
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+});
+
+test("production runtime keeps valid v3 authoritative while cleanup is pending across a mutation", async (t) => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files, serialized } = filesWithV2(legacy);
+  const seed = v3Store(files, legacy);
+  await seed.initialize();
+  const before = await seed.read();
+  const cleared = structuredClone(before.dataset);
+  cleared.records = [];
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  await assert.rejects(seed.transact(before.revision, cleared), /FAKE_DELETEFILE_FAILED/);
+
+  installProductionHost(t, files, {
+    chatId: "chat_main",
+    activePrompt: null,
+    activeCharacter: null,
+    activeGroup: null,
+    characters: [],
+    groups: [],
+    members: [],
+    currentCharacter: null,
+  }, [], {}, []);
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  const runtime = createRuntime({ getConfigDir: () => CONFIG_DIR });
+
+  const pending = await runtime.initialize();
+  assert.equal(pending.mode, "v3");
+  assert.equal(pending.cleanup?.state, "pending");
+  assert.equal((await runtime.dataset()).records.length, 0);
+  const beforeMutationRevision = (await runtime.dataset()).revision;
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  await runtime.updateSettings({ aiEnabled: false });
+
+  const committedV3 = JSON.parse(files.snapshot()[V3_PATH]);
+  const retainedJournal = JSON.parse(files.snapshot()[V3_CLEANUP_PATH]);
+  assert.equal(committedV3.revision, beforeMutationRevision + 1);
+  assert.equal(committedV3.settings.aiEnabled, false);
+  assert.equal(committedV3.recordManifest.recordCount, 0);
+  assert.equal(retainedJournal.expectedRevision, beforeMutationRevision);
+  assert.equal((await runtime.migrationStatus()).mode, "v3");
+  assert.equal((await runtime.migrationStatus()).cleanup?.state, "pending");
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+  assert.equal(JSON.parse(files.snapshot()[V2_PATH]).revision, legacy.revision);
+
+  const recoveredRuntime = createRuntime({ getConfigDir: () => CONFIG_DIR });
+  const recoveredStatus = await recoveredRuntime.initialize();
+  assert.equal(recoveredStatus.mode, "v3");
+  assert.equal(recoveredStatus.cleanup, undefined);
+  assert.equal((await recoveredRuntime.dataset()).settings.aiEnabled, false);
+  assert.equal((await recoveredRuntime.dataset()).records.length, 0);
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], undefined);
+  assert.equal(files.snapshot()[V2_PATH], serialized);
 });
 
 test("owned record, repair, legacy config, and cleanup-journal temps are removed after ordinary rejection", async () => {
