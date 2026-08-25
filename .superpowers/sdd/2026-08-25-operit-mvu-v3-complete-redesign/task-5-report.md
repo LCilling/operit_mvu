@@ -135,3 +135,153 @@ Result: exit 0; no whitespace errors
 - Atomicity relies on the host's documented file move behavior. The fake adapter proves ordering and interruption recovery, not device-filesystem implementation internals.
 - The v2 compatibility view is intentionally lossy for v3-only concepts. Untouched hidden assets are preserved; conflicting legacy IDs and deletion of a legacy-projected effect still referenced by a hidden v3 rule fail explicitly instead of silently overwriting v3 data.
 - Explicit migration retry replaces an invalid v3 candidate and its uncommitted record directory from the preserved v2 source. The v2 bytes remain the recovery anchor.
+
+## Review round 1 fix — 2026-08-25
+
+This section supersedes the earlier report's statements that config publication used an ordinary move, JSONL queries used host `readPart`, retry rebuilt by deleting the v3 candidate, and compatibility reads materialized every record. Those were accurate for the pre-review Task 5 commit and are no longer true after the hardening commit.
+
+### Starting WIP and review findings
+
+- Review-fix starting `HEAD`: `bcb2cd9bafe9e7909a7c6a495fd69b1e08037aa2`.
+- The branch and linked worktree matched the requested locations and were clean at the start of this fix round.
+- The complete round-1 review was read. Direct code and host-interface inspection confirmed all three Critical findings, all five Important findings, and the unsafe-integer Minor finding.
+- The adjacent OperitAI host declarations and implementation expose `Tools.Files.replaceAtomically(source, destination)`. It is a checked, same-directory atomic replacement that fails instead of degrading to ordinary copy/delete. No host file lock, lease, or conditional-write primitive is exposed to this plugin.
+- Existing commits and ignored SDD artifacts were preserved. `progress.md` was not edited.
+
+### Honest RED evidence
+
+The host-faithful decorated-partial-read fake first broke the existing tests before the production reader was changed:
+
+```text
+Command: pnpm run typecheck; node --test tests/record-store.test.mjs
+Result: exit 1; tests 12; pass 4; fail 8
+Representative failure: MVU_V3_RECORD_LINE_INVALID:segment-000001.jsonl:496
+Affected coverage: segmented queries, repair/query, atomic transaction queries,
+migration queries, and both production-composition paths.
+```
+
+The dedicated round-1 regressions were then run against the uncorrected production implementation:
+
+```text
+Command: pnpm run typecheck; node --test tests/record-store-hardening.test.mjs
+Result: exit 1; tests 10; pass 0; fail 10
+Failures proved:
+- atomic replacement was not called (`'v3' !== 'v2_compat'` under injected atomic failure)
+- decorated JSONL reached the parser
+- two store instances corrupted/staged the same segment instead of rejecting stale CAS
+- normal writes deleted/reused an orphan instead of failing collision-safe
+- retry used no atomic replacement and was not fail-closed
+- 100k-history compatibility read used the unbounded/decorated path
+- rule selector/target/reference/shared-condition data was replaced
+- effect actor/source semantics and multiple instances were collapsed
+- expiry disabled the reusable definition
+- `Number.MAX_SAFE_INTEGER + 1` was accepted as a segment counter
+```
+
+Two additional missing contracts were found during GREEN integration and each received a fresh RED before its fix:
+
+```text
+Command: pnpm run typecheck; node --test --test-name-pattern="later in-runtime write" tests/record-store-hardening.test.mjs
+Result: exit 1; tests 1; pass 0; fail 1
+Failure: MVU_V3_RECORD_SEGMENT_COLLISION:segment-000001.jsonl
+Meaning: the same runtime did not enter exclusive recovery after a partial append write.
+```
+
+```text
+Command: pnpm run typecheck; node --test --test-name-pattern="legacy effect writes" tests/record-store-hardening.test.mjs
+Result: exit 1; tests 1; pass 0; fail 1
+Failure: AssertionError false !== true
+Meaning: a legacy active-effect toggle still disabled the reusable v3 definition.
+```
+
+No artificial RED was added. The unsuccessful-result adapter assertion and ordinary-move-versus-atomic fake assertion extend the already-RED atomic-publication contract.
+
+### Hardened invariants
+
+- V2 and v3 config files are published only with checked `replaceAtomically`; ordinary `move` is never a config publication fallback. Config, repair, and retry temp paths carry runtime-unique identifiers.
+- Segment queries use bounded whole-segment raw reads and slice locally. Host `readPart` remains modeled as decorated/truncatable/error-injectable but is never used for JSONL.
+- A module-wide queue serializes every v3 startup, recovery, read transaction, and write transaction by config path across `V3MvuStore` instances in one JavaScript runtime. Each writer rereads the on-disk revision while holding that exclusion and stale CAS fails before staging.
+- A failed or partial append marks the path recovery-required. The next write, or startup, exclusively validates committed lines, atomically trims an orphan tail, and removes contiguous unlisted new segments before another append.
+- Normal writes never destructively delete a colliding uncommitted segment. Replacement/migration finds a new contiguous unused segment run; failed retry staging remains invisible because only the atomically published manifest controls visibility.
+- Startup is the only unconditional full-history validation path. `readV3` is config-only; v2 compatibility snapshots load at most the newest 500 records using at most one 500-line segment read for that snapshot.
+- A legacy rule edit patches only v2-representable name/description/toggle/cooldown/order/condition/effect fields. Existing actor selectors, targets, creation metadata, and hidden effect-group references survive. Shared conditions use copy-on-write.
+- A legacy effect operation edit preserves reusable definition identity, field-effect identity, actor selectors, source filters, every active instance, each reason, trigger actor, target, activation time, and lifetime. Expiry/direct settlement removes active instances without disabling the reusable definition; ambiguous multi-instance projection edits fail closed.
+- `retryMigration` is accepted only while the store reports `v2_compat`, simultaneous calls are coalesced, a valid v3 is preferred again under the path lock, and valid-v3 retry attempts reject without deletion or mutation.
+- Persisted revisions, record counts, segment indexes, line counts, and segment revisions require safe integers. Revision/count/index increments are checked before publication or append-side effects.
+
+### Files changed in the hardening commit
+
+- `src/mvu/app/index.ts`
+- `src/mvu/app/record-store.ts`
+- `src/mvu/app/store-v3.ts`
+- `src/mvu/app/store.ts`
+- `src/mvu/app/validation.ts`
+- `types/files.d.ts`
+- `tests/helpers.mjs`
+- `tests/record-store.test.mjs`
+- `tests/record-store-hardening.test.mjs`
+
+Focused implementation commit:
+
+```text
+d40e0f6100dd08c07a21f5b7bcc4aab70445c824 fix: harden crash-safe v3 persistence
+9 files changed, 1046 insertions(+), 164 deletions(-)
+```
+
+### Exact GREEN verification
+
+```text
+Command: node --test tests/record-store-hardening.test.mjs
+Result: exit 0; tests 13; pass 13; fail 0; skipped 0; todo 0
+```
+
+```text
+Command: node --test tests/record-store.test.mjs tests/migration-v3.test.mjs
+Result: exit 0; tests 16; pass 16; fail 0; skipped 0; todo 0
+```
+
+```text
+Command: pnpm run check
+Result: exit 0
+- UI audit: PASS (15 screens, 42 declared actions, 48 handled actions, 20 native methods)
+- TypeScript: PASS
+- Temporary-effect audit: PASS
+- Node tests: 70 total, 70 pass, 0 fail, 0 skipped, 0 todo
+```
+
+```text
+Command: git diff --check
+Result: exit 0; no output
+
+Command: git diff --cached --check
+Result: exit 0; no output
+```
+
+The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICALLY_FAILED` diagnostic appears during the production-hook failure test; that rejection is asserted and the suite exits zero.
+
+### Round-1 acceptance matrix
+
+- [x] **Atomic host capability and checked failure.** `MvuFileApi` and `types/files.d.ts` declare `replaceAtomically`; the real adapter checks `successful`; v2 and v3 config publishers call only atomic replace. Tests distinguish interrupted ordinary move from failed atomic replacement and assert failed host result handling.
+- [x] **Raw bounded JSONL reads.** Record queries read at most the needed 500-line segment(s), slice locally, ignore physical lines beyond `committedLineCount`, and never call decorated/truncated `readPart`.
+- [x] **Cross-instance serialization and stale-writer safety.** Two stores on one path are deterministically interleaved with a barrier; only one publishes and the stale writer receives `StaleRevisionError`. Unique config/repair temp IDs and collision-free migration segment runs prevent shared fixed staging names.
+- [x] **Hidden v3 rule semantics.** Exact regression coverage preserves selectors, targets, hidden effect references, metadata, and the untouched side of a shared condition while representable fields change.
+- [x] **Reusable definitions versus active instances.** Operation edits preserve source/actor filters and multiple exact instances; direct toggle and expiry settle instances without disabling the reusable definition.
+- [x] **Bounded normal work.** The 100,000-record test clears startup operation history, performs a compatibility read, and proves no partial read and at most one record-segment whole read. Full segment validation is startup/recovery-only.
+- [x] **Fail-closed migration retry.** Retry is compatibility-only, coalesced for double-clicks, stages on unique paths, atomically switches, preserves v2 bytes, and never deletes valid v3.
+- [x] **Host-faithful fake and production ordering.** The fake decorates/truncates partial reads, distinguishes ordinary move from atomic replace, supports pre-operation barriers and pre/post-write failures, and records operations. The registered `src/main.ts` hook test proves records append before config publication; injected publication failure leaves committed config/revision/count unchanged.
+- [x] **Safe integers.** Revisions/counts/indexes and increments are guarded with `Number.isSafeInteger`.
+- [x] **500-line committed record store and repair.** Rotation remains exactly 500, manifest counts are the read boundary, and both restart and same-runtime interrupted-append recovery are covered.
+- [x] **Safe v2→v3 startup migration.** Valid v3 wins; v2 bytes remain byte-identical; failure returns structured `v2_compat`; retries use new segment/config staging paths and atomic switch.
+- [x] **Real production transaction and composition.** The registered production hook exercises legacy natural/per-turn/state-AI/link behavior plus v3 role-aware rules, effect activation/consumption, hourly facts, caps, and committed records in one v3 transaction—not an internal helper alone.
+- [x] **Pre-Task-6 compatibility.** `V3MvuStore` still implements the v2 `MvuStore` interface with a documented bounded recent-record snapshot while v3 paging remains available.
+- [x] **Hourly retention.** Existing recursive enabled-condition-window coverage remains green and does not count-cap referenced hours.
+- [x] **Role-aware AI, caps, validation, and v2 preservation.** Task 4 semantic/validation tests, migration tests, and production hook assertions all remain green.
+- [x] **Full check.** `pnpm run check` passes with 70/70 Node tests.
+
+### Residual risks after round 1
+
+- The host API exposed to this plugin has no lock/lease/conditional-write primitive. The implementation and deterministic tests prove path serialization across all `V3MvuStore` instances sharing this JavaScript module/runtime; they do not prove exclusion between separate host processes. No broader claim is made.
+- A crashed or failed uniquely staged migration/replacement can leave invisible old segment or temp files. They cannot become committed through the manifest and contiguous forward orphans are repaired, but lower-index staging generations may consume storage until a future host listing/garbage-collection capability is introduced.
+- The pre-Task-6 v2 compatibility snapshot intentionally exposes only the newest 500 records. Full history remains available through v3 paged `queryRecords`; Task 6 should keep UI history on that API.
+- Atomic durability still depends on the host's documented same-directory `replaceAtomically` implementation. The adapter fails closed and the fake tests observable contract/failure behavior, not device-filesystem internals.
+- No subagent/code-review dispatch tool was available in this session. A direct diff and acceptance audit was performed; this is a process limitation, not an unreported independent review.
