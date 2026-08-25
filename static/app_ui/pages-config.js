@@ -92,7 +92,17 @@
       '"></label><label>变化步长<input name="step" type="number" inputmode="decimal" step="any" value="' + draft.step +
       '"></label><label>初始值<input name="initialValue" type="number" inputmode="decimal" step="any" value="' + draft.initialValue +
       '"></label></div>' + stageEditor(draft) + fieldAutomationEditor(draft) + '</section><p class="inline-error editor-error" role="alert" data-field-editor-error>' +
-      ui.escapeHtml(draft.error || "") + '</p><div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary">保存字段</button></div></form>';
+      ui.escapeHtml(draft.error || "") + '</p>' + fieldEditorSubmit(draft) + '</form>';
+  }
+
+  function fieldEditorSubmit(draft) {
+    if (draft.mutationCommitted) {
+      return '<div class="editor-submit committed"><button type="button" class="button primary" data-action="reload-field-list-after-save"' +
+        (draft.refreshingAfterCommit ? " disabled" : "") + '>' + (draft.refreshingAfterCommit ? "正在重新载入…" : "重新载入字段列表") + "</button></div>";
+    }
+    return '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back"' + (draft.submitting ? " disabled" : "") +
+      '>取消</button><button type="submit" class="button primary"' + (draft.submitting ? " disabled" : "") + '>' +
+      (draft.submitting ? "正在保存…" : "保存字段") + "</button></div>";
   }
 
   function scopeBinding(draft) {
@@ -124,10 +134,35 @@
     const context = ui.state.snapshot;
     const chatId = context.activeContext.chatId;
     const chatName = context.contextLabels.chatName;
+    const search = String(draft.chatBindingSearch || "").trim().toLocaleLowerCase();
+    const filtered = draft.bindingIds.filter(function (id) {
+      const readable = id === chatId ? chatName : "名称不可用";
+      return !search || (readable + " " + id).toLocaleLowerCase().includes(search);
+    });
+    const pageCount = Math.max(1, Math.ceil(filtered.length / 5));
+    draft.chatBindingPage = Math.max(1, Math.min(pageCount, Number(draft.chatBindingPage) || 1));
+    const startIndex = (draft.chatBindingPage - 1) * 5;
+    const visible = filtered.slice(startIndex, startIndex + 5);
+    const start = visible.length ? startIndex + 1 : 0;
+    const end = startIndex + visible.length;
     return '<div class="binding-summary chat-binding" data-chat-binding><span><strong>当前会话</strong><small>' + ui.escapeHtml(chatName) +
       '</small></span><label class="compact-switch"><input name="bindCurrentChat" type="checkbox"' + (draft.chatAutoBind ? " checked" : "") +
-      '><span>立即绑定</span></label><details><summary>高级绑定设置</summary><p>默认绑定正在打开的会话“' + ui.escapeHtml(chatName) +
-      '”。关闭“立即绑定”可先创建一个暂不生效的字段模板。</p><small>会话标识 · ' + ui.escapeHtml(chatId || "宿主未提供") + "</small></details></div>";
+      '><span>绑定当前会话</span></label><details' + (draft.chatBindingsOpen ? " open" : "") + '><summary>高级绑定设置 · ' + draft.bindingIds.length +
+      ' 个会话</summary><p>开关只增删正在打开的会话，不会覆盖其它绑定。宿主暂不提供历史会话名称目录，因此旧会话按精确 ID 管理，不会虚构名称。</p>' +
+      '<label class="chat-binding-search">搜索已绑定会话<input name="chatBindingSearch" type="search" value="' + ui.escapeHtml(draft.chatBindingSearch || "") +
+      '" placeholder="搜索当前名称或会话 ID"></label><div class="chat-binding-status"><span data-chat-binding-count>显示 ' + start + '–' + end + ' / 共 ' +
+      filtered.length + ' 条' + (filtered.length !== draft.bindingIds.length ? ' · 筛选前 ' + draft.bindingIds.length + ' 条' : "") +
+      '</span><div><button type="button" class="icon-button" data-action="page-chat-bindings" data-chat-page-direction="-1" aria-label="上一页"' +
+      (draft.chatBindingPage <= 1 ? " disabled" : "") + '>' + c.icon("chevron_left") + '</button><button type="button" class="icon-button" data-action="page-chat-bindings" data-chat-page-direction="1" aria-label="下一页"' +
+      (draft.chatBindingPage >= pageCount ? " disabled" : "") + '>' + c.icon("chevron_right") + '</button></div></div><div class="chat-binding-list">' +
+      (visible.length ? visible.map(function (id) {
+        const current = id === chatId;
+        return '<article data-chat-binding-id="' + ui.escapeHtml(id) + '"><span><strong>' + ui.escapeHtml(current ? chatName : "名称不可用") +
+          '</strong><small>' + (current ? "当前会话" : "已保存会话 ID") + ' · ' + ui.escapeHtml(id) + '</small></span><button type="button" class="text-action" data-action="remove-chat-binding" data-remove-chat-binding-id="' +
+          ui.escapeHtml(id) + '">移除</button></article>';
+      }).join("") : '<p class="template-empty">没有匹配的会话绑定。</p>') + '</div><div class="manual-chat-binding"><label>按精确 ID 添加<input name="manualChatBindingId" value="' +
+      ui.escapeHtml(draft.manualChatBindingId || "") + '" placeholder="粘贴宿主提供的会话 ID"></label><button type="button" class="button secondary" data-action="add-chat-binding">添加绑定</button></div>' +
+      '<small>当前会话 · ' + ui.escapeHtml(chatId || "宿主未提供") + "</small></details></div>";
   }
 
   function scopeButton(scope, draft) {
@@ -174,6 +209,52 @@
     return '<option value="' + value + '"' + (value === selected ? " selected" : "") + '>' + label + "</option>";
   }
 
+  const TEMPLATE_PAGE_SIZE = 5;
+
+  function templateCollection(flow, key, items, searchableText) {
+    flow.views = flow.views || {};
+    const view = flow.views[key] || { search: "", page: 1 };
+    flow.views[key] = view;
+    const search = String(view.search || "").trim().toLocaleLowerCase();
+    const filtered = search ? items.filter(function (item) {
+      return String(searchableText(item) || "").toLocaleLowerCase().includes(search);
+    }) : items.slice();
+    const pageCount = Math.max(1, Math.ceil(filtered.length / TEMPLATE_PAGE_SIZE));
+    view.page = Math.max(1, Math.min(pageCount, Number(view.page) || 1));
+    const startIndex = (view.page - 1) * TEMPLATE_PAGE_SIZE;
+    const visible = filtered.slice(startIndex, startIndex + TEMPLATE_PAGE_SIZE);
+    return {
+      key,
+      view,
+      items: visible,
+      filteredCount: filtered.length,
+      totalCount: items.length,
+      start: visible.length ? startIndex + 1 : 0,
+      end: startIndex + visible.length,
+      pageCount,
+    };
+  }
+
+  function templateCollectionTools(collection, placeholder, reportedTotal) {
+    const total = reportedTotal === undefined ? collection.filteredCount : reportedTotal;
+    const allCopy = collection.filteredCount !== collection.totalCount
+      ? " · 筛选前 " + collection.totalCount + " 条"
+      : "";
+    return '<div class="template-collection-tools"><label class="template-collection-search"><span class="visually-hidden">' +
+      ui.escapeHtml(placeholder) + '</span><input type="search" data-template-search="' + ui.escapeHtml(collection.key) + '" value="' +
+      ui.escapeHtml(collection.view.search || "") + '" placeholder="' + ui.escapeHtml(placeholder) + '"></label><div class="template-collection-status"><span data-template-count="' +
+      ui.escapeHtml(collection.key) + '">显示 ' + collection.start + '–' + collection.end + ' / 共 ' + total + ' 条' + allCopy +
+      '</span><div><button type="button" class="icon-button" data-action="page-template-view" data-template-view-key="' + ui.escapeHtml(collection.key) +
+      '" data-template-page-direction="-1" aria-label="上一页"' + (collection.view.page <= 1 ? " disabled" : "") + '>' + c.icon("chevron_left") +
+      '</button><button type="button" class="icon-button" data-action="page-template-view" data-template-view-key="' + ui.escapeHtml(collection.key) +
+      '" data-template-page-direction="1" aria-label="下一页"' + (collection.view.page >= collection.pageCount ? " disabled" : "") + '>' +
+      c.icon("chevron_right") + "</button></div></div></div>";
+  }
+
+  function dynamicTemplateViewKey(prefix, fieldId, sourceId) {
+    return prefix + "-" + encodeURIComponent(fieldId) + (sourceId === undefined ? "" : "-" + encodeURIComponent(sourceId)) + "-targets";
+  }
+
   function fieldTemplateDialog() {
     const flow = ui.state.fieldTemplateFlow;
     if (!flow) return "";
@@ -198,11 +279,13 @@
         '</small><button type="button" class="button primary" data-action="close-field-template-flow">返回字段列表</button></div>';
     }
     const fields = flow.selectedFields || [];
+    const fieldCollection = templateCollection(flow, "export-fields", fields, function (field) { return field.name + " " + field.id; });
     return '<div class="template-flow-body"><section class="template-callout"><span>' + c.icon("info") +
       '</span><p>字段定义（含初始值）始终包含；勾选目标会携带“启用”建议，可另选当前值建议，未勾选目标不会写入模板。导入端仍需重新确认本地映射，不会按源 ID 静默覆盖。</p></section><button type="button" class="picker-trigger compact" data-action="choose-template-export-fields" data-picker-key="template-export-fields" data-picker-mode="multiple">' +
       '<span>' + c.icon("search") + '</span><span><strong>搜索选择字段</strong><small>' + (fields.length ? "已选择 " + fields.length + " 个" : "支持名称与 ID 查找") +
-      '</small></span>' + c.icon("chevron_right") + '</button><div class="template-field-list">' +
-      (fields.length ? fields.map(function (field) { return exportFieldCard(flow, field); }).join("") : '<p class="template-empty">尚未选择字段。</p>') +
+      '</small></span>' + c.icon("chevron_right") + '</button>' + (fields.length ? templateCollectionTools(fieldCollection, "搜索已选字段") : "") +
+      '<div class="template-field-list">' +
+      (fields.length ? fieldCollection.items.map(function (field) { return exportFieldCard(flow, field); }).join("") : '<p class="template-empty">尚未选择字段。</p>') +
       '</div></div><footer><button type="button" class="button secondary" data-action="close-field-template-flow">取消</button><button type="button" class="button primary" data-action="commit-field-template-export"' +
       (fields.length ? "" : " disabled") + '>导出所选字段</button></footer>';
   }
@@ -211,12 +294,16 @@
     const scoped = field.scope === "character" || field.scope === "group";
     const targets = (flow.exportTargets && flow.exportTargets[field.id]) || [];
     const targetLabel = field.scope === "group" ? "群组" : "角色";
+    const targetCollection = templateCollection(flow, dynamicTemplateViewKey("export", field.id), targets, function (target) {
+      return target.name + " " + target.targetId;
+    });
     return '<article class="template-field-card" data-template-export-field="' + ui.escapeHtml(field.id) + '"><header><span class="field-color-dot" style="--field-color:' +
       ui.escapeHtml(field.themeColor) + '"></span><span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope] || field.scope) +
       ' · ' + ui.escapeHtml(field.id) + '</small></span><span class="included-badge">定义 / 配置已包含</span></header>' +
       (scoped ? '<button type="button" class="text-action matrix-picker" data-action="choose-template-export-targets" data-template-field-id="' + ui.escapeHtml(field.id) +
         '" data-template-target-entity="' + (field.scope === "group" ? "groups" : "actors") + '">' + c.icon("person_search") + '搜索选择' + targetLabel +
-        '</button><div class="target-matrix">' + (targets.length ? targets.map(function (target) { return exportTargetRow(field, target); }).join("") :
+        '</button>' + (targets.length ? templateCollectionTools(targetCollection, "搜索已选" + targetLabel) : "") + '<div class="target-matrix">' +
+        (targets.length ? targetCollection.items.map(function (target) { return exportTargetRow(field, target); }).join("") :
           '<p>未选择' + targetLabel + '；此字段将作为未绑定模板导出。</p>') + "</div>" : field.scope === "global"
         ? '<p class="template-scope-copy">全局字段共享一份配置，不显示角色开关，也不携带角色私有值。</p>'
         : '<details class="template-chat-copy"><summary>当前会话导出说明</summary><p>导出字段定义，不导出会话 UUID；导入时默认绑定接收端正在打开的会话。</p></details>') + "</article>";
@@ -232,9 +319,9 @@
   function importTemplateFlow(flow) {
     if (flow.result) return importResult(flow);
     if (!flow.preview) {
-      return '<div class="template-flow-body"><section class="template-callout"><span>' + c.icon(flow.error ? "error" : "progress_activity") +
+      return '<div class="template-flow-body"><section class="template-callout"><span>' + c.icon(flow.loading ? "progress_activity" : "error") +
         '</span><p><strong>' + ui.escapeHtml(flow.fileName || "字段模板") + '</strong><br>' +
-        (flow.error ? "文件尚未通过检查，可关闭后重新选择。" : "正在验证格式、冲突和映射信息…") +
+        (flow.loading ? "正在验证格式、冲突和映射信息…" : "文件尚未通过检查，可关闭后重新选择。") +
         '</p></section></div><footer><button type="button" class="button secondary" data-action="close-field-template-flow">关闭</button></footer>';
     }
     const step = flow.step || 1;
@@ -253,13 +340,25 @@
   function importContentStep(flow) {
     const preview = flow.preview;
     const dependencyTotal = preview.omittedDependencies.reduce(function (sum, item) { return sum + item.totalCount; }, 0);
+    const fields = templateCollection(flow, "content-fields", preview.fields, function (field) { return field.name + " " + field.sourceFieldId; });
+    const dependencies = preview.omittedDependencies.flatMap(function (group) {
+      return group.items.map(function (item) { return { ...item, fieldId: group.fieldId }; });
+    });
+    const dependencyCollection = templateCollection(flow, "content-dependencies", dependencies, function (item) {
+      return item.readableName + " " + item.kind + " " + item.sourceId + " " + item.fieldId;
+    });
     return '<section data-template-import-step="content"><div class="template-callout"><span>' + c.icon("description") + '</span><p><strong>' +
       ui.escapeHtml(flow.fileName || "字段模板") + '</strong><br>' + preview.fields.length + ' 个字段 · 模板版本 ' + preview.schemaVersion +
-      '</p></div><div class="preview-field-list">' + preview.fields.map(function (field) {
+      '</p></div>' + templateCollectionTools(fields, "搜索模板字段") + '<div class="preview-field-list">' + fields.items.map(function (field) {
         return '<article><span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope]) + ' · ' +
           ui.escapeHtml(field.sourceFieldId) + '</small></span><span>' + field.config.stages + ' 个阶段</span></article>';
       }).join("") + '</div><details class="dependency-preview"' + (dependencyTotal ? " open" : "") + '><summary>未随字段导入的依赖 · ' + dependencyTotal +
-      '</summary>' + (dependencyTotal ? preview.omittedDependencies.map(renderDependencyGroup).join("") : '<p>没有检测到规则、条件、联动或效果依赖。</p>') +
+      '</summary>' + (dependencyTotal ? templateCollectionTools(dependencyCollection, "搜索依赖", dependencyTotal) + '<ul class="dependency-window">' +
+        dependencyCollection.items.map(function (item) {
+          return '<li>' + ui.escapeHtml(item.readableName) + '<small>' + ui.escapeHtml(item.fieldId) + ' · ' + ui.escapeHtml(item.kind) + ' · ' +
+            ui.escapeHtml(item.sourceId) + '</small></li>';
+        }).join("") + '</ul>' + (dependencyTotal > dependencies.length ? '<p>另有 ' + (dependencyTotal - dependencies.length) + ' 项仅计数，需导入后检查。</p>' : "")
+        : '<p>没有检测到规则、条件、联动或效果依赖。</p>') +
       '</details>' + repairCategoryList(flow) + '</section>';
   }
 
@@ -271,15 +370,10 @@
     }).join("") + "</ul></div>";
   }
 
-  function renderDependencyGroup(group) {
-    return '<div><strong>' + ui.escapeHtml(group.fieldId) + '</strong><ul>' + group.items.map(function (item) {
-      return '<li>' + ui.escapeHtml(item.readableName) + '<small>' + ui.escapeHtml(item.kind) + ' · ' + ui.escapeHtml(item.sourceId) + '</small></li>';
-    }).join("") + '</ul>' + (group.truncated ? '<p>另有 ' + (group.totalCount - group.items.length) + ' 项未展开。</p>' : "") + "</div>";
-  }
-
   function importConflictStep(flow) {
-    return '<section data-template-import-step="conflict"><p class="step-copy">默认创建副本，避免覆盖本地配置。只有确认需要同步时再选择更新或替换。</p><div class="conflict-list">' +
-      flow.preview.fields.map(function (field) {
+    const fields = templateCollection(flow, "conflict-fields", flow.preview.fields, function (field) { return field.name + " " + field.sourceFieldId; });
+    return '<section data-template-import-step="conflict"><p class="step-copy">默认创建副本，避免覆盖本地配置。只有确认需要同步时再选择更新或替换。</p>' +
+      templateCollectionTools(fields, "搜索冲突字段") + '<div class="conflict-list">' + fields.items.map(function (field) {
         const strategy = flow.strategies[field.sourceFieldId] || "create_copy";
         const hasConflict = field.conflict === "id";
         return '<article><span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + (hasConflict ? "存在同 ID 字段" : "没有同 ID 字段") +
@@ -293,26 +387,38 @@
 
   function importMappingStep(flow) {
     const needs = flow.preview.mappingNeeds;
-    return '<section data-template-import-step="mapping"><p class="step-copy">先按字段确认本地目标；每个目标都能单独决定是否启用和如何处理数值。</p><div class="mapping-list">' +
-      (needs.length ? needs.map(function (need) { return importMappingField(flow, need); }).join("") : '<div class="template-callout"><span>' + c.icon("task_alt") +
+    const fields = templateCollection(flow, "mapping-fields", needs, function (need) {
+      const field = flow.preview.fields.find(function (candidate) { return candidate.sourceFieldId === need.fieldId; });
+      return (field ? field.name : "") + " " + need.fieldId;
+    });
+    return '<section data-template-import-step="mapping"><p class="step-copy">先按字段确认本地目标；每个目标都能单独决定是否启用和如何处理数值。</p>' + repairCategoryList(flow) + '<div class="mapping-list">' +
+      (needs.length ? templateCollectionTools(fields, "搜索映射字段") + fields.items.map(function (need) { return importMappingField(flow, need); }).join("") : '<div class="template-callout"><span>' + c.icon("task_alt") +
         '</span><p>全局或会话字段无需角色映射；会话字段将在接收端绑定当前会话。</p></div>') + "</div></section>";
   }
 
   function importMappingField(flow, need) {
     const sources = need.requiresLocalTargets ? [{ sourceId: "__unbound__", name: "本地目标", hasValue: false, requiresSearch: true }] : need.sourceTargets;
+    const sourceCollection = templateCollection(flow, dynamicTemplateViewKey("mapping-sources", need.fieldId), sources, function (source) {
+      return source.name + " " + source.sourceId;
+    });
     return '<article class="mapping-field"><header><span><strong>' + ui.escapeHtml(flow.preview.fields.find(function (field) { return field.sourceFieldId === need.fieldId; })?.name || need.fieldId) +
       '</strong><small>' + (need.scope === "group" ? "群组映射" : "角色映射") + '</small></span><div class="mapping-batch" data-import-field-batch>' +
       batchEnableButton(need.fieldId, "all_on", "全部启用") + batchEnableButton(need.fieldId, "all_off", "全部停用") +
-      batchEnableButton(need.fieldId, "file_suggestion", "采用文件建议") + '</div></header>' + sources.map(function (source) {
+      batchEnableButton(need.fieldId, "file_suggestion", "采用文件建议") + '</div></header>' + templateCollectionTools(sourceCollection, "搜索源目标") +
+      sourceCollection.items.map(function (source) {
         const key = need.fieldId + "\u0000" + source.sourceId;
         const targets = flow.importMappings[key] || [];
+        const targetCollection = templateCollection(flow, dynamicTemplateViewKey("mapping", need.fieldId, source.sourceId), targets, function (target) {
+          return target.name + " " + target.targetId;
+        });
         return '<section class="source-mapping" data-import-source-id="' + ui.escapeHtml(source.sourceId) + '"><div><span><strong>' + ui.escapeHtml(source.name) +
           '</strong><small>' + (source.sourceId === "__unbound__" ? "模板未携带源目标" : ui.escapeHtml(source.sourceId)) + '</small></span><button type="button" class="text-action" data-action="choose-template-import-targets" data-template-field-id="' +
           ui.escapeHtml(need.fieldId) + '" data-template-source-id="' + ui.escapeHtml(source.sourceId) + '" data-template-target-entity="' +
           (need.scope === "group" ? "groups" : "actors") + '">' + c.icon("person_search") + '搜索映射</button></div>' +
           (source.valueAdjustment ? '<p class="adjustment-note">导入值将因' + (source.valueAdjustment.reason === "clamp" ? "范围" : "步长") + '从 ' +
             ui.escapeHtml(source.valueAdjustment.from) + ' 调整为 ' + ui.escapeHtml(source.valueAdjustment.to) + "。</p>" : "") +
-          '<div class="mapped-targets">' + (targets.length ? targets.map(function (target) { return importTargetRow(need, source, target); }).join("") :
+          (targets.length ? templateCollectionTools(targetCollection, "搜索已映射目标") : "") + '<div class="mapped-targets">' +
+          (targets.length ? targetCollection.items.map(function (target) { return importTargetRow(need, source, target); }).join("") :
             '<p>尚未选择本地目标。</p>') + "</div></section>";
       }).join("") + "</article>";
   }

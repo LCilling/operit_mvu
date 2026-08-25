@@ -325,6 +325,14 @@
       addFieldStage();
     } else if (action === "remove-field-stage") {
       removeFieldStage(Number(element.dataset.stageIndex));
+    } else if (action === "reload-field-list-after-save") {
+      await reloadFieldListAfterSave();
+    } else if (action === "add-chat-binding") {
+      addManualChatBinding();
+    } else if (action === "remove-chat-binding") {
+      removeChatBinding(element.dataset.removeChatBindingId);
+    } else if (action === "page-chat-bindings") {
+      pageChatBindings(Number(element.dataset.chatPageDirection));
     } else if (action === "open-field-template-import") {
       ui.state.fieldTemplateImportOpener = element;
       fieldTemplateImportPicker.click();
@@ -346,6 +354,8 @@
       await chooseTemplateImportTargets(element);
     } else if (action === "set-import-field-enabled") {
       setImportFieldEnabled(element.dataset.templateFieldId, element.dataset.importBatchMode);
+    } else if (action === "page-template-view") {
+      pageTemplateView(element.dataset.templateViewKey, Number(element.dataset.templatePageDirection));
     } else if (action === "commit-field-template-import") {
       await commitFieldTemplateImport();
     } else if (action === "refresh-field-template-preview") {
@@ -522,7 +532,22 @@
     handleRangeInput(event);
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
-    if (target.closest('[data-form="field-editor"]')) captureFieldEditorControl(target);
+    if (target.closest('[data-form="field-editor"]')) {
+      captureFieldEditorControl(target);
+      if (target.name === "chatBindingSearch") {
+        render();
+        return;
+      }
+    }
+    const templateSearch = target.closest("[data-template-search]");
+    if (templateSearch && ui.state.fieldTemplateFlow) {
+      const flow = ui.state.fieldTemplateFlow;
+      flow.views = flow.views || {};
+      const key = templateSearch.dataset.templateSearch;
+      flow.views[key] = { ...(flow.views[key] || {}), search: templateSearch.value, page: 1 };
+      render();
+      return;
+    }
     const pickerSearch = target.closest("[data-picker-search]");
     if (pickerSearch) {
       ui.searchEntityPicker(pickerSearch.value);
@@ -548,9 +573,9 @@
       if (target.name === "bindCurrentChat") {
         const draft = ui.state.fieldEditorDraft;
         draft.chatAutoBind = target.checked;
-        draft.bindingIds = target.checked && ui.state.snapshot.activeContext.chatId
-          ? [ui.state.snapshot.activeContext.chatId]
-          : [];
+        const chatId = ui.state.snapshot.activeContext.chatId;
+        if (target.checked && chatId && !draft.bindingIds.includes(chatId)) draft.bindingIds.push(chatId);
+        if (!target.checked && chatId) draft.bindingIds = draft.bindingIds.filter(function (id) { return id !== chatId; });
         render();
       }
       return;
@@ -814,6 +839,56 @@
     else if (target.name === "aiMinConfidence") draft.ai.minConfidence = target.value;
     else if (target.name === "aiMaxDelta") draft.ai.maxDelta = target.value;
     else if (target.name === "aiPrompt") draft.ai.prompt = target.value;
+    else if (target.name === "chatBindingSearch") {
+      draft.chatBindingSearch = target.value;
+      draft.chatBindingPage = 1;
+      draft.chatBindingsOpen = true;
+    } else if (target.name === "manualChatBindingId") {
+      draft.manualChatBindingId = target.value;
+      draft.chatBindingsOpen = true;
+    }
+  }
+
+  function addManualChatBinding() {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || draft.scope !== "chat") return;
+    const id = String(draft.manualChatBindingId || "").trim();
+    draft.chatBindingsOpen = true;
+    if (!id) {
+      draft.error = "请输入要绑定的会话 ID。";
+      render();
+      return;
+    }
+    if (id.length > 256) {
+      draft.error = "会话 ID 不能超过 256 个字符。";
+      render();
+      return;
+    }
+    if (!draft.bindingIds.includes(id)) draft.bindingIds.push(id);
+    draft.manualChatBindingId = "";
+    draft.chatBindingSearch = "";
+    draft.chatBindingPage = Math.max(1, Math.ceil(draft.bindingIds.length / 5));
+    draft.chatAutoBind = Boolean(ui.state.snapshot.activeContext.chatId && draft.bindingIds.includes(ui.state.snapshot.activeContext.chatId));
+    draft.error = "";
+    render();
+  }
+
+  function removeChatBinding(id) {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || draft.scope !== "chat" || !id) return;
+    draft.bindingIds = draft.bindingIds.filter(function (bindingId) { return bindingId !== id; });
+    draft.chatBindingsOpen = true;
+    draft.chatAutoBind = Boolean(ui.state.snapshot.activeContext.chatId && draft.bindingIds.includes(ui.state.snapshot.activeContext.chatId));
+    draft.error = "";
+    render();
+  }
+
+  function pageChatBindings(direction) {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || draft.scope !== "chat" || ![-1, 1].includes(direction)) return;
+    draft.chatBindingPage = Math.max(1, (Number(draft.chatBindingPage) || 1) + direction);
+    draft.chatBindingsOpen = true;
+    render();
   }
 
   function addFieldStage() {
@@ -896,21 +971,73 @@
 
   async function saveFieldEditor() {
     const draft = ui.state.fieldEditorDraft;
-    if (!draft) return;
+    if (!draft || draft.submitting || draft.mutationCommitted) return;
+    let field;
     try {
-      const field = buildFieldInput(draft);
-      setBusy(true);
-      if (draft.identity === "__new__") await ui.native.call("addField", { field });
-      else await ui.native.call("updateField", { id: draft.identity, patch: field });
-      await ui.loadSnapshot();
-      ui.state.listViews.fields = { ...ui.state.listViews.fields, page: 1, search: field.name, filters: {} };
-      ui.resetFieldEditorDraft();
-      ui.state.selectedEntityId = "";
-      await ui.navigate("config-fields", { replace: true, force: true });
-      showToast(draft.identity === "__new__" ? "字段已创建" : "字段已保存");
+      field = buildFieldInput(draft);
     } catch (error) {
       draft.error = error instanceof Error ? error.message : "保存失败，请重试。";
       render();
+      return;
+    }
+    draft.submitting = true;
+    draft.error = "";
+    render();
+    setBusy(true);
+    try {
+      if (draft.identity === "__new__") await ui.native.call("addField", { field });
+      else await ui.native.call("updateField", { id: draft.identity, patch: field });
+      draft.mutationCommitted = true;
+      draft.submitting = false;
+      draft.committedFieldName = field.name;
+      draft.committedWasNew = draft.identity === "__new__";
+      await finishCommittedFieldSave(draft);
+    } catch (error) {
+      if (draft.mutationCommitted) {
+        draft.submitting = false;
+        draft.refreshingAfterCommit = false;
+        draft.error = "字段已经保存，但字段列表刷新失败。请重新载入列表；再次保存不会重复提交。";
+      } else {
+        draft.submitting = false;
+        draft.error = error instanceof Error ? error.message : "保存失败，请重试。";
+      }
+      render();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function finishCommittedFieldSave(draft) {
+    if (!draft || !draft.mutationCommitted) return;
+    draft.refreshingAfterCommit = true;
+    draft.error = "";
+    render();
+    await ui.loadSnapshot();
+    ui.state.listViews.fields = {
+      ...ui.state.listViews.fields,
+      page: 1,
+      search: draft.committedFieldName || "",
+      filters: {},
+    };
+    const wasNew = draft.committedWasNew;
+    ui.resetFieldEditorDraft();
+    ui.state.selectedEntityId = "";
+    await ui.navigate("config-fields", { replace: true, force: true });
+    showToast(wasNew ? "字段已创建" : "字段已保存");
+  }
+
+  async function reloadFieldListAfterSave() {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || !draft.mutationCommitted || draft.refreshingAfterCommit) return;
+    setBusy(true);
+    try {
+      await finishCommittedFieldSave(draft);
+    } catch (_error) {
+      if (ui.state.fieldEditorDraft === draft) {
+        draft.refreshingAfterCommit = false;
+        draft.error = "字段已经保存，但仍无法载入字段列表。请检查宿主连接后重试。";
+        render();
+      }
     } finally {
       setBusy(false);
     }
@@ -1079,7 +1206,8 @@
       step: 1,
       fileName: fileName || "字段模板.json",
       json: source,
-      error: "正在检查模板…",
+      loading: true,
+      error: "",
       result: null,
       refreshing: false,
       staleRevision: false,
@@ -1100,20 +1228,83 @@
 
   function defaultImportMappings(preview) {
     const mappings = {};
+    const assignedByField = new Map();
+    let duplicateSuggestionCount = 0;
     preview.mappingNeeds.forEach(function (need) {
+      const assigned = assignedByField.get(need.fieldId) || new Set();
+      assignedByField.set(need.fieldId, assigned);
       need.sourceTargets.forEach(function (sourceTarget) {
         const key = need.fieldId + "\u0000" + sourceTarget.sourceId;
-        mappings[key] = sourceTarget.suggestedTarget ? [{
-          targetId: sourceTarget.suggestedTarget.targetId,
-          name: sourceTarget.suggestedTarget.name,
-          enabled: true,
-          suggestedEnabled: true,
-          valuePolicy: sourceTarget.hasValue ? "template_value" : "field_initial",
-        }] : [];
+        const suggested = sourceTarget.suggestedTarget;
+        if (suggested && assigned.has(suggested.targetId)) {
+          duplicateSuggestionCount += 1;
+          mappings[key] = [];
+        } else {
+          mappings[key] = suggested ? [{
+            targetId: suggested.targetId,
+            name: suggested.name,
+            enabled: true,
+            suggestedEnabled: true,
+            valuePolicy: sourceTarget.hasValue ? "template_value" : "field_initial",
+          }] : [];
+          if (suggested) assigned.add(suggested.targetId);
+        }
       });
       if (need.requiresLocalTargets) mappings[need.fieldId + "\u0000__unbound__"] = [];
     });
-    return mappings;
+    return { mappings, duplicateSuggestionCount };
+  }
+
+  async function retainedImportMappings(preview, previousMappings) {
+    const defaults = defaultImportMappings(preview);
+    const mappings = defaults.mappings;
+    const validKeys = new Set(Object.keys(mappings));
+    let droppedMappingCount = 0;
+    let duplicateMappingCount = defaults.duplicateSuggestionCount;
+    Object.keys(previousMappings || {}).forEach(function (key) {
+      if (!validKeys.has(key) && Array.isArray(previousMappings[key])) droppedMappingCount += previousMappings[key].length;
+    });
+    const assignedByField = new Map();
+    for (const need of preview.mappingNeeds) {
+      const assigned = assignedByField.get(need.fieldId) || new Set();
+      assignedByField.set(need.fieldId, assigned);
+      const trustedSuggestedIds = new Set(need.sourceTargets.map(function (source) {
+        return source.suggestedTarget && source.suggestedTarget.targetId;
+      }).filter(Boolean));
+      const sourceIds = need.requiresLocalTargets ? ["__unbound__"] : need.sourceTargets.map(function (source) { return source.sourceId; });
+      for (const sourceId of sourceIds) {
+        const key = need.fieldId + "\u0000" + sourceId;
+        const candidates = Array.isArray(previousMappings[key]) ? previousMappings[key] : mappings[key];
+        const retained = [];
+        for (const target of candidates) {
+          if (assigned.has(target.targetId)) {
+            duplicateMappingCount += 1;
+            continue;
+          }
+          if (Array.isArray(previousMappings[key]) && !trustedSuggestedIds.has(target.targetId)) {
+            const entityType = need.scope === "group" ? "group" : "actor";
+            try {
+              ui.state.entities.delete(entityType + ":" + target.targetId);
+              await ui.getEntity(entityType, target.targetId);
+            } catch (_error) {
+              droppedMappingCount += 1;
+              continue;
+            }
+          }
+          retained.push(target);
+          assigned.add(target.targetId);
+        }
+        mappings[key] = retained;
+      }
+    }
+    return { mappings, droppedMappingCount, duplicateMappingCount };
+  }
+
+  function includeMappingReview(repairs, droppedMappingCount, duplicateMappingCount) {
+    const categories = repairs.categories.slice();
+    if (droppedMappingCount) categories.push({ key: "mapping_removed", label: "已移除失效映射", count: droppedMappingCount });
+    if (duplicateMappingCount) categories.push({ key: "mapping_duplicate", label: "重复映射待确认", count: duplicateMappingCount });
+    return { count: repairs.count + droppedMappingCount + duplicateMappingCount, categories };
   }
 
   function repairSummary(preview) {
@@ -1168,7 +1359,8 @@
     const previousMappings = preserveDecisions ? { ...(flow.importMappings || {}) } : {};
     const previousStep = flow.step || 1;
     flow.refreshing = preserveDecisions;
-    flow.error = preserveDecisions ? "正在用当前文件刷新预览…" : "正在检查模板…";
+    flow.loading = true;
+    flow.error = "";
     render();
     setBusy(true);
     try {
@@ -1182,29 +1374,34 @@
         const previous = previousStrategies[field.sourceFieldId];
         strategies[field.sourceFieldId] = supportedImportStrategy(field, previous) ? previous : "create_copy";
       });
-      const importMappings = defaultImportMappings(preview);
-      if (preserveDecisions) {
-        Object.keys(importMappings).forEach(function (key) {
-          if (Array.isArray(previousMappings[key])) importMappings[key] = previousMappings[key];
-        });
-      }
-      const repairs = repairSummary(preview);
+      const mappingState = preserveDecisions
+        ? await retainedImportMappings(preview, previousMappings)
+        : { ...defaultImportMappings(preview), droppedMappingCount: 0 };
+      const repairs = includeMappingReview(
+        repairSummary(preview),
+        mappingState.droppedMappingCount || 0,
+        mappingState.duplicateMappingCount || mappingState.duplicateSuggestionCount || 0,
+      );
       if (ui.state.fieldTemplateFlow !== flow) return;
       flow.preview = preview;
       flow.previewRevision = preview.revision;
       flow.strategies = strategies;
-      flow.importMappings = importMappings;
+      flow.importMappings = mappingState.mappings;
+      flow.droppedMappingCount = mappingState.droppedMappingCount || 0;
+      flow.duplicateMappingCount = mappingState.duplicateMappingCount || mappingState.duplicateSuggestionCount || 0;
       flow.repairCount = repairs.count;
       flow.repairCategories = repairs.categories;
       flow.step = preserveDecisions ? Math.max(1, Math.min(3, previousStep)) : 1;
       flow.staleRevision = false;
       flow.refreshing = false;
+      flow.loading = false;
       flow.error = "";
       flow.result = null;
       render();
     } catch (error) {
       if (ui.state.fieldTemplateFlow === flow) {
         flow.refreshing = false;
+        flow.loading = false;
         flow.error = (preserveDecisions ? "重新预览失败：" : "无法预览模板：") + (error instanceof Error ? error.message : "文件无效");
         render();
       }
@@ -1245,11 +1442,18 @@
       }),
       opener,
       onCommit(ids, items) {
+        const assignedElsewhere = new Set();
+        Object.keys(flow.importMappings || {}).forEach(function (candidateKey) {
+          if (candidateKey === key || !candidateKey.startsWith(fieldId + "\u0000")) return;
+          flow.importMappings[candidateKey].forEach(function (target) { assignedElsewhere.add(target.targetId); });
+        });
+        const duplicates = ids.filter(function (id) { return assignedElsewhere.has(id); });
+        const acceptedIds = ids.filter(function (id) { return !assignedElsewhere.has(id); });
         const itemById = new Map(items.map(function (item) { return [group ? item.characterGroupId : item.characterId, item]; }));
         const oldById = new Map(previous.map(function (target) { return [target.targetId, target]; }));
         const need = flow.preview.mappingNeeds.find(function (item) { return item.fieldId === fieldId; });
         const source = sourceId === "__unbound__" ? null : need.sourceTargets.find(function (item) { return item.sourceId === sourceId; });
-        flow.importMappings[key] = ids.map(function (id) {
+        flow.importMappings[key] = acceptedIds.map(function (id) {
           const old = oldById.get(id);
           const item = itemById.get(id);
           return {
@@ -1260,7 +1464,9 @@
             valuePolicy: old ? old.valuePolicy : source && source.hasValue ? "template_value" : "field_initial",
           };
         });
-        flow.error = "";
+        flow.error = duplicates.length
+          ? "本地目标“" + duplicates[0] + "”已经映射到这个字段的其它源目标，不能重复分配。"
+          : "";
       },
     });
   }
@@ -1290,7 +1496,18 @@
     render();
   }
 
+  function pageTemplateView(key, direction) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || !key || ![-1, 1].includes(direction)) return;
+    flow.views = flow.views || {};
+    const view = flow.views[key] || { search: "", page: 1 };
+    view.page = Math.max(1, (Number(view.page) || 1) + direction);
+    flow.views[key] = view;
+    render();
+  }
+
   function buildFieldTemplateImportDecisions(flow) {
+    validateUniqueImportMappings(flow);
     return flow.preview.fields.map(function (field) {
       const strategy = flow.strategies[field.sourceFieldId] || "create_copy";
       const need = flow.preview.mappingNeeds.find(function (item) { return item.fieldId === field.sourceFieldId; });
@@ -1307,6 +1524,22 @@
     });
   }
 
+  function validateUniqueImportMappings(flow) {
+    flow.preview.mappingNeeds.forEach(function (need) {
+      if ((flow.strategies[need.fieldId] || "create_copy") === "update") return;
+      const seen = new Set();
+      Object.keys(flow.importMappings || {}).forEach(function (key) {
+        if (!key.startsWith(need.fieldId + "\u0000")) return;
+        (flow.importMappings[key] || []).forEach(function (target) {
+          if (seen.has(target.targetId)) {
+            throw new Error("字段“" + need.fieldId + "”中的本地目标“" + target.targetId + "”被重复映射，请保留一处后再导入。");
+          }
+          seen.add(target.targetId);
+        });
+      });
+    });
+  }
+
   function importTargetPayload(target) {
     return { targetId: target.targetId, enabled: Boolean(target.enabled), valuePolicy: target.valuePolicy };
   }
@@ -1314,8 +1547,15 @@
   async function commitFieldTemplateImport() {
     const flow = ui.state.fieldTemplateFlow;
     if (!flow || flow.mode !== "import" || !flow.preview) return;
-    const decisions = buildFieldTemplateImportDecisions(flow);
     flow.error = "";
+    let decisions;
+    try {
+      decisions = buildFieldTemplateImportDecisions(flow);
+    } catch (error) {
+      flow.error = error instanceof Error ? error.message : "映射配置无效，请检查后重试。";
+      render();
+      return;
+    }
     setBusy(true);
     try {
       const result = await ui.native.call("importFieldTemplate", {

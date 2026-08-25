@@ -542,6 +542,19 @@ output { display: block; }
 .chat-binding details { grid-column: 1 / -1; padding-top: 8px; border-top: 1px solid rgba(112,88,216,.1); }
 .chat-binding summary, .field-config-panels summary, .template-chat-copy summary, .dependency-preview summary { min-height: 40px; display: flex; align-items: center; color: var(--primary-dark); cursor: pointer; }
 .chat-binding details p, .template-chat-copy p { color: var(--ink-soft); font-size: 12px; line-height: 18px; }
+.chat-binding-search { margin-top: 8px; }
+.chat-binding-search input { min-height: 44px; margin-top: 4px; }
+.chat-binding-status { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink-soft); font-size: 14px; line-height: 21px; }
+.chat-binding-status > div { display: flex; flex: 0 0 auto; gap: 4px; }
+.chat-binding-status .icon-button { width: 40px; height: 40px; }
+.chat-binding-list { display: grid; gap: 5px; }
+.chat-binding-list article { min-width: 0; min-height: 44px; padding: 6px 8px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; border-radius: 11px; background: rgba(112,88,216,.05); }
+.chat-binding-list strong, .chat-binding-list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-binding-list strong { font-size: 14px; line-height: 21px; font-weight: 500; }
+.chat-binding-list small { color: var(--ink-soft); font-size: 14px; line-height: 21px; }
+.manual-chat-binding { margin-top: 8px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.manual-chat-binding input { min-height: 44px; margin-top: 4px; }
+.manual-chat-binding .button { min-height: 44px; }
 .subsection-heading { margin: 14px 2px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .subsection-heading > span strong, .subsection-heading > span small { display: block; }
 .subsection-heading > span strong { font-size: 14px; font-weight: 500; }
@@ -581,6 +594,12 @@ output { display: block; }
 .template-callout p { color: var(--ink-soft); font-size: 12px; line-height: 18px; }
 .template-callout strong { color: var(--ink); font-weight: 500; }
 .template-flow-body > .picker-trigger { margin-top: 9px; }
+.template-collection-tools { min-width: 0; margin-top: 8px; display: grid; gap: 5px; }
+.template-collection-search input { min-height: 44px; margin: 0; }
+.template-collection-status { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink-soft); font-size: 14px; line-height: 21px; }
+.template-collection-status > span { min-width: 0; overflow-wrap: anywhere; }
+.template-collection-status > div { display: flex; flex: 0 0 auto; gap: 4px; }
+.template-collection-status .icon-button { width: 40px; height: 40px; }
 .template-field-list, .preview-field-list, .conflict-list, .mapping-list { margin-top: 9px; display: grid; gap: 8px; }
 .template-empty, .target-matrix > p, .mapped-targets > p { padding: 12px; color: var(--ink-soft); font-size: 12px; text-align: center; border: 1px dashed rgba(112,88,216,.2); border-radius: 12px; }
 .template-field-card, .mapping-field, .conflict-list > article { min-width: 0; padding: 11px; border: 1px solid rgba(112,88,216,.11); border-radius: 15px; background: rgba(255,255,255,.78); }
@@ -620,6 +639,7 @@ output { display: block; }
 .preview-field-list small, .preview-field-list article > span:last-child { color: var(--ink-soft); font-size: 11px; }
 .dependency-preview { margin-top: 9px; padding: 0 10px 8px; border: 1px solid rgba(112,88,216,.1); border-radius: 13px; background: rgba(255,255,255,.64); }
 .dependency-preview > div { padding: 7px 0; }
+.dependency-window { padding: 7px 0; }
 .dependency-preview li { margin-top: 5px; color: var(--ink); font-size: 12px; }
 .dependency-preview li small { display: block; color: var(--ink-soft); font-size: 11px; }
 .repair-categories { margin-top: 9px; padding: 9px 10px; border: 1px solid rgba(112,88,216,.1); border-radius: 13px; background: rgba(255,255,255,.64); text-align: left; }
@@ -786,6 +806,7 @@ output { display: block; }
   .matrix-row { grid-template-columns: 1fr; }
   .matrix-row > span { grid-row: auto; }
   .matrix-row > label { justify-content: flex-start; }
+  .manual-chat-binding { grid-template-columns: 1fr; }
   .bottom-action { padding-inline: 12px; gap: 8px; }
   .management-summary { grid-template-columns: 1fr; }
   .entity-picker > footer { align-items: end; }

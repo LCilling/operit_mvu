@@ -170,6 +170,53 @@ test("field add and update host failures stay inline, preserve edits, and recove
   assert.equal(window.MvuUi.state.demoLastRequests.updateField.patch.description, "更新失败后仍保留");
 });
 
+test("field save locks duplicate submits and never retries a committed mutation after refresh failure", async (t) => {
+  const window = await createApp("field-editor");
+  t.after(() => window.close());
+  const { document } = window;
+  input(window, '[name="name"]', "只创建一次");
+
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let releaseMutation;
+  const mutationGate = new Promise((resolve) => { releaseMutation = resolve; });
+  let addCalls = 0;
+  let failNextRefresh = true;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "addField") {
+      addCalls += 1;
+      await mutationGate;
+      return originalCall(method, params);
+    }
+    if (method === "snapshot" && addCalls > 0 && failNextRefresh) {
+      failNextRefresh = false;
+      throw new Error("demo refresh unavailable");
+    }
+    return originalCall(method, params);
+  };
+
+  const form = document.querySelector('[data-form="field-editor"]');
+  form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  await waitFor(() => addCalls > 0, "field mutation did not start");
+  assert.equal(addCalls, 1, "duplicate submit started a second mutation");
+  assert.equal(document.querySelector('[data-form="field-editor"] button[type="submit"]').disabled, true);
+
+  releaseMutation();
+  await waitFor(
+    () => /已经保存|已提交/.test(document.querySelector("[data-field-editor-error]")?.textContent || ""),
+    "committed mutation was reported as an ordinary save failure",
+  );
+  assert.ok(document.querySelector('[data-action="reload-field-list-after-save"]'));
+  assert.equal(document.querySelector('[data-form="field-editor"] button[type="submit"]'), null);
+  document.querySelector('[data-form="field-editor"]').dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(addCalls, 1, "committed mutation was retried");
+
+  click(window, '[data-action="reload-field-list-after-save"]');
+  await waitFor(() => window.MvuUi.state.route === "config-fields", "committed save could not recover to the field list");
+  assert.equal(addCalls, 1);
+});
+
 test("export flow selects fields and bounded targets through searchable pickers and emits the explicit target matrix", async (t) => {
   const window = await createApp("config-fields");
   t.after(() => window.close());
@@ -329,6 +376,125 @@ test("stale field-template import visibly re-previews the same file and preserve
   assert.equal(window.MvuUi.state.demoLastRequests.importFieldTemplate.expectedRevision, staleRevision + 1);
 });
 
+test("stale re-preview drops deleted or wrong-kind local mappings and reports the exact removal", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"],
+    targetSelections: [{
+      fieldId: "picker-field-001",
+      targets: [{ targetId: "picker-actor-001", enabled: true, includeValue: true }],
+    }],
+  });
+  await window.MvuUi.importFieldTemplateText(window.MvuUi.state.demoLastFieldTemplateJson, "removed-target.json");
+  const flow = window.MvuUi.state.fieldTemplateFlow;
+  const key = "picker-field-001\u0000picker-actor-001";
+  flow.importMappings[key].push({
+    targetId: "picker-actor-002", name: "即将删除的角色", enabled: true,
+    suggestedEnabled: true, valuePolicy: "template_value",
+  });
+  flow.step = 3;
+  window.MvuUi.state.demoStore.revision += 1;
+  window.MvuUi.render();
+  click(window, '[data-action="commit-field-template-import"]');
+  await waitFor(() => window.document.querySelector('[data-action="refresh-field-template-preview"]'), "stale recovery action missing");
+
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  window.MvuUi.state.entities.delete("actor:picker-actor-002");
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "getEntityById" && params.entityType === "actor" && params.id === "picker-actor-002") {
+      throw new Error("MVU_ENTITY_NOT_FOUND");
+    }
+    const result = await originalCall(method, params);
+    if (method === "previewFieldTemplateImport") {
+      for (const need of result.mappingNeeds) {
+        for (const source of need.sourceTargets) {
+          if (source.suggestedTarget?.targetId === "picker-actor-002") delete source.suggestedTarget;
+        }
+      }
+    }
+    return result;
+  };
+
+  click(window, '[data-action="refresh-field-template-preview"]');
+  await waitFor(() => !flow.refreshing && !flow.staleRevision, "stale preview did not finish");
+  assert.equal(flow.importMappings[key].some((target) => target.targetId === "picker-actor-002"), false);
+  assert.equal(flow.droppedMappingCount, 1);
+  assert.match(window.document.querySelector("[data-repair-categories]").textContent, /失效映射.*1/s);
+});
+
+test("duplicate suggested targets stay unmapped within one imported field", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"],
+    targetSelections: [{
+      fieldId: "picker-field-001",
+      targets: [
+        { targetId: "picker-actor-001", enabled: true, includeValue: true },
+        { targetId: "picker-actor-002", enabled: true, includeValue: true },
+      ],
+    }],
+  });
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  window.MvuUi.native.call = async function (method, params) {
+    const result = await originalCall(method, params);
+    if (method === "previewFieldTemplateImport") {
+      result.mappingNeeds[0].sourceTargets[1].suggestedTarget = {
+        targetId: "picker-actor-001", name: "游标角色 001", reason: "stable_id",
+      };
+    }
+    return result;
+  };
+  await window.MvuUi.importFieldTemplateText(window.MvuUi.state.demoLastFieldTemplateJson, "duplicate-suggestion.json");
+  const flow = window.MvuUi.state.fieldTemplateFlow;
+  const first = flow.importMappings["picker-field-001\u0000picker-actor-001"];
+  const second = flow.importMappings["picker-field-001\u0000picker-actor-002"];
+  assert.equal(first[0].targetId, "picker-actor-001");
+  assert.deepEqual(plain(second), []);
+  assert.match(window.document.querySelector("[data-repair-categories]").textContent, /重复映射.*1/s);
+});
+
+test("manual duplicate mapping is prevented and centralized validation blocks native import", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"],
+    targetSelections: [{
+      fieldId: "picker-field-001",
+      targets: [
+        { targetId: "picker-actor-001", enabled: true, includeValue: true },
+        { targetId: "picker-actor-002", enabled: true, includeValue: true },
+      ],
+    }],
+  });
+  await window.MvuUi.importFieldTemplateText(window.MvuUi.state.demoLastFieldTemplateJson, "manual-duplicate.json");
+  click(window, '[data-action="next-field-template-import"]');
+  click(window, '[data-action="next-field-template-import"]');
+  const secondSource = window.document.querySelector('[data-import-source-id="picker-actor-002"] [data-action="choose-template-import-targets"]');
+  secondSource.click();
+  await waitFor(() => window.MvuUi.state.entityPicker?.orderIds.length > 0, "mapping picker did not load");
+  click(window, '[data-picker-id="picker-actor-001"]');
+  click(window, '[data-action="confirm-entity-picker"]');
+  const secondKey = "picker-field-001\u0000picker-actor-002";
+  assert.equal(window.MvuUi.state.fieldTemplateFlow.importMappings[secondKey].some((target) => target.targetId === "picker-actor-001"), false);
+  assert.match(window.document.querySelector("[data-field-template-error]").textContent, /已经映射|不能重复/);
+
+  window.MvuUi.state.fieldTemplateFlow.importMappings[secondKey] = [{
+    targetId: "picker-actor-001", name: "游标角色 001", enabled: true,
+    suggestedEnabled: true, valuePolicy: "template_value",
+  }];
+  let importCalls = 0;
+  const importCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  window.MvuUi.native.call = function (method, params) {
+    if (method === "importFieldTemplate") importCalls += 1;
+    return importCall(method, params);
+  };
+  click(window, '[data-action="commit-field-template-import"]');
+  await waitFor(() => /重复/.test(window.document.querySelector("[data-field-template-error]")?.textContent || ""), "duplicate validation error missing");
+  assert.equal(importCalls, 0);
+});
+
 test("repair summary deduplicates overlapping references and names every repair category", async (t) => {
   const window = await createApp("config-fields");
   t.after(() => window.close());
@@ -371,11 +537,196 @@ test("repair summary deduplicates overlapping references and names every repair 
 
   click(window, '[data-action="next-field-template-import"]');
   click(window, '[data-action="next-field-template-import"]');
+  click(window, '[data-action="choose-template-import-targets"]');
+  await waitFor(() => window.MvuUi.state.entityPicker?.orderIds.length > 0, "repair fixture target picker did not load");
+  click(window, '[data-picker-id="picker-actor-001"]');
+  click(window, '[data-action="confirm-entity-picker"]');
   click(window, '[data-action="commit-field-template-import"]');
   await waitFor(() => window.MvuUi.state.fieldTemplateFlow?.result, "repair fixture import did not complete");
   const resultText = window.document.querySelector("[data-template-import-result]").textContent;
   assert.match(resultText, /需修复 5/);
   assert.match(resultText, /规则\s*1.*条件\s*1.*状态联动\s*1.*临时效果\s*1.*其他无效引用\s*1/s);
+});
+
+test("large legal template views render searchable five-row windows with exact count copy", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"],
+    targetSelections: [{ fieldId: "picker-field-001", targets: [] }],
+  });
+  await window.MvuUi.importFieldTemplateText(window.MvuUi.state.demoLastFieldTemplateJson, "large-preview.json");
+  const flow = window.MvuUi.state.fieldTemplateFlow;
+  const baseField = flow.preview.fields[0];
+  const fields = Array.from({ length: 20 }, (_value, fieldIndex) => ({
+    ...plain(baseField),
+    sourceFieldId: `large-field-${String(fieldIndex + 1).padStart(2, "0")}`,
+    name: `大模板字段 ${String(fieldIndex + 1).padStart(2, "0")}`,
+  }));
+  const mappingNeeds = fields.map((field) => ({
+    fieldId: field.sourceFieldId,
+    scope: "character",
+    requiresLocalTargets: false,
+    templateValueAvailable: true,
+    sourceTargets: Array.from({ length: 12 }, (_target, sourceIndex) => ({
+      kind: "actor", sourceId: `${field.sourceFieldId}-source-${String(sourceIndex + 1).padStart(2, "0")}`,
+      name: `源角色 ${String(sourceIndex + 1).padStart(2, "0")}`, hasValue: true, requiresSearch: true,
+    })),
+  }));
+  flow.preview = { ...flow.preview, fields, mappingNeeds, omittedDependencies: [], invalidReferences: [] };
+  flow.strategies = Object.fromEntries(fields.map((field) => [field.sourceFieldId, "create_copy"]));
+  flow.importMappings = {};
+  for (const need of mappingNeeds) {
+    for (const source of need.sourceTargets) {
+      flow.importMappings[`${need.fieldId}\u0000${source.sourceId}`] = Array.from({ length: 12 }, (_target, index) => ({
+        targetId: `picker-actor-${String(index + 1).padStart(3, "0")}`,
+        name: `游标角色 ${String(index + 1).padStart(3, "0")}`,
+        enabled: true, suggestedEnabled: true, valuePolicy: "template_value",
+      }));
+    }
+  }
+  flow.views = {};
+  flow.step = 1;
+  window.MvuUi.render();
+  assert.ok(window.document.querySelectorAll(".preview-field-list article").length <= 5);
+  assert.match(window.document.querySelector('[data-template-count="content-fields"]').textContent, /显示 1–5 \/ 共 20 条/);
+  input(window, '[data-template-search="content-fields"]', "字段 20");
+  assert.equal(window.document.querySelectorAll(".preview-field-list article").length, 1);
+  assert.match(window.document.querySelector(".preview-field-list").textContent, /大模板字段 20/);
+
+  flow.step = 2;
+  window.MvuUi.render();
+  assert.ok(window.document.querySelectorAll(".conflict-list > article").length <= 5);
+  assert.match(window.document.querySelector('[data-template-count="conflict-fields"]').textContent, /显示 1–5 \/ 共 20 条/);
+
+  flow.step = 3;
+  window.MvuUi.render();
+  assert.ok(window.document.querySelectorAll(".mapping-list > .mapping-field").length <= 5);
+  assert.match(window.document.querySelector('[data-template-count="mapping-fields"]').textContent, /显示 1–5 \/ 共 20 条/);
+  for (const field of window.document.querySelectorAll(".mapping-field")) {
+    assert.ok(field.querySelectorAll(".source-mapping").length <= 5);
+    for (const source of field.querySelectorAll(".source-mapping")) {
+      assert.ok(source.querySelectorAll("[data-template-import-target-id]").length <= 5);
+      assert.match(source.querySelector("[data-template-count$='-targets']").textContent, /显示 1–5 \/ 共 12 条/);
+    }
+  }
+  assert.equal(window.document.body.textContent.includes("加载更多"), false);
+});
+
+test("current-conversation toggle preserves other bindings and advanced management stays bounded and honest", async (t) => {
+  const window = await createApp("field-editor");
+  t.after(() => window.close());
+  const base = await window.MvuUi.native.call("getEntityById", { entityType: "field", id: "affinity" });
+  const chatField = {
+    ...plain(base), id: "chat-multi", scope: "chat",
+    bindingIds: ["chat-old-1", "chat-a", "chat-old-2", "chat-old-3", "chat-old-4", "chat-old-5", "chat-old-6"],
+    bindingDisplay: "7 个会话", scopeKey: "chat:chat-a",
+  };
+  window.MvuUi.state.entities.set("field:chat-multi", chatField);
+  window.MvuUi.state.selectedEntityId = "chat-multi";
+  window.MvuUi.resetFieldEditorDraft();
+  window.MvuUi.render();
+  const { document } = window;
+  assert.match(document.querySelector("[data-chat-binding]").textContent, /Operit 的会话/);
+  assert.ok(document.querySelectorAll("[data-chat-binding-id]").length <= 5);
+  assert.match(document.querySelector('[data-chat-binding-count]').textContent, /显示 1–5 \/ 共 7 条/);
+  assert.match(document.querySelector("[data-chat-binding]").textContent, /名称不可用/);
+
+  const toggle = document.querySelector('[name="bindCurrentChat"]');
+  toggle.checked = false;
+  toggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.equal(window.MvuUi.state.fieldEditorDraft.bindingIds.includes("chat-a"), false);
+  assert.deepEqual(
+    plain(window.MvuUi.state.fieldEditorDraft.bindingIds),
+    ["chat-old-1", "chat-old-2", "chat-old-3", "chat-old-4", "chat-old-5", "chat-old-6"],
+  );
+  const nextToggle = document.querySelector('[name="bindCurrentChat"]');
+  nextToggle.checked = true;
+  nextToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.deepEqual(
+    plain(window.MvuUi.state.fieldEditorDraft.bindingIds),
+    ["chat-old-1", "chat-old-2", "chat-old-3", "chat-old-4", "chat-old-5", "chat-old-6", "chat-a"],
+  );
+
+  input(window, '[name="manualChatBindingId"]', "chat-manual");
+  click(window, '[data-action="add-chat-binding"]');
+  assert.ok(window.MvuUi.state.fieldEditorDraft.bindingIds.includes("chat-manual"));
+});
+
+test("demo import enforces target parity and persists all three value policies atomically", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"],
+    targetSelections: [{
+      fieldId: "picker-field-001",
+      targets: [{ targetId: "picker-actor-001", enabled: true, includeValue: true }],
+    }],
+  });
+  const document = JSON.parse(window.MvuUi.state.demoLastFieldTemplateJson);
+  document.fields[0].sourceTargets[0].value = 37;
+  const json = JSON.stringify(document);
+  const preview = await window.MvuUi.native.call("previewFieldTemplateImport", { json });
+  window.MvuUi.state.demoStore.stateValues ||= {};
+  window.MvuUi.state.demoStore.stateValues["character:picker-actor-002"] = { "picker-field-001": 64 };
+  const decision = {
+    sourceFieldId: "picker-field-001", strategy: "create_copy",
+    mappings: [{
+      sourceTargetId: "picker-actor-001",
+      targets: [
+        { targetId: "picker-actor-001", enabled: true, valuePolicy: "template_value" },
+        { targetId: "picker-actor-002", enabled: true, valuePolicy: "keep_existing" },
+        { targetId: "picker-actor-003", enabled: true, valuePolicy: "field_initial" },
+      ],
+    }],
+  };
+  const result = await window.MvuUi.native.call("importFieldTemplate", {
+    json, expectedRevision: preview.revision, decisions: { fields: [decision] },
+  });
+  const createdId = result.summary.created[0];
+  assert.equal(result.summary.valueWrites, 3);
+  assert.equal(window.MvuUi.state.demoStore.stateValues["character:picker-actor-001"][createdId], 37);
+  assert.equal(window.MvuUi.state.demoStore.stateValues["character:picker-actor-002"][createdId], 64);
+  assert.equal(window.MvuUi.state.demoStore.stateValues["character:picker-actor-003"][createdId], document.fields[0].definition.initialValue);
+
+  const revisionBeforeInvalid = window.MvuUi.state.demoStore.revision;
+  const fieldsBeforeInvalid = window.MvuUi.state.demoStore.fields.length;
+  await assert.rejects(
+    window.MvuUi.native.call("importFieldTemplate", {
+      json, expectedRevision: revisionBeforeInvalid, decisions: { fields: [{
+        ...decision,
+        mappings: [{ sourceTargetId: "picker-actor-001", targets: [
+          { targetId: "picker-group-001", enabled: true, valuePolicy: "template_value" },
+        ] }],
+      }] },
+    }),
+    /TARGET_INVALID|MAPPING_TARGET_INVALID/,
+  );
+  assert.equal(window.MvuUi.state.demoStore.revision, revisionBeforeInvalid);
+  assert.equal(window.MvuUi.state.demoStore.fields.length, fieldsBeforeInvalid);
+});
+
+test("template preview loading is distinct from error state and never renders error icon or copy", async (t) => {
+  const window = await createApp("config-fields");
+  t.after(() => window.close());
+  await window.MvuUi.native.call("exportFieldTemplate", {
+    fieldIds: ["picker-field-001"], targetSelections: [{ fieldId: "picker-field-001", targets: [] }],
+  });
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let releasePreview;
+  const previewGate = new Promise((resolve) => { releasePreview = resolve; });
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "previewFieldTemplateImport") await previewGate;
+    return originalCall(method, params);
+  };
+  const pending = window.MvuUi.importFieldTemplateText(window.MvuUi.state.demoLastFieldTemplateJson, "loading.json");
+  await waitFor(() => window.MvuUi.state.fieldTemplateFlow, "loading flow missing");
+  assert.equal(window.MvuUi.state.fieldTemplateFlow.loading, true);
+  assert.equal(window.document.querySelector("[data-field-template-error]").textContent, "");
+  assert.match(window.document.querySelector(".template-callout .material-symbols-rounded").textContent, /progress_activity/);
+  assert.doesNotMatch(window.document.querySelector(".template-callout").textContent, /尚未通过检查|错误|失败/);
+  releasePreview();
+  await pending;
 });
 
 test("field-template host errors stay inline and recover on retry", async (t) => {
@@ -438,7 +789,7 @@ test("field-template dialog keeps overlay clicks inside and Escape restores each
   assert.equal(document.activeElement, document.querySelector('[data-action="open-field-template-import"]'));
 });
 
-test("complete effect-group DTOs require an exact bounded defaultReason and demo entities provide it", async (t) => {
+test("effect-group responses accept legacy reason sources while create and update requests retain the 512 editor limit", async (t) => {
   const window = await createApp("effect-library");
   t.after(() => window.close());
   const full = await window.MvuUi.native.call("getEntityById", { entityType: "effectGroup", id: "effect-1" });
@@ -456,10 +807,33 @@ test("complete effect-group DTOs require an exact bounded defaultReason and demo
   const blankCustom = plain(full);
   blankCustom.defaultReason = { mode: "custom", template: "relationship", text: "   " };
   assert.throws(() => validate(blankCustom), /MVU_EFFECT_REASON_CONFIG_INVALID/);
-  const oversized = plain(full);
-  oversized.defaultReason = { mode: "template", template: "positive", text: "字".repeat(513) };
-  assert.throws(() => validate(oversized), /MVU_EFFECT_REASON_CONFIG_INVALID/);
+  const legacy = plain(full);
+  legacy.defaultReason = { mode: "template", template: "positive", text: "字".repeat(513) };
+  assert.doesNotThrow(() => validate(legacy));
+  const legacyBoundary = plain(full);
+  legacyBoundary.defaultReason = { mode: "custom", template: "positive", text: "字".repeat(16384) };
+  assert.doesNotThrow(() => validate(legacyBoundary));
+  const persistedOversized = plain(full);
+  persistedOversized.defaultReason = { mode: "template", template: "positive", text: "字".repeat(16385) };
+  assert.throws(() => validate(persistedOversized), /MVU_EFFECT_REASON_CONFIG_INVALID/);
   const bounded = plain(full);
   bounded.defaultReason = { mode: "custom", template: "environment", text: "字".repeat(512) };
   assert.doesNotThrow(() => validate(bounded));
+
+  const createInput = plain(full);
+  delete createInput.id;
+  delete createInput.createdAt;
+  delete createInput.updatedAt;
+  createInput.defaultReason = { mode: "custom", template: "general", text: "字".repeat(513) };
+  await assert.rejects(
+    window.MvuUi.native.call("createEffectGroup", { expectedRevision: 7, effectGroup: createInput }),
+    /MVU_EFFECT_REASON_CONFIG_INVALID/,
+  );
+  await assert.rejects(
+    window.MvuUi.native.call("updateEffectGroup", {
+      id: full.id, expectedRevision: 7,
+      patch: { defaultReason: { mode: "custom", template: "general", text: "字".repeat(513) } },
+    }),
+    /MVU_EFFECT_REASON_CONFIG_INVALID/,
+  );
 });
