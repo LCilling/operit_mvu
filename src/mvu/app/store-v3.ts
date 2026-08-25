@@ -19,6 +19,7 @@ import type {
 import {
   assertRecordManifest,
   createEmptyRecordManifest,
+  RECORDS_PER_SEGMENT,
   SegmentedRecordStore,
   type RecordQueryRequest,
   type RecordQueryResult,
@@ -45,11 +46,17 @@ export interface MigrationError {
   message: string;
 }
 
+export interface CleanupPendingStatus {
+  state: "pending";
+  error: MigrationError;
+}
+
 export type MigrationStatus =
   | {
       mode: "v3";
       source: "existing" | "migrated" | "initialized";
       report?: MigrationResult["report"];
+      cleanup?: CleanupPendingStatus;
     }
   | { mode: "v2_compat"; error: MigrationError };
 
@@ -99,6 +106,7 @@ export class V3MvuStore implements MvuStore {
   private readonly records: SegmentedRecordStore;
   private initialization: Promise<MigrationStatus> | undefined;
   private retryInFlight: Promise<MigrationStatus> | undefined;
+  private cleanupError: MigrationError | undefined;
 
   constructor(options: V3MvuStoreOptions) {
     this.getConfigDir = options.getConfigDir;
@@ -120,7 +128,8 @@ export class V3MvuStore implements MvuStore {
   }
 
   async migrationStatus(): Promise<MigrationStatus> {
-    return this.initialize();
+    const status = await this.initialize();
+    return status.mode === "v3" ? this.withCleanupStatus(status) : status;
   }
 
   async retryMigration(): Promise<MigrationStatus> {
@@ -236,11 +245,11 @@ export class V3MvuStore implements MvuStore {
           if (!forceRebuild) throw error;
         }
         if (existing !== undefined) {
-          // Cleanup failure does not make a validated, atomically published v3
-          // config eligible for force-rebuild from v2. Retry only the journal.
+          // Once config and committed records validate, v3 is authoritative.
+          // Superseded-file deletion is resumable maintenance, not migration.
           runtimeRecoveryRequired.delete(v3Path);
-          await this.resumeSegmentCleanup(existing.dataset);
-          return { mode: "v3", source: "existing" };
+          await this.tryResumeSegmentCleanup(existing.dataset);
+          return this.withCleanupStatus({ mode: "v3", source: "existing" });
         }
       }
 
@@ -273,6 +282,7 @@ export class V3MvuStore implements MvuStore {
       await this.records.validateAndRepair(committed.recordManifest, committed.revision);
       await this.persistConfig(v3Path, committed);
       runtimeRecoveryRequired.delete(v3Path);
+      this.cleanupError = undefined;
       return {
         mode: "v3",
         source: hasV2 ? "migrated" : "initialized",
@@ -407,9 +417,14 @@ export class V3MvuStore implements MvuStore {
     if (!(await this.files.exists(journalPath))) return;
     const parsed = JSON.parse(await this.files.readText(journalPath)) as unknown;
     assertSegmentCleanupJournal(parsed, this.records.directoryPath());
-    const matchesPublishedReplacement = parsed.expectedRevision === committed.revision &&
+    const exactPublication = parsed.expectedRevision === committed.revision &&
       JSON.stringify(parsed.expectedRecordManifest) === JSON.stringify(committed.recordManifest);
-    if (!matchesPublishedReplacement) {
+    const descendantPublication = committed.revision > parsed.expectedRevision &&
+      isRecordManifestDescendant(parsed.expectedRecordManifest, committed.recordManifest);
+    if (!exactPublication && !descendantPublication) {
+      if (committed.revision > parsed.expectedRevision) {
+        throw new Error("MVU_V3_SEGMENT_CLEANUP_DESCENDANT_UNPROVEN");
+      }
       await this.files.deleteFile(journalPath);
       return;
     }
@@ -427,6 +442,29 @@ export class V3MvuStore implements MvuStore {
     await this.files.deleteFile(journalPath);
   }
 
+  private async tryResumeSegmentCleanup(committed: MvuDatasetV3): Promise<void> {
+    try {
+      await this.resumeSegmentCleanup(committed);
+      this.cleanupError = undefined;
+    } catch (error) {
+      this.cleanupError = structuredMigrationError(error);
+    }
+  }
+
+  private withCleanupStatus(
+    status: Extract<MigrationStatus, { mode: "v3" }>,
+  ): Extract<MigrationStatus, { mode: "v3" }> {
+    const decorated: Extract<MigrationStatus, { mode: "v3" }> = {
+      mode: "v3",
+      source: status.source,
+    };
+    if (status.report !== undefined) decorated.report = status.report;
+    if (this.cleanupError !== undefined) {
+      decorated.cleanup = { state: "pending", error: { ...this.cleanupError } };
+    }
+    return decorated;
+  }
+
   private async discardCleanupJournal(): Promise<void> {
     const path = this.cleanupPath(this.configDir());
     if (await this.files.exists(path)) await this.files.deleteFile(path);
@@ -438,7 +476,7 @@ export class V3MvuStore implements MvuStore {
       await this.records.validateAndRepair(current.dataset.recordManifest, current.revision);
       runtimeRecoveryRequired.delete(path);
     }
-    await this.resumeSegmentCleanup(current.dataset);
+    await this.tryResumeSegmentCleanup(current.dataset);
   }
 
   private enqueuePath<T>(operation: () => Promise<T>): Promise<T> {
@@ -501,6 +539,46 @@ function assertSegmentCleanupJournal(
     }
     seen.add(path);
   }
+}
+
+function isRecordManifestDescendant(
+  expected: RecordManifest,
+  current: RecordManifest,
+): boolean {
+  if (current.recordCount < expected.recordCount ||
+    current.nextSegmentIndex < expected.nextSegmentIndex ||
+    current.segments.length < expected.segments.length) {
+    return false;
+  }
+  if (expected.segments.length === 0) {
+    return current.segments.length === 0 ||
+      current.segments[0].index >= expected.nextSegmentIndex;
+  }
+
+  const lastExpectedPosition = expected.segments.length - 1;
+  for (let position = 0; position < expected.segments.length; position += 1) {
+    const ancestor = expected.segments[position];
+    const descendant = current.segments[position];
+    if (ancestor.index !== descendant.index || ancestor.fileName !== descendant.fileName) return false;
+    if (position < lastExpectedPosition ||
+      ancestor.committedLineCount === RECORDS_PER_SEGMENT ||
+      ancestor.committedLineCount === descendant.committedLineCount) {
+      if (JSON.stringify(ancestor) !== JSON.stringify(descendant)) return false;
+      continue;
+    }
+    if (descendant.committedLineCount < ancestor.committedLineCount ||
+      descendant.firstRevision !== ancestor.firstRevision ||
+      descendant.lastRevision < ancestor.lastRevision ||
+      descendant.firstOccurredAt > ancestor.firstOccurredAt ||
+      descendant.lastOccurredAt < ancestor.lastOccurredAt) {
+      return false;
+    }
+  }
+  if (current.segments.length > expected.segments.length &&
+    current.segments[expected.segments.length].index < expected.nextSegmentIndex) {
+    return false;
+  }
+  return true;
 }
 
 function compatibilitySnapshot(dataset: MvuDatasetV3, records: readonly DataChangeRecord[]): MvuStoreSnapshot {
