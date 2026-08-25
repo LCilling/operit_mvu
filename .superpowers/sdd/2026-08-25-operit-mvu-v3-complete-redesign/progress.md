@@ -109,3 +109,4 @@ Task 6: base d45ea9f7d389deebcf4c9b250e403dcefc8a6fa0
 Task 6: implementation complete pending review (474a1d9 + 6f62e8c; 103/103).
 Task 6: independent review rejected initial implementation — 1 Critical, 7 Important, 2 Minor themes; required client revision CAS, opaque bounded cursors, raw-ID tie-breaks, deep AI copy IDs, summary/current-state snapshot, bounded references, immutable active effects, and strict pre-read IDs.
 Task 6: review fix round complete (c36bf63 + 6845819 + e03e03e + afa36f8; 113/113; `pnpm run check` and `git diff --check` PASS). Pending fresh independent re-review.
+Task 6: review fix round 2 complete (`c63b8d8`; query 35/35, full 131/131; exact filter fingerprints, 64 KiB legacy-safe compact snapshot, formal 15-operation CAS matrix; `pnpm run check` and `git diff --check` PASS). Pending fresh independent re-review; Task 7 monolith remains untouched.

@@ -185,3 +185,58 @@ Expected failure-injection diagnostics remain visible in the test output while t
 - Actor/group directory totals can change between cursor requests because the host does not provide a directory revision token.
 - Arbitrary record-body search remains fail-closed to preserve the bounded 100,000-record I/O guarantee.
 - Two unrelated release-version document edits were present in the shared worktree during final verification. They were not staged or modified by this Task 6 round.
+
+## Independent review fix round 3 (review “round 2” request)
+
+This follow-up fixes the three findings raised after the first independent-review repair set. The production and regression-test changes are committed as:
+
+- `c63b8d8` — exact-filter cursor fingerprints, bounded/sanitized snapshot DTOs and the formal 15-operation revision matrix.
+
+The shared release-document commit `20ec644` and earlier release-version commit `8382b1c` were preserved unchanged. The legacy `static/app_ui/app.js` monolith was also left untouched because its snapshot migration remains Task 7 scope.
+
+### TDD evidence
+
+The first focused query run after adding the new regressions produced the expected RED result:
+
+```text
+node --test tests/query.test.mjs
+```
+
+- `33` passed / `2` failed.
+- The `Actor_A` cursor was incorrectly accepted for the distinct `actor_a` filter.
+- A snapshot containing 2,000,000 UTF-16 code units in legacy labels exceeded the 64 KiB response contract.
+
+A second focused RED check proved that semantically identical sort objects with different property insertion order also produced different fingerprints. After implementation, the focused suite is `35/35` green, including the 15 named CAS subtests.
+
+### Changes
+
+1. Cursor fingerprints now normalize only free-text search. Exact filter values retain case and raw code-unit identity. Filter keys and the fixed sort shape are canonicalized independently of object insertion order.
+2. Exact filter regressions cover `bindingId`, `conditionId`, `actorId`, `groupId`, and `fieldId`, including the required `Actor_A` versus `actor_a` reproduction.
+3. `MvuCompactPageSnapshot` now owns bounded display-label, actor, group, active-context, migration-status and first-page summary DTOs. Every user/host/legacy string crossing this boundary is Unicode-code-point-safe truncated, malformed surrogate code units are replaced, and affected DTOs expose `truncated`.
+4. Migration warnings retain an exact `warningCount`, expose `warningsTruncated`, and return at most eight bounded warning texts.
+5. The query boundary enforces `MVU_SNAPSHOT_MAX_BYTES = 65_536` against the final UTF-8 serialized payload. The 2,000,000-character regression exercises field, rule, condition, effect, record, actor, group, active-context, session-label, migration-warning and cleanup-error data without validating or rewriting the legacy dataset.
+6. Existing strict new-mutation limits remain in force: entity IDs and names are capped at 256 code units, descriptions/AI requirements at 4,096, and collection/depth limits are enforced by exact-key IPC parsers. Legacy v2/v3 loading was not tightened, so old datasets remain loadable and are sanitized only in compact projections.
+7. The old single stale-client test was replaced with a table-driven condition/effect-group/rule matrix. All 15 create/update/copy/toggle/delete operations prove that a stale revision is rejected before `transactV3`, leaves the dataset byte-equivalent, and that a valid request writes once and returns revision + 1.
+
+### Final verification
+
+```text
+pnpm run check
+git diff --check
+```
+
+- Manifest/WebView audits: PASS (`15` screens, `42` declared actions, `48` handled actions, `20` UI-referenced native methods).
+- TypeScript and temporary-effect audit: PASS.
+- Query suite: `35` passed / `0` failed.
+- Full suite: `131` passed / `0` failed.
+- The 100,000-record bounded-read and every Task 5 atomicity/recovery/migration/cleanup invariant remain green.
+- `git diff --check`: PASS.
+
+The failure-injection diagnostics printed by record-store tests remain expected and all associated assertions pass.
+
+### Residual boundaries
+
+- Task 7 must consume the typed compact snapshot and display `truncated` states where useful; the old monolithic UI remains intentionally incompatible.
+- Compact summaries cap abnormal legacy identifiers as well as labels. Normal host UUIDs and generated v3 identifiers fit the bound; an imported identifier that itself requires truncation is surfaced with `truncated: true` and remains a legacy-repair case rather than silently expanding the snapshot.
+- Cursor state remains runtime-local, capped and expiring; restart invalidates outstanding cursors, and host directory totals may change because the host exposes no directory revision.
+- Arbitrary record-body search remains fail-closed to preserve the 100,000-record bounded-I/O guarantee.
