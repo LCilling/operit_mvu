@@ -17,15 +17,19 @@ import {
   QUERY_SEARCH_MAX_LENGTH,
   type ConditionInput,
   type ConditionPatch,
+  type DeleteMutationResponse,
   type EffectGroupInput,
   type EffectGroupPatch,
   type EntityReferenceSummary,
   type GetEntityByIdRequest,
   type MvuCompactPageSnapshot,
   type MvuQueryService,
+  type MutationResponse,
   type QueryGroup,
   type QueryRequest,
   type QueryResponse,
+  type ReferenceQueryRequest,
+  type RevisionedIdRequest,
   type RuleInput,
   type RulePatch,
 } from "../mvu/app/query";
@@ -163,13 +167,13 @@ export interface ExportDatasetResponse {
 export interface ImportDatasetRequest { json: string; }
 export interface AddTemporaryEffectRequest { effect: TemporaryEffectInput; }
 export interface UpdateTemporaryEffectRequest { id: string; patch: TemporaryEffectPatch; }
-export interface CreateConditionRequest { condition: ConditionInput; }
-export interface UpdateConditionRequest { id: string; patch: ConditionPatch; }
-export interface CreateEffectGroupRequest { effectGroup: EffectGroupInput; }
-export interface UpdateEffectGroupRequest { id: string; patch: EffectGroupPatch; }
-export interface CreateRuleRequest { rule: RuleInput; }
-export interface UpdateRuleRequest { id: string; patch: RulePatch; }
-export interface ToggleEntityRequest { id: string; enabled: boolean; }
+export interface CreateConditionRequest { expectedRevision: number; condition: ConditionInput; }
+export interface UpdateConditionRequest extends RevisionedIdRequest { patch: ConditionPatch; }
+export interface CreateEffectGroupRequest { expectedRevision: number; effectGroup: EffectGroupInput; }
+export interface UpdateEffectGroupRequest extends RevisionedIdRequest { patch: EffectGroupPatch; }
+export interface CreateRuleRequest { expectedRevision: number; rule: RuleInput; }
+export interface UpdateRuleRequest extends RevisionedIdRequest { patch: RulePatch; }
+export interface ToggleEntityRequest extends RevisionedIdRequest { enabled: boolean; }
 
 export interface MvuIpcDependencies {
   snapshot(request: SnapshotRequest): Promise<MvuPageSnapshot>;
@@ -205,7 +209,9 @@ function fail(code: string): never {
 }
 
 function isUnknownRecord(value: unknown): value is UnknownRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function requireRecord(value: unknown, code: string): UnknownRecord {
@@ -667,6 +673,35 @@ function parseIdRequest(value: unknown): IdRequest {
   const record = requireRecord(value, "MVU_ID_REQUEST_INVALID");
   assertKeys(record, ["id"], [], "MVU_ID_REQUEST_INVALID");
   return { id: requireNonEmptyString(record, "id", "MVU_ID_REQUIRED") };
+}
+
+function requireExpectedRevision(record: UnknownRecord, code: string): number {
+  const revision = requireNumber(record, "expectedRevision", code);
+  if (!Number.isSafeInteger(revision) || revision < 0) fail(code);
+  return revision;
+}
+
+function parseRevisionedIdRequest(value: unknown, code: string): RevisionedIdRequest {
+  const record = requireRecord(value, code);
+  assertKeys(record, ["id", "expectedRevision"], [], code);
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, code),
+    expectedRevision: requireExpectedRevision(record, code),
+  };
+}
+
+function parseReferenceQueryRequest(value: unknown, code: string): ReferenceQueryRequest {
+  const record = requireRecord(value, code);
+  assertKeys(record, ["id"], ["page"], code);
+  const request: ReferenceQueryRequest = {
+    id: requireBoundedNonEmptyString(record, "id", 256, code),
+  };
+  if (hasOwn(record, "page")) {
+    const page = requireNumber(record, "page", code);
+    if (!Number.isSafeInteger(page) || page < 1) fail(code);
+    request.page = page;
+  }
+  return request;
 }
 
 function parseScopeContextRequest(value: unknown): ScopeContextRequest {
@@ -1171,46 +1206,68 @@ function parseRuleInput(value: unknown, patch: boolean): RuleInput | RulePatch {
 
 function parseCreateConditionRequest(value: unknown): CreateConditionRequest {
   const record = requireRecord(value, "MVU_CREATE_CONDITION_REQUEST_INVALID");
-  assertKeys(record, ["condition"], [], "MVU_CREATE_CONDITION_REQUEST_INVALID");
-  return { condition: parseConditionInput(record.condition, false) };
+  assertKeys(record, ["condition", "expectedRevision"], [], "MVU_CREATE_CONDITION_REQUEST_INVALID");
+  return {
+    expectedRevision: requireExpectedRevision(record, "MVU_CREATE_CONDITION_REVISION_INVALID"),
+    condition: parseConditionInput(record.condition, false),
+  };
 }
 
 function parseUpdateConditionRequest(value: unknown): UpdateConditionRequest {
   const record = requireRecord(value, "MVU_UPDATE_CONDITION_REQUEST_INVALID");
-  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_CONDITION_REQUEST_INVALID");
-  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_CONDITION_ID_INVALID"), patch: parseConditionInput(record.patch, true) };
+  assertKeys(record, ["id", "patch", "expectedRevision"], [], "MVU_UPDATE_CONDITION_REQUEST_INVALID");
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, "MVU_CONDITION_ID_INVALID"),
+    expectedRevision: requireExpectedRevision(record, "MVU_UPDATE_CONDITION_REVISION_INVALID"),
+    patch: parseConditionInput(record.patch, true),
+  };
 }
 
 function parseCreateEffectGroupRequest(value: unknown): CreateEffectGroupRequest {
   const record = requireRecord(value, "MVU_CREATE_EFFECT_GROUP_REQUEST_INVALID");
-  assertKeys(record, ["effectGroup"], [], "MVU_CREATE_EFFECT_GROUP_REQUEST_INVALID");
-  return { effectGroup: parseEffectGroupInput(record.effectGroup, false) };
+  assertKeys(record, ["effectGroup", "expectedRevision"], [], "MVU_CREATE_EFFECT_GROUP_REQUEST_INVALID");
+  return {
+    expectedRevision: requireExpectedRevision(record, "MVU_CREATE_EFFECT_GROUP_REVISION_INVALID"),
+    effectGroup: parseEffectGroupInput(record.effectGroup, false),
+  };
 }
 
 function parseUpdateEffectGroupRequest(value: unknown): UpdateEffectGroupRequest {
   const record = requireRecord(value, "MVU_UPDATE_EFFECT_GROUP_REQUEST_INVALID");
-  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_EFFECT_GROUP_REQUEST_INVALID");
-  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_EFFECT_GROUP_ID_INVALID"), patch: parseEffectGroupInput(record.patch, true) };
+  assertKeys(record, ["id", "patch", "expectedRevision"], [], "MVU_UPDATE_EFFECT_GROUP_REQUEST_INVALID");
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, "MVU_EFFECT_GROUP_ID_INVALID"),
+    expectedRevision: requireExpectedRevision(record, "MVU_UPDATE_EFFECT_GROUP_REVISION_INVALID"),
+    patch: parseEffectGroupInput(record.patch, true),
+  };
 }
 
 function parseCreateRuleRequest(value: unknown): CreateRuleRequest {
   const record = requireRecord(value, "MVU_CREATE_RULE_REQUEST_INVALID");
-  assertKeys(record, ["rule"], [], "MVU_CREATE_RULE_REQUEST_INVALID");
-  return { rule: parseRuleInput(record.rule, false) };
+  assertKeys(record, ["rule", "expectedRevision"], [], "MVU_CREATE_RULE_REQUEST_INVALID");
+  return {
+    expectedRevision: requireExpectedRevision(record, "MVU_CREATE_RULE_REVISION_INVALID"),
+    rule: parseRuleInput(record.rule, false),
+  };
 }
 
 function parseUpdateRuleRequest(value: unknown): UpdateRuleRequest {
   const record = requireRecord(value, "MVU_UPDATE_RULE_REQUEST_INVALID");
-  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_RULE_REQUEST_INVALID");
-  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_RULE_ID_INVALID"), patch: parseRuleInput(record.patch, true) };
+  assertKeys(record, ["id", "patch", "expectedRevision"], [], "MVU_UPDATE_RULE_REQUEST_INVALID");
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, "MVU_RULE_ID_INVALID"),
+    expectedRevision: requireExpectedRevision(record, "MVU_UPDATE_RULE_REVISION_INVALID"),
+    patch: parseRuleInput(record.patch, true),
+  };
 }
 
 function parseToggleRequest(value: unknown, entity: "CONDITION" | "EFFECT_GROUP" | "RULE"): ToggleEntityRequest {
   const code = `MVU_TOGGLE_${entity}_REQUEST_INVALID`;
   const record = requireRecord(value, code);
-  assertKeys(record, ["id", "enabled"], [], code);
+  assertKeys(record, ["id", "enabled", "expectedRevision"], [], code);
   return {
     id: requireBoundedNonEmptyString(record, "id", 256, code),
+    expectedRevision: requireExpectedRevision(record, code),
     enabled: requireBoolean(record, "enabled", code),
   };
 }
@@ -1246,21 +1303,21 @@ export const MVU_REQUEST_PARSERS = {
   getEntityById: parseGetEntityByIdRequest,
   createCondition: parseCreateConditionRequest,
   updateCondition: parseUpdateConditionRequest,
-  copyCondition: parseIdRequest,
+  copyCondition: (value: unknown) => parseRevisionedIdRequest(value, "MVU_COPY_CONDITION_REQUEST_INVALID"),
   toggleCondition: (value: unknown) => parseToggleRequest(value, "CONDITION"),
-  deleteCondition: parseIdRequest,
-  getConditionReferences: parseIdRequest,
+  deleteCondition: (value: unknown) => parseRevisionedIdRequest(value, "MVU_DELETE_CONDITION_REQUEST_INVALID"),
+  getConditionReferences: (value: unknown) => parseReferenceQueryRequest(value, "MVU_CONDITION_REFERENCES_REQUEST_INVALID"),
   createEffectGroup: parseCreateEffectGroupRequest,
   updateEffectGroup: parseUpdateEffectGroupRequest,
-  copyEffectGroup: parseIdRequest,
+  copyEffectGroup: (value: unknown) => parseRevisionedIdRequest(value, "MVU_COPY_EFFECT_GROUP_REQUEST_INVALID"),
   toggleEffectGroup: (value: unknown) => parseToggleRequest(value, "EFFECT_GROUP"),
-  deleteEffectGroup: parseIdRequest,
-  getEffectGroupReferences: parseIdRequest,
+  deleteEffectGroup: (value: unknown) => parseRevisionedIdRequest(value, "MVU_DELETE_EFFECT_GROUP_REQUEST_INVALID"),
+  getEffectGroupReferences: (value: unknown) => parseReferenceQueryRequest(value, "MVU_EFFECT_GROUP_REFERENCES_REQUEST_INVALID"),
   createRule: parseCreateRuleRequest,
   updateRule: parseUpdateRuleRequest,
-  copyRule: parseIdRequest,
+  copyRule: (value: unknown) => parseRevisionedIdRequest(value, "MVU_COPY_RULE_REQUEST_INVALID"),
   toggleRule: (value: unknown) => parseToggleRequest(value, "RULE"),
-  deleteRule: parseIdRequest,
+  deleteRule: (value: unknown) => parseRevisionedIdRequest(value, "MVU_DELETE_RULE_REQUEST_INVALID"),
   getRuleReferences: parseIdRequest,
 } as const;
 
@@ -1449,71 +1506,71 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
       MVU_IPC.getEntityById,
       guarded("getEntityById", MVU_REQUEST_PARSERS.getEntityById, (request) => deps.queries.getEntityById(request))
     ),
-    ToolPkg.ipc.on<unknown, ConditionDefinition>(
+    ToolPkg.ipc.on<unknown, MutationResponse<ConditionDefinition>>(
       MVU_IPC.createCondition,
       guarded("createCondition", MVU_REQUEST_PARSERS.createCondition, (request) => deps.queries.createCondition(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<ConditionDefinition>>(
       MVU_IPC.updateCondition,
       guarded("updateCondition", MVU_REQUEST_PARSERS.updateCondition, (request) => deps.queries.updateCondition(request))
     ),
-    ToolPkg.ipc.on<unknown, ConditionDefinition>(
+    ToolPkg.ipc.on<unknown, MutationResponse<ConditionDefinition>>(
       MVU_IPC.copyCondition,
       guarded("copyCondition", MVU_REQUEST_PARSERS.copyCondition, (request) => deps.queries.copyCondition(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<ConditionDefinition>>(
       MVU_IPC.toggleCondition,
       guarded("toggleCondition", MVU_REQUEST_PARSERS.toggleCondition, (request) => deps.queries.toggleCondition(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, DeleteMutationResponse>(
       MVU_IPC.deleteCondition,
       guarded("deleteCondition", MVU_REQUEST_PARSERS.deleteCondition, (request) => deps.queries.deleteCondition(request))
     ),
-    ToolPkg.ipc.on<unknown, EntityReferenceSummary[]>(
+    ToolPkg.ipc.on<unknown, QueryResponse<EntityReferenceSummary>>(
       MVU_IPC.getConditionReferences,
       guarded("getConditionReferences", MVU_REQUEST_PARSERS.getConditionReferences, (request) => deps.queries.getConditionReferences(request))
     ),
-    ToolPkg.ipc.on<unknown, EffectGroupDefinition>(
+    ToolPkg.ipc.on<unknown, MutationResponse<EffectGroupDefinition>>(
       MVU_IPC.createEffectGroup,
       guarded("createEffectGroup", MVU_REQUEST_PARSERS.createEffectGroup, (request) => deps.queries.createEffectGroup(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<EffectGroupDefinition>>(
       MVU_IPC.updateEffectGroup,
       guarded("updateEffectGroup", MVU_REQUEST_PARSERS.updateEffectGroup, (request) => deps.queries.updateEffectGroup(request))
     ),
-    ToolPkg.ipc.on<unknown, EffectGroupDefinition>(
+    ToolPkg.ipc.on<unknown, MutationResponse<EffectGroupDefinition>>(
       MVU_IPC.copyEffectGroup,
       guarded("copyEffectGroup", MVU_REQUEST_PARSERS.copyEffectGroup, (request) => deps.queries.copyEffectGroup(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<EffectGroupDefinition>>(
       MVU_IPC.toggleEffectGroup,
       guarded("toggleEffectGroup", MVU_REQUEST_PARSERS.toggleEffectGroup, (request) => deps.queries.toggleEffectGroup(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, DeleteMutationResponse>(
       MVU_IPC.deleteEffectGroup,
       guarded("deleteEffectGroup", MVU_REQUEST_PARSERS.deleteEffectGroup, (request) => deps.queries.deleteEffectGroup(request))
     ),
-    ToolPkg.ipc.on<unknown, EntityReferenceSummary[]>(
+    ToolPkg.ipc.on<unknown, QueryResponse<EntityReferenceSummary>>(
       MVU_IPC.getEffectGroupReferences,
       guarded("getEffectGroupReferences", MVU_REQUEST_PARSERS.getEffectGroupReferences, (request) => deps.queries.getEffectGroupReferences(request))
     ),
-    ToolPkg.ipc.on<unknown, RuleDefinitionV3>(
+    ToolPkg.ipc.on<unknown, MutationResponse<RuleDefinitionV3>>(
       MVU_IPC.createRule,
       guarded("createRule", MVU_REQUEST_PARSERS.createRule, (request) => deps.queries.createRule(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<RuleDefinitionV3>>(
       MVU_IPC.updateRule,
       guarded("updateRule", MVU_REQUEST_PARSERS.updateRule, (request) => deps.queries.updateRule(request))
     ),
-    ToolPkg.ipc.on<unknown, RuleDefinitionV3>(
+    ToolPkg.ipc.on<unknown, MutationResponse<RuleDefinitionV3>>(
       MVU_IPC.copyRule,
       guarded("copyRule", MVU_REQUEST_PARSERS.copyRule, (request) => deps.queries.copyRule(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, MutationResponse<RuleDefinitionV3>>(
       MVU_IPC.toggleRule,
       guarded("toggleRule", MVU_REQUEST_PARSERS.toggleRule, (request) => deps.queries.toggleRule(request))
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, DeleteMutationResponse>(
       MVU_IPC.deleteRule,
       guarded("deleteRule", MVU_REQUEST_PARSERS.deleteRule, (request) => deps.queries.deleteRule(request))
     ),
@@ -1617,56 +1674,56 @@ export const mvuIpcClient = {
   getEntityById(request: GetEntityByIdRequest): ReturnType<MvuQueryService["getEntityById"]> {
     return call<GetEntityByIdRequest, Awaited<ReturnType<MvuQueryService["getEntityById"]>>>(MVU_IPC.getEntityById, request);
   },
-  createCondition(request: CreateConditionRequest): Promise<ConditionDefinition> {
-    return call<CreateConditionRequest, ConditionDefinition>(MVU_IPC.createCondition, request);
+  createCondition(request: CreateConditionRequest): Promise<MutationResponse<ConditionDefinition>> {
+    return call<CreateConditionRequest, MutationResponse<ConditionDefinition>>(MVU_IPC.createCondition, request);
   },
-  updateCondition(request: UpdateConditionRequest): Promise<void> {
-    return call<UpdateConditionRequest, void>(MVU_IPC.updateCondition, request);
+  updateCondition(request: UpdateConditionRequest): Promise<MutationResponse<ConditionDefinition>> {
+    return call<UpdateConditionRequest, MutationResponse<ConditionDefinition>>(MVU_IPC.updateCondition, request);
   },
-  copyCondition(request: IdRequest): Promise<ConditionDefinition> {
-    return call<IdRequest, ConditionDefinition>(MVU_IPC.copyCondition, request);
+  copyCondition(request: RevisionedIdRequest): Promise<MutationResponse<ConditionDefinition>> {
+    return call<RevisionedIdRequest, MutationResponse<ConditionDefinition>>(MVU_IPC.copyCondition, request);
   },
-  toggleCondition(request: ToggleEntityRequest): Promise<void> {
-    return call<ToggleEntityRequest, void>(MVU_IPC.toggleCondition, request);
+  toggleCondition(request: ToggleEntityRequest): Promise<MutationResponse<ConditionDefinition>> {
+    return call<ToggleEntityRequest, MutationResponse<ConditionDefinition>>(MVU_IPC.toggleCondition, request);
   },
-  deleteCondition(request: IdRequest): Promise<void> {
-    return call<IdRequest, void>(MVU_IPC.deleteCondition, request);
+  deleteCondition(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    return call<RevisionedIdRequest, DeleteMutationResponse>(MVU_IPC.deleteCondition, request);
   },
-  getConditionReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
-    return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getConditionReferences, request);
+  getConditionReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
+    return call<ReferenceQueryRequest, QueryResponse<EntityReferenceSummary>>(MVU_IPC.getConditionReferences, request);
   },
-  createEffectGroup(request: CreateEffectGroupRequest): Promise<EffectGroupDefinition> {
-    return call<CreateEffectGroupRequest, EffectGroupDefinition>(MVU_IPC.createEffectGroup, request);
+  createEffectGroup(request: CreateEffectGroupRequest): Promise<MutationResponse<EffectGroupDefinition>> {
+    return call<CreateEffectGroupRequest, MutationResponse<EffectGroupDefinition>>(MVU_IPC.createEffectGroup, request);
   },
-  updateEffectGroup(request: UpdateEffectGroupRequest): Promise<void> {
-    return call<UpdateEffectGroupRequest, void>(MVU_IPC.updateEffectGroup, request);
+  updateEffectGroup(request: UpdateEffectGroupRequest): Promise<MutationResponse<EffectGroupDefinition>> {
+    return call<UpdateEffectGroupRequest, MutationResponse<EffectGroupDefinition>>(MVU_IPC.updateEffectGroup, request);
   },
-  copyEffectGroup(request: IdRequest): Promise<EffectGroupDefinition> {
-    return call<IdRequest, EffectGroupDefinition>(MVU_IPC.copyEffectGroup, request);
+  copyEffectGroup(request: RevisionedIdRequest): Promise<MutationResponse<EffectGroupDefinition>> {
+    return call<RevisionedIdRequest, MutationResponse<EffectGroupDefinition>>(MVU_IPC.copyEffectGroup, request);
   },
-  toggleEffectGroup(request: ToggleEntityRequest): Promise<void> {
-    return call<ToggleEntityRequest, void>(MVU_IPC.toggleEffectGroup, request);
+  toggleEffectGroup(request: ToggleEntityRequest): Promise<MutationResponse<EffectGroupDefinition>> {
+    return call<ToggleEntityRequest, MutationResponse<EffectGroupDefinition>>(MVU_IPC.toggleEffectGroup, request);
   },
-  deleteEffectGroup(request: IdRequest): Promise<void> {
-    return call<IdRequest, void>(MVU_IPC.deleteEffectGroup, request);
+  deleteEffectGroup(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    return call<RevisionedIdRequest, DeleteMutationResponse>(MVU_IPC.deleteEffectGroup, request);
   },
-  getEffectGroupReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
-    return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getEffectGroupReferences, request);
+  getEffectGroupReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
+    return call<ReferenceQueryRequest, QueryResponse<EntityReferenceSummary>>(MVU_IPC.getEffectGroupReferences, request);
   },
-  createRule(request: CreateRuleRequest): Promise<RuleDefinitionV3> {
-    return call<CreateRuleRequest, RuleDefinitionV3>(MVU_IPC.createRule, request);
+  createRule(request: CreateRuleRequest): Promise<MutationResponse<RuleDefinitionV3>> {
+    return call<CreateRuleRequest, MutationResponse<RuleDefinitionV3>>(MVU_IPC.createRule, request);
   },
-  updateRule(request: UpdateRuleRequest): Promise<void> {
-    return call<UpdateRuleRequest, void>(MVU_IPC.updateRule, request);
+  updateRule(request: UpdateRuleRequest): Promise<MutationResponse<RuleDefinitionV3>> {
+    return call<UpdateRuleRequest, MutationResponse<RuleDefinitionV3>>(MVU_IPC.updateRule, request);
   },
-  copyRule(request: IdRequest): Promise<RuleDefinitionV3> {
-    return call<IdRequest, RuleDefinitionV3>(MVU_IPC.copyRule, request);
+  copyRule(request: RevisionedIdRequest): Promise<MutationResponse<RuleDefinitionV3>> {
+    return call<RevisionedIdRequest, MutationResponse<RuleDefinitionV3>>(MVU_IPC.copyRule, request);
   },
-  toggleRule(request: ToggleEntityRequest): Promise<void> {
-    return call<ToggleEntityRequest, void>(MVU_IPC.toggleRule, request);
+  toggleRule(request: ToggleEntityRequest): Promise<MutationResponse<RuleDefinitionV3>> {
+    return call<ToggleEntityRequest, MutationResponse<RuleDefinitionV3>>(MVU_IPC.toggleRule, request);
   },
-  deleteRule(request: IdRequest): Promise<void> {
-    return call<IdRequest, void>(MVU_IPC.deleteRule, request);
+  deleteRule(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    return call<RevisionedIdRequest, DeleteMutationResponse>(MVU_IPC.deleteRule, request);
   },
   getRuleReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
     return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getRuleReferences, request);

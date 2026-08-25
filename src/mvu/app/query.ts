@@ -2,6 +2,7 @@ import { klona } from "../port/util";
 import type { DataActor, DataChangeRecord, DataField, MvuSettings, StateScopeContext } from "./model";
 import type {
   ConditionDefinition,
+  ConditionExpression,
   EffectGroupDefinition,
   MvuDatasetV3,
   RuleDefinitionV3,
@@ -11,8 +12,11 @@ import type { MigrationStatus, V3MvuStoreSnapshot } from "./store-v3";
 import { assertMvuDatasetV3 } from "./validation";
 
 export const QUERY_SEARCH_MAX_LENGTH = 120;
-export const QUERY_CURSOR_MAX_LENGTH = 2_048;
+export const QUERY_CURSOR_MAX_LENGTH = 96;
 export const PICKER_BATCH_SIZE = 30;
+export const ENTITY_ID_MAX_LENGTH = 256;
+const DEFAULT_CURSOR_TTL_MS = 5 * 60_000;
+const DEFAULT_CURSOR_CAPACITY = 128;
 
 const MANAGEMENT_PAGE_SIZES = {
   fields: 5,
@@ -60,6 +64,28 @@ export interface EntityReferenceSummary {
   relation: "references" | "referenced_by" | "active_instance";
 }
 
+export interface RevisionedRequest {
+  expectedRevision: number;
+}
+
+export interface RevisionedIdRequest extends RevisionedRequest {
+  id: string;
+}
+
+export interface ReferenceQueryRequest {
+  id: string;
+  page?: number;
+}
+
+export interface MutationResponse<TEntity = never> {
+  revision: number;
+  entity: TEntity;
+}
+
+export interface DeleteMutationResponse {
+  revision: number;
+}
+
 export type ConditionInput = Omit<ConditionDefinition, "id" | "createdAt" | "updatedAt">;
 export type ConditionPatch = Partial<ConditionInput>;
 export type EffectGroupInput = Omit<EffectGroupDefinition, "id" | "createdAt" | "updatedAt">;
@@ -83,7 +109,10 @@ export interface MvuQuerySource {
 
 export interface MvuQueryServiceOptions {
   now?: () => number;
-  createId?: (prefix: "condition" | "effect_group" | "rule" | "field_effect") => string;
+  createId?: (prefix: GeneratedIdPrefix) => string;
+  createCursorToken?: () => string;
+  cursorTtlMs?: number;
+  cursorCapacity?: number;
 }
 
 export interface MvuCompactPageSnapshot {
@@ -113,12 +142,15 @@ export interface MvuCompactPageSnapshot {
   };
 }
 
-interface CursorPayload {
-  version: 1;
-  entity: "fields" | "actors" | "groups";
+type CursorEntity = "fields" | "actors" | "groups";
+type GeneratedIdPrefix = "condition" | "effect_group" | "rule" | "field_effect" | "ai_predicate";
+
+interface CursorState {
+  entity: CursorEntity;
   fingerprint: string;
   anchorValue: Sortable;
   anchorId: string;
+  expiresAt: number;
 }
 
 type Sortable = string | number | boolean;
@@ -127,6 +159,10 @@ type FilterValue = string | boolean | number;
 export class MvuQueryService {
   private readonly now: () => number;
   private readonly createId: NonNullable<MvuQueryServiceOptions["createId"]>;
+  private readonly createCursorToken: NonNullable<MvuQueryServiceOptions["createCursorToken"]>;
+  private readonly cursorTtlMs: number;
+  private readonly cursorCapacity: number;
+  private readonly cursors = new Map<string, CursorState>();
 
   constructor(
     private readonly source: MvuQuerySource,
@@ -134,6 +170,9 @@ export class MvuQueryService {
   ) {
     this.now = options.now ?? Date.now;
     this.createId = options.createId ?? defaultId;
+    this.createCursorToken = options.createCursorToken ?? defaultCursorToken;
+    this.cursorTtlMs = positiveSafeInteger(options.cursorTtlMs, DEFAULT_CURSOR_TTL_MS);
+    this.cursorCapacity = positiveSafeInteger(options.cursorCapacity, DEFAULT_CURSOR_CAPACITY);
   }
 
   async queryFields(request: QueryRequest): Promise<QueryResponse<DataField>> {
@@ -170,7 +209,7 @@ export class MvuQueryService {
       },
       searchText: (item) => [item.id, item.name, item.description, ...item.bindingIds],
       id: (item) => item.id,
-    });
+    }, this.cursorAccess());
   }
 
   async queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
@@ -194,7 +233,7 @@ export class MvuQueryService {
       ),
       searchText: (item) => [item.characterId, item.name],
       id: (item) => item.characterId,
-    });
+    }, this.cursorAccess());
   }
 
   async queryGroups(request: QueryRequest): Promise<QueryResponse<QueryGroup>> {
@@ -212,7 +251,7 @@ export class MvuQueryService {
       filterKeys: {},
       searchText: (item) => [item.characterGroupId, item.name],
       id: (item) => item.characterGroupId,
-    });
+    }, this.cursorAccess());
   }
 
   async queryRules(request: QueryRequest): Promise<QueryResponse<RuleDefinitionV3>> {
@@ -397,60 +436,61 @@ export class MvuQueryService {
     };
   }
 
-  createCondition(request: { condition: ConditionInput }): Promise<ConditionDefinition> {
-    return this.createEntity("condition", request.condition, (draft, created) => draft.conditions.push(created));
+  createCondition(request: RevisionedRequest & { condition: ConditionInput }): Promise<MutationResponse<ConditionDefinition>> {
+    return this.createEntity(request.expectedRevision, "condition", request.condition, (draft, created) => draft.conditions.push(created));
   }
 
-  updateCondition(request: { id: string; patch: ConditionPatch }): Promise<void> {
-    return this.updateEntity("condition", request.id, request.patch, (draft) => draft.conditions);
+  updateCondition(request: RevisionedIdRequest & { patch: ConditionPatch }): Promise<MutationResponse<ConditionDefinition>> {
+    return this.updateEntity(request.expectedRevision, "condition", request.id, request.patch, (draft) => draft.conditions);
   }
 
-  copyCondition(request: { id: string }): Promise<ConditionDefinition> {
-    return this.copyEntity("condition", request.id, (draft) => draft.conditions);
+  copyCondition(request: RevisionedIdRequest): Promise<MutationResponse<ConditionDefinition>> {
+    return this.copyEntity(request.expectedRevision, "condition", request.id, (draft) => draft.conditions);
   }
 
-  toggleCondition(request: { id: string; enabled: boolean }): Promise<void> {
-    return this.updateCondition({ id: request.id, patch: { enabled: request.enabled } });
+  toggleCondition(request: RevisionedIdRequest & { enabled: boolean }): Promise<MutationResponse<ConditionDefinition>> {
+    return this.updateCondition({ id: request.id, expectedRevision: request.expectedRevision, patch: { enabled: request.enabled } });
   }
 
-  async deleteCondition(request: { id: string }): Promise<void> {
-    await this.mutate((draft) => {
+  async deleteCondition(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    const committed = await this.mutate(request.expectedRevision, (draft) => {
       if (draft.rules.some((rule) => rule.conditionId === request.id)) {
         throw new Error("MVU_CONDITION_REFERENCED");
       }
       removeRequired(draft.conditions, request.id, "MVU_CONDITION_NOT_FOUND");
     });
+    return { revision: committed.revision };
   }
 
-  async getConditionReferences(request: { id: string }): Promise<EntityReferenceSummary[]> {
+  async getConditionReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
     const dataset = (await this.source.readV3()).dataset;
     requireById(dataset.conditions, request.id, "MVU_CONDITION_NOT_FOUND");
-    return sortReferences(dataset.rules.filter((rule) => rule.conditionId === request.id).map((rule) => ({
+    return pageReferences(sortReferences(dataset.rules.filter((rule) => rule.conditionId === request.id).map((rule) => ({
       entityType: "rule" as const,
       id: rule.id,
       name: rule.name,
       relation: "referenced_by" as const,
-    })));
+    }))), request.page);
   }
 
-  createEffectGroup(request: { effectGroup: EffectGroupInput }): Promise<EffectGroupDefinition> {
-    return this.createEntity("effect_group", request.effectGroup, (draft, created) => draft.effectGroups.push(created));
+  createEffectGroup(request: RevisionedRequest & { effectGroup: EffectGroupInput }): Promise<MutationResponse<EffectGroupDefinition>> {
+    return this.createEntity(request.expectedRevision, "effect_group", request.effectGroup, (draft, created) => draft.effectGroups.push(created));
   }
 
-  updateEffectGroup(request: { id: string; patch: EffectGroupPatch }): Promise<void> {
-    return this.updateEntity("effect_group", request.id, request.patch, (draft) => draft.effectGroups);
+  updateEffectGroup(request: RevisionedIdRequest & { patch: EffectGroupPatch }): Promise<MutationResponse<EffectGroupDefinition>> {
+    return this.updateEntity(request.expectedRevision, "effect_group", request.id, request.patch, (draft) => draft.effectGroups);
   }
 
-  copyEffectGroup(request: { id: string }): Promise<EffectGroupDefinition> {
-    return this.copyEntity("effect_group", request.id, (draft) => draft.effectGroups);
+  copyEffectGroup(request: RevisionedIdRequest): Promise<MutationResponse<EffectGroupDefinition>> {
+    return this.copyEntity(request.expectedRevision, "effect_group", request.id, (draft) => draft.effectGroups);
   }
 
-  toggleEffectGroup(request: { id: string; enabled: boolean }): Promise<void> {
-    return this.updateEffectGroup({ id: request.id, patch: { enabled: request.enabled } });
+  toggleEffectGroup(request: RevisionedIdRequest & { enabled: boolean }): Promise<MutationResponse<EffectGroupDefinition>> {
+    return this.updateEffectGroup({ id: request.id, expectedRevision: request.expectedRevision, patch: { enabled: request.enabled } });
   }
 
-  async deleteEffectGroup(request: { id: string }): Promise<void> {
-    await this.mutate((draft) => {
+  async deleteEffectGroup(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    const committed = await this.mutate(request.expectedRevision, (draft) => {
       const ruleReference = draft.rules.some((rule) => rule.actions.some((action) =>
         action.kind === "activate_effect_group"
           ? action.effectGroupId === request.id
@@ -460,9 +500,10 @@ export class MvuQueryService {
       }
       removeRequired(draft.effectGroups, request.id, "MVU_EFFECT_GROUP_NOT_FOUND");
     });
+    return { revision: committed.revision };
   }
 
-  async getEffectGroupReferences(request: { id: string }): Promise<EntityReferenceSummary[]> {
+  async getEffectGroupReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
     const dataset = (await this.source.readV3()).dataset;
     requireById(dataset.effectGroups, request.id, "MVU_EFFECT_GROUP_NOT_FOUND");
     const ruleReferences = dataset.rules.filter((rule) => rule.actions.some((action) =>
@@ -481,27 +522,28 @@ export class MvuQueryService {
       name: instance.reason.text,
       relation: "active_instance" as const,
     }));
-    return sortReferences([...ruleReferences, ...activeReferences]);
+    return pageReferences(sortReferences([...ruleReferences, ...activeReferences]), request.page);
   }
 
-  createRule(request: { rule: RuleInput }): Promise<RuleDefinitionV3> {
-    return this.createEntity("rule", request.rule, (draft, created) => draft.rules.push(created));
+  createRule(request: RevisionedRequest & { rule: RuleInput }): Promise<MutationResponse<RuleDefinitionV3>> {
+    return this.createEntity(request.expectedRevision, "rule", request.rule, (draft, created) => draft.rules.push(created));
   }
 
-  updateRule(request: { id: string; patch: RulePatch }): Promise<void> {
-    return this.updateEntity("rule", request.id, request.patch, (draft) => draft.rules);
+  updateRule(request: RevisionedIdRequest & { patch: RulePatch }): Promise<MutationResponse<RuleDefinitionV3>> {
+    return this.updateEntity(request.expectedRevision, "rule", request.id, request.patch, (draft) => draft.rules);
   }
 
-  copyRule(request: { id: string }): Promise<RuleDefinitionV3> {
-    return this.copyEntity("rule", request.id, (draft) => draft.rules);
+  copyRule(request: RevisionedIdRequest): Promise<MutationResponse<RuleDefinitionV3>> {
+    return this.copyEntity(request.expectedRevision, "rule", request.id, (draft) => draft.rules);
   }
 
-  toggleRule(request: { id: string; enabled: boolean }): Promise<void> {
-    return this.updateRule({ id: request.id, patch: { enabled: request.enabled } });
+  toggleRule(request: RevisionedIdRequest & { enabled: boolean }): Promise<MutationResponse<RuleDefinitionV3>> {
+    return this.updateRule({ id: request.id, expectedRevision: request.expectedRevision, patch: { enabled: request.enabled } });
   }
 
-  async deleteRule(request: { id: string }): Promise<void> {
-    await this.mutate((draft) => removeRequired(draft.rules, request.id, "MVU_RULE_NOT_FOUND"));
+  async deleteRule(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    const committed = await this.mutate(request.expectedRevision, (draft) => removeRequired(draft.rules, request.id, "MVU_RULE_NOT_FOUND"));
+    return { revision: committed.revision };
   }
 
   async getRuleReferences(request: { id: string }): Promise<EntityReferenceSummary[]> {
@@ -541,49 +583,56 @@ export class MvuQueryService {
     TInput extends object,
     TEntity extends TInput & { id: string; createdAt: string; updatedAt: string },
   >(
+    expectedRevision: number,
     prefix: "condition" | "effect_group" | "rule",
     input: TInput,
     append: (draft: MvuDatasetV3, created: TEntity) => void,
-  ): Promise<TEntity> {
-    let result: TEntity | undefined;
-    await this.mutate((draft) => {
+  ): Promise<MutationResponse<TEntity>> {
+    const id = this.createId(prefix);
+    const committed = await this.mutate(expectedRevision, (draft) => {
       const timestamp = new Date(this.now()).toISOString();
-      result = {
+      const result = {
         ...klona(input),
-        id: this.createId(prefix),
+        id,
         createdAt: timestamp,
         updatedAt: timestamp,
       } as TEntity;
       append(draft, result);
     });
-    if (result === undefined) throw new Error("MVU_ENTITY_CREATE_FAILED");
-    return klona(result);
+    const result = requireById(entityCollection<TEntity>(committed.dataset, prefix), id, "MVU_ENTITY_CREATE_FAILED");
+    return { revision: committed.revision, entity: klona(result) };
   }
 
   private async updateEntity<TEntity extends { id: string; updatedAt: string }>(
+    expectedRevision: number,
     prefix: "condition" | "effect_group" | "rule",
     id: string,
     patch: object,
     select: (draft: MvuDatasetV3) => TEntity[],
-  ): Promise<void> {
-    await this.mutate((draft) => {
+  ): Promise<MutationResponse<TEntity>> {
+    const committed = await this.mutate(expectedRevision, (draft) => {
       const entity = requireById(select(draft), id, `MVU_${prefix.toUpperCase()}_NOT_FOUND`);
       Object.assign(entity, klona(patch), { updatedAt: new Date(this.now()).toISOString() });
     });
+    return {
+      revision: committed.revision,
+      entity: klona(requireById(select(committed.dataset), id, `MVU_${prefix.toUpperCase()}_NOT_FOUND`)),
+    };
   }
 
   private async copyEntity<TEntity extends { id: string; name: string; createdAt: string; updatedAt: string }>(
+    expectedRevision: number,
     prefix: "condition" | "effect_group" | "rule",
     id: string,
     select: (draft: MvuDatasetV3) => TEntity[],
-  ): Promise<TEntity> {
-    let result: TEntity | undefined;
-    await this.mutate((draft) => {
+  ): Promise<MutationResponse<TEntity>> {
+    const copiedId = this.createId(prefix);
+    const committed = await this.mutate(expectedRevision, (draft) => {
       const source = requireById(select(draft), id, `MVU_${prefix.toUpperCase()}_NOT_FOUND`);
       const timestamp = new Date(this.now()).toISOString();
-      result = {
+      const result = {
         ...klona(source),
-        id: this.createId(prefix),
+        id: copiedId,
         name: `${source.name} 副本`,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -595,23 +644,80 @@ export class MvuQueryService {
           id: this.createId("field_effect"),
         }));
       }
+      if (prefix === "condition") {
+        const condition = result as unknown as ConditionDefinition;
+        condition.expression = copyConditionExpression(condition.expression, this.createId);
+      }
       select(draft).push(result);
     });
-    if (result === undefined) throw new Error("MVU_ENTITY_COPY_FAILED");
-    return klona(result);
+    const result = requireById(select(committed.dataset), copiedId, "MVU_ENTITY_COPY_FAILED");
+    return { revision: committed.revision, entity: klona(result) };
   }
 
-  private async mutate(change: (draft: MvuDatasetV3) => void): Promise<void> {
+  private async mutate(expectedRevision: number, change: (draft: MvuDatasetV3) => void): Promise<V3MvuStoreSnapshot> {
+    requireExpectedRevision(expectedRevision);
     const snapshot = await this.source.readV3();
+    if (snapshot.revision !== expectedRevision) {
+      throw new Error(`MVU_STALE_REVISION:${expectedRevision}:${snapshot.revision}`);
+    }
     const draft = klona(snapshot.dataset);
     change(draft);
     assertMvuDatasetV3(draft);
-    await this.source.transactV3(snapshot.revision, draft, []);
+    return this.source.transactV3(expectedRevision, draft, []);
+  }
+
+  private cursorAccess(): CursorAccess {
+    return {
+      issue: (state) => this.issueCursor(state),
+      resolve: (token, entity, fingerprint) => this.resolveCursor(token, entity, fingerprint),
+    };
+  }
+
+  private issueCursor(state: Omit<CursorState, "expiresAt">): string {
+    this.purgeExpiredCursors();
+    while (this.cursors.size >= this.cursorCapacity) {
+      const oldest = this.cursors.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.cursors.delete(oldest);
+    }
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const opaque = this.createCursorToken();
+      const token = `c1_${opaque}`;
+      if (!/^c1_[A-Za-z0-9_-]{1,80}$/.test(token) || token.length > QUERY_CURSOR_MAX_LENGTH) {
+        throw new Error("MVU_QUERY_CURSOR_TOKEN_INVALID");
+      }
+      if (this.cursors.has(token)) continue;
+      this.cursors.set(token, { ...state, expiresAt: this.now() + this.cursorTtlMs });
+      return token;
+    }
+    throw new Error("MVU_QUERY_CURSOR_TOKEN_COLLISION");
+  }
+
+  private resolveCursor(token: string, entity: CursorEntity, fingerprint: string): CursorState {
+    if (token.length > QUERY_CURSOR_MAX_LENGTH || !/^c1_[A-Za-z0-9_-]{1,80}$/.test(token)) {
+      throw new Error("MVU_QUERY_CURSOR_INVALID");
+    }
+    const state = this.cursors.get(token);
+    if (state === undefined || state.expiresAt <= this.now() ||
+      state.entity !== entity || state.fingerprint !== fingerprint) {
+      if (state !== undefined && state.expiresAt <= this.now()) this.cursors.delete(token);
+      throw new Error("MVU_QUERY_CURSOR_INVALID");
+    }
+    this.cursors.delete(token);
+    this.cursors.set(token, state);
+    return state;
+  }
+
+  private purgeExpiredCursors(): void {
+    const now = this.now();
+    for (const [token, state] of this.cursors) {
+      if (state.expiresAt <= now) this.cursors.delete(token);
+    }
   }
 }
 
 interface CollectionQueryOptions<T> {
-  entity: CursorPayload["entity"] | "rules" | "conditions" | "effectGroups";
+  entity: CursorEntity | "rules" | "conditions" | "effectGroups";
   items: readonly T[];
   request: QueryRequest;
   pageSize: number;
@@ -624,7 +730,12 @@ interface CollectionQueryOptions<T> {
   id: (item: T) => string;
 }
 
-function queryCollection<T>(options: CollectionQueryOptions<T>): QueryResponse<T> {
+interface CursorAccess {
+  issue(state: Omit<CursorState, "expiresAt">): string;
+  resolve(token: string, entity: CursorEntity, fingerprint: string): CursorState;
+}
+
+function queryCollection<T>(options: CollectionQueryOptions<T>, cursors?: CursorAccess): QueryResponse<T> {
   validateQueryRequest(options.request, {
     cursor: options.cursor,
     sortKeys: Object.keys(options.sortKeys),
@@ -652,6 +763,7 @@ function queryCollection<T>(options: CollectionQueryOptions<T>): QueryResponse<T
     options.sortKeys[sort.key],
     sort.direction,
     options.id,
+    cursors,
   );
 }
 
@@ -666,7 +778,7 @@ function queryCollectionFromValidated<T>(
   id: (item: T) => string,
 ): QueryResponse<T> {
   const sorted = [...items].sort(stableComparator(sortKeys[sort.key], sort.direction, id));
-  return sliceCollection(entity, sorted, request, pageSize, cursor, sortKeys[sort.key], sort.direction, id);
+  return sliceCollection(entity, sorted, request, pageSize, cursor, sortKeys[sort.key], sort.direction, id, undefined);
 }
 
 function sliceCollection<T>(
@@ -678,13 +790,17 @@ function sliceCollection<T>(
   sortValue: (item: T) => Sortable,
   direction: "asc" | "desc",
   id: (item: T) => string,
+  cursors: CursorAccess | undefined,
 ): QueryResponse<T> {
   const fingerprint = queryFingerprint(request);
   let offset = ((request.page ?? 1) - 1) * pageSize;
   if (cursor) {
     offset = 0;
     if (request.cursor !== undefined) {
-      const anchor = decodeCursor(request.cursor, entity, fingerprint);
+      if (cursors === undefined || (entity !== "fields" && entity !== "actors" && entity !== "groups")) {
+        throw new Error("MVU_QUERY_CURSOR_INVALID");
+      }
+      const anchor = cursors.resolve(request.cursor, entity, fingerprint);
       const next = sorted.findIndex((item) =>
         compareToAnchor(item, anchor, sortValue, direction, id) > 0);
       offset = next < 0 ? sorted.length : next;
@@ -699,27 +815,26 @@ function sliceCollection<T>(
     totalCount: sorted.length,
     hasMore,
     nextCursor: cursor && hasMore && last !== undefined
-      ? encodeCursor({
-          version: 1,
-          entity: entity as CursorPayload["entity"],
+      ? (cursors?.issue({
+          entity: entity as CursorEntity,
           fingerprint,
           anchorValue: sortValue(last),
           anchorId: id(last),
-        })
+        }) ?? null)
       : null,
   };
 }
 
 function compareToAnchor<T>(
   item: T,
-  anchor: CursorPayload,
+  anchor: CursorState,
   sortValue: (item: T) => Sortable,
   direction: "asc" | "desc",
   id: (item: T) => string,
 ): number {
   const primary = compareSortable(sortValue(item), anchor.anchorValue);
   if (primary !== 0) return direction === "asc" ? primary : -primary;
-  return compareText(id(item), anchor.anchorId);
+  return compareRawId(id(item), anchor.anchorId);
 }
 
 function stableComparator<T>(
@@ -731,7 +846,7 @@ function stableComparator<T>(
   return (left, right) => {
     const comparison = compareSortable(value(left), value(right));
     if (comparison !== 0) return direction === "asc" ? comparison : -comparison;
-    return compareText(id(left), id(right));
+    return compareRawId(id(left), id(right));
   };
 }
 
@@ -745,6 +860,10 @@ function compareText(left: string, right: string): number {
   const normalizedLeft = normalizeSearch(left);
   const normalizedRight = normalizeSearch(right);
   return normalizedLeft < normalizedRight ? -1 : normalizedLeft > normalizedRight ? 1 : 0;
+}
+
+function compareRawId(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function normalizeSearch(value: string): string {
@@ -802,40 +921,14 @@ function isNonEmptyFilterString(value: FilterValue): boolean {
 }
 
 function queryFingerprint(request: QueryRequest): string {
-  const filters = Object.entries(request.filters ?? {}).sort(([left], [right]) => compareText(left, right));
+  const filters = Object.entries(request.filters ?? {})
+    .map(([key, value]) => [key, typeof value === "string" ? normalizeSearch(value) : value] as const)
+    .sort(([left], [right]) => compareRawId(left, right));
   return JSON.stringify({
     search: normalizeSearch(request.search ?? ""),
     filters,
     sort: request.sort ?? null,
   });
-}
-
-function encodeCursor(payload: CursorPayload): string {
-  return `v1:${encodeURIComponent(JSON.stringify(payload))}`;
-}
-
-function decodeCursor(cursor: string, entity: string, fingerprint: string): CursorPayload {
-  if (!cursor.startsWith("v1:")) throw new Error("MVU_QUERY_CURSOR_INVALID");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(decodeURIComponent(cursor.slice(3)));
-  } catch {
-    throw new Error("MVU_QUERY_CURSOR_INVALID");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("MVU_QUERY_CURSOR_INVALID");
-  }
-  const candidate = parsed as Partial<CursorPayload>;
-  const anchorType = typeof candidate.anchorValue;
-  if (Object.keys(parsed).length !== 5 || candidate.version !== 1 || candidate.entity !== entity ||
-    candidate.fingerprint !== fingerprint ||
-    (anchorType !== "string" && anchorType !== "number" && anchorType !== "boolean") ||
-    (anchorType === "number" && !Number.isFinite(candidate.anchorValue)) ||
-    typeof candidate.anchorId !== "string" || candidate.anchorId.length === 0 ||
-    candidate.anchorId.length > 256) {
-    throw new Error("MVU_QUERY_CURSOR_INVALID");
-  }
-  return candidate as CursorPayload;
 }
 
 function ruleReferencesActor(rule: RuleDefinitionV3, value: FilterValue): boolean {
@@ -875,20 +968,81 @@ function removeRequired<TEntity extends { id: string }>(items: TEntity[], id: st
 }
 
 function requireEntityId(id: string): void {
-  if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+  if (typeof id !== "string" || id.length === 0 || id.length > ENTITY_ID_MAX_LENGTH) {
     throw new Error("MVU_ENTITY_ID_INVALID");
   }
 }
 
 function sortReferences(references: EntityReferenceSummary[]): EntityReferenceSummary[] {
   return references.sort((left, right) =>
-    compareText(left.entityType, right.entityType) || compareText(left.id, right.id));
+    compareText(left.entityType, right.entityType) || compareRawId(left.id, right.id));
+}
+
+function pageReferences(
+  references: readonly EntityReferenceSummary[],
+  page = 1,
+): QueryResponse<EntityReferenceSummary> {
+  if (!Number.isSafeInteger(page) || page < 1) throw new Error("MVU_QUERY_PAGE_INVALID");
+  const offset = (page - 1) * MANAGEMENT_PAGE_SIZES.conditions;
+  const items = references.slice(offset, offset + MANAGEMENT_PAGE_SIZES.conditions).map((item) => klona(item));
+  return {
+    items,
+    loadedCount: items.length,
+    totalCount: references.length,
+    hasMore: offset + items.length < references.length,
+    nextCursor: null,
+  };
+}
+
+function entityCollection<TEntity extends { id: string }>(
+  dataset: MvuDatasetV3,
+  prefix: "condition" | "effect_group" | "rule",
+): TEntity[] {
+  if (prefix === "condition") return dataset.conditions as unknown as TEntity[];
+  if (prefix === "effect_group") return dataset.effectGroups as unknown as TEntity[];
+  return dataset.rules as unknown as TEntity[];
+}
+
+function copyConditionExpression(
+  expression: ConditionExpression,
+  createId: (prefix: GeneratedIdPrefix) => string,
+): ConditionExpression {
+  if (expression.kind === "and" || expression.kind === "or") {
+    return {
+      kind: expression.kind,
+      children: expression.children.map((child) => copyConditionExpression(child, createId)),
+    };
+  }
+  if (expression.kind === "not") {
+    return { kind: "not", child: copyConditionExpression(expression.child, createId) };
+  }
+  if (expression.predicate.kind !== "ai_semantic") return klona(expression);
+  return {
+    kind: "predicate",
+    predicate: { ...klona(expression.predicate), id: createId("ai_predicate") },
+  };
+}
+
+function requireExpectedRevision(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("MVU_EXPECTED_REVISION_INVALID");
+}
+
+function positiveSafeInteger(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 let generatedIdSequence = 0;
 
-function defaultId(prefix: "condition" | "effect_group" | "rule" | "field_effect"): string {
+function defaultId(prefix: GeneratedIdPrefix): string {
   generatedIdSequence += 1;
   if (!Number.isSafeInteger(generatedIdSequence)) generatedIdSequence = 1;
   return `${prefix}_${Date.now().toString(36)}_${generatedIdSequence.toString(36)}`;
+}
+
+function defaultCursorToken(): string {
+  return `${randomTokenPart()}${randomTokenPart()}${randomTokenPart()}${randomTokenPart()}`;
+}
+
+function randomTokenPart(): string {
+  return Math.floor(Math.random() * 0x1_0000_0000).toString(36).padStart(7, "0");
 }
