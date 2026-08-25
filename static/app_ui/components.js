@@ -156,8 +156,8 @@
 
   function listMeta(page, noun, currentPage, pageSize, totalCount, filtered) {
     const allCount = Number.isSafeInteger(totalCount) ? totalCount : page.totalCount;
-    return '<p class="list-meta" aria-live="polite">已显示 ' + page.loadedCount + " / 匹配 " + page.totalCount +
-      " / 共 " + allCount + "</p>";
+    return '<p class="list-meta" aria-live="polite">已显示 ' + page.loadedCount + " " + noun + " / 匹配 " + page.totalCount +
+      " " + noun + " / 共 " + allCount + " " + noun + "</p>";
   }
 
   function listViewFiltered(view) {
@@ -169,9 +169,9 @@
   function pagination(page, route, currentPage) {
     const pageNumber = currentPage || 1;
     return '<nav class="pagination" aria-label="分页"><button type="button" data-page="' + (pageNumber - 1) + '" data-page-route="' +
-      ui.escapeHtml(route) + '"' + (pageNumber <= 1 ? " disabled" : "") + '>' + icon("chevron_left") + '上一页</button><span>第 ' +
+      ui.escapeHtml(route) + '" data-page-direction="previous"' + (pageNumber <= 1 ? " disabled" : "") + '>' + icon("chevron_left") + '上一页</button><span>第 ' +
       pageNumber + ' 页</span><button type="button" data-page="' + (pageNumber + 1) + '" data-page-route="' + ui.escapeHtml(route) + '"' +
-      (!page.hasMore ? " disabled" : "") + '>下一页' + icon("chevron_right") + "</button></nav>";
+      ' data-page-direction="next"' + (!page.hasMore ? " disabled" : "") + '>下一页' + icon("chevron_right") + "</button></nav>";
   }
 
   function renderEntityPicker(picker) {
@@ -217,7 +217,8 @@
       ? '<div class="picker-spacer" data-picker-spacer="after" aria-hidden="true" style="height:' + ((resultIds.length - end) * virtual.rowHeight) + 'px"></div>'
       : "";
     const error = picker.error
-      ? '<div class="picker-error" role="alert"><span>' + ui.escapeHtml(picker.error) + '</span><button type="button" data-action="retry-entity-picker">重试</button></div>'
+      ? '<div class="picker-error" role="alert"><span>' + ui.escapeHtml(picker.error) + '</span>' +
+        (picker.errorRetryable === false ? "" : '<button type="button" data-action="retry-entity-picker">重试</button>') + "</div>"
       : "";
     const status = picker.loading && picker.items.length === 0
         ? '<div class="picker-skeleton" aria-label="正在搜索"><i></i><i></i><i></i></div>'
@@ -251,9 +252,11 @@
     }
     if (picker.entity === "actors") {
       const groupId = ui.state.snapshot?.activeContext?.groupId || "";
+      const groupLocked = picker.lockedFilterKeys instanceof Set && picker.lockedFilterKeys.has("groupId");
       return '<div class="picker-filters" aria-label="角色筛选">' +
         pickerFilter("筛选启用状态", "enabled", filters.enabled, [["", "全部状态"], ["true", "可用"], ["false", "已停用"]], "boolean") +
-        (groupId ? pickerFilter("筛选成员范围", "groupId", filters.groupId, [["", "全部角色"], [groupId, "当前群成员"]]) : "") + "</div>";
+        (groupId ? pickerFilter("筛选成员范围", "groupId", filters.groupId,
+          groupLocked ? [[groupId, "当前群成员"]] : [["", "全部角色"], [groupId, "当前群成员"]], "string", groupLocked) : "") + "</div>";
     }
     if (picker.entity === "groups") {
       const actorId = ui.state.snapshot?.activeContext?.actorId || "";
@@ -263,10 +266,10 @@
     return "";
   }
 
-  function pickerFilter(ariaLabel, key, current, options, valueType) {
+  function pickerFilter(ariaLabel, key, current, options, valueType, disabled) {
     const value = current === undefined ? "" : String(current);
     return '<label><span class="visually-hidden">' + ariaLabel + '</span><select aria-label="' + ariaLabel + '" data-picker-filter="' + key + '"' +
-      (valueType ? ' data-filter-value-type="' + valueType + '"' : "") + '>' + options.map(function (option) {
+      (valueType ? ' data-filter-value-type="' + valueType + '"' : "") + (disabled ? " disabled" : "") + '>' + options.map(function (option) {
         return '<option value="' + ui.escapeHtml(option[0]) + '"' + (value === option[0] ? " selected" : "") + '>' + ui.escapeHtml(option[1]) + "</option>";
       }).join("") + "</select></label>";
   }

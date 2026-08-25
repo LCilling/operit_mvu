@@ -12,13 +12,16 @@
     ], groupMode ? "group" : "character", "data-status-mode", "状态范围") : "";
     const renderGroupSelector = c.groupSelector;
     const renderActorSelector = c.actorSelector;
+    const memberTotal = snapshot.activeContext.groupId !== null && Number.isSafeInteger(ui.state.directory.actorTotal)
+      ? ui.state.directory.actorTotal
+      : snapshot.counts.actors;
     const identitySelector = groupMode
       ? renderGroupSelector(ui.state.directory.groups, snapshot.activeContext.groupId)
       : renderActorSelector(ui.state.directory.actors, snapshot.activeContext.actorId);
     const finder = '<button type="button" class="identity-finder" data-action="' +
       (groupMode ? "open-status-group-picker" : "open-status-actor-picker") + '" data-picker-key="status-' +
       (groupMode ? "group" : "actor") + '-finder">' + c.icon(groupMode ? "group_search" : "person_search") +
-      '<span>查找' + (groupMode ? "群组" : "角色") + '（共 ' + (groupMode ? snapshot.counts.groups : snapshot.counts.actors) +
+      '<span>查找' + (groupMode ? "群组" : "角色") + '（共 ' + (groupMode ? snapshot.counts.groups : memberTotal) +
       "）</span></button>";
     const selected = groupMode ? snapshot.selected.group : snapshot.selected.actor;
     const identityName = selected && selected.name ? selected.name :

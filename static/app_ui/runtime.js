@@ -33,16 +33,15 @@
   const PICKER_WINDOW_OVERSCAN = 4;
   const PICKER_WINDOW_MAX_ROWS = 24;
   const PICKER_RETAINED_PAGE_LIMIT = 128;
-  const QUERY_TOTAL_MAX = 10_000;
   const QUERY_RESPONSE_POLICIES = {
-    fields: { method: "queryFields", pageSize: 5, pickerPageSize: 30 },
-    actors: { method: "queryActors", pageSize: 30, cursor: true },
-    groups: { method: "queryGroups", pageSize: 30, cursor: true },
-    rules: { method: "queryRules", pageSize: 5 },
-    conditions: { method: "queryConditions", pageSize: 10 },
-    effectgroups: { method: "queryEffectGroups", pageSize: 10 },
-    effects: { method: "queryEffectGroups", pageSize: 10 },
-    records: { method: "queryRecords", pageSize: 10 },
+    fields: { method: "queryFields", pageSize: 5, pickerPageSize: 30, maxTotal: Number.MAX_SAFE_INTEGER },
+    actors: { method: "queryActors", pageSize: 30, cursor: true, maxTotal: Number.MAX_SAFE_INTEGER },
+    groups: { method: "queryGroups", pageSize: 30, cursor: true, maxTotal: Number.MAX_SAFE_INTEGER },
+    rules: { method: "queryRules", pageSize: 5, maxTotal: Number.MAX_SAFE_INTEGER },
+    conditions: { method: "queryConditions", pageSize: 10, maxTotal: Number.MAX_SAFE_INTEGER },
+    effectgroups: { method: "queryEffectGroups", pageSize: 10, maxTotal: Number.MAX_SAFE_INTEGER },
+    effects: { method: "queryEffectGroups", pageSize: 10, maxTotal: Number.MAX_SAFE_INTEGER },
+    records: { method: "queryRecords", pageSize: 10, maxTotal: Number.MAX_SAFE_INTEGER },
   };
   const PICKER_ENTITIES = {
     fields: { method: "queryFields", label: "fields", idKey: "id", entityType: "field", cursor: true, filters: { mode: "picker" } },
@@ -59,7 +58,7 @@
     route: initialRoute,
     snapshot: null,
     pages: {},
-    directory: { actors: [], groups: [] },
+    directory: { actors: [], groups: [], actorTotal: 0, groupTotal: 0 },
     entities: new Map(),
     bindingLabels: new Map(),
     ruleLabels: new Map(),
@@ -208,7 +207,7 @@
     if (!isRecord(value) || !Array.isArray(value.items)) throw new Error(code);
     if (!nonNegativeInteger(value.loadedCount) || value.loadedCount !== value.items.length) throw new Error(code);
     if (value.loadedCount > policy.pageSize) throw new Error(code);
-    if (!nonNegativeInteger(value.totalCount) || value.totalCount < value.loadedCount || value.totalCount > QUERY_TOTAL_MAX) throw new Error(code);
+    if (!nonNegativeInteger(value.totalCount) || value.totalCount < value.loadedCount || value.totalCount > policy.maxTotal) throw new Error(code);
     if (typeof value.hasMore !== "boolean") throw new Error(code);
     if (value.nextCursor !== null && (typeof value.nextCursor !== "string" || value.nextCursor.length === 0 || value.nextCursor.length > 96)) {
       throw new Error(code);
@@ -713,29 +712,33 @@
     const opener = options.opener && typeof options.opener === "object"
       ? options.opener
       : document.activeElement || null;
+    const pickerFilters = { ...(definition.filters || {}), ...(options.filters || {}) };
     state.entityPicker = {
       entity: options.entity,
       definition,
       title: options.title || "选择项目",
       mode: options.mode === "multiple" ? "multiple" : "single",
       search: "",
-      filters: { ...(definition.filters || {}), ...(options.filters || {}) },
+      filters: pickerFilters,
+      lockedFilterKeys: new Set(Array.isArray(options.lockedFilterKeys) ? options.lockedFilterKeys : []),
       items: [],
       orderIds: [],
       itemById: new Map(),
       selectedIds,
       selectedItems,
       totalCount: 0,
-      allTotalCount: pickerAllTotalCount(options.entity),
+      allTotalCount: pickerAllTotalCount(options.entity, pickerFilters),
       hasMore: false,
       nextCursor: null,
       nextPage: 2,
       loading: false,
       error: "",
+      errorRetryable: true,
       requestToken: 0,
       seenCursors: new Set(),
       autoFetchBlocked: false,
       retainedPageLimit: PICKER_RETAINED_PAGE_LIMIT,
+      retainedPageCount: 0,
       expectedTotal: undefined,
       virtualWindow: {
         scrollTop: 0,
@@ -761,7 +764,10 @@
     return state.entityPicker;
   }
 
-  function pickerAllTotalCount(entity) {
+  function pickerAllTotalCount(entity, filters) {
+    if (entity === "actors" && filters?.groupId && nonNegativeInteger(state.directory.actorTotal)) {
+      return state.directory.actorTotal;
+    }
     const counts = state.snapshot && state.snapshot.counts;
     const key = entity === "effectGroups" ? "effectGroups" : entity;
     return counts && nonNegativeInteger(counts[key]) ? counts[key] : 0;
@@ -798,6 +804,7 @@
     if (!picker) return;
     picker.search = String(value == null ? "" : value);
     picker.error = "";
+    picker.errorRetryable = true;
     picker.autoFetchBlocked = false;
     if (picker.searchTimer) window.clearTimeout(picker.searchTimer);
     picker.searchTimer = window.setTimeout(function () {
@@ -809,6 +816,7 @@
   function updateEntityPickerFilter(key, rawValue, valueType) {
     const picker = state.entityPicker;
     if (!picker) return Promise.resolve(null);
+    if (picker.lockedFilterKeys?.has(key)) return Promise.reject(new Error("MVU_PICKER_FILTER_LOCKED"));
     const allowed = {
       fields: new Set(["scope", "type", "enabled"]),
       actors: new Set(["enabled", "groupId"]),
@@ -820,6 +828,7 @@
     else nextFilters[key] = valueType === "boolean" ? rawValue === "true" : String(rawValue);
     picker.filters = nextFilters;
     picker.error = "";
+    picker.errorRetryable = true;
     picker.autoFetchBlocked = false;
     return loadEntityPicker(true);
   }
@@ -858,6 +867,13 @@
   function fetchNextEntityPickerPage() {
     const picker = state.entityPicker;
     if (!picker || picker.loading || !picker.hasMore || picker.autoFetchBlocked) return Promise.resolve(false);
+    if (picker.retainedPageCount >= picker.retainedPageLimit) {
+      picker.error = "结果过多，已暂停继续读取。请缩小搜索范围。";
+      picker.errorRetryable = false;
+      picker.autoFetchBlocked = true;
+      renderIfReady();
+      return Promise.resolve(false);
+    }
     return loadEntityPicker(false).then(function () { return true; });
   }
 
@@ -885,10 +901,6 @@
         loadedCount: reset ? 0 : picker.orderIds.length,
       });
       if (state.entityPicker !== picker || token !== picker.requestToken) return null;
-      const retentionPageSize = queryResponsePolicy(picker.definition.method, request).pageSize;
-      if (response.totalCount > retentionPageSize * picker.retainedPageLimit) {
-        throw new Error("MVU_PICKER_RETENTION_LIMIT");
-      }
       if (reset) {
         picker.orderIds = [];
         picker.itemById.clear();
@@ -911,13 +923,16 @@
       picker.nextCursor = response.nextCursor;
       if (response.nextCursor !== null) picker.seenCursors.add(response.nextCursor);
       picker.nextPage = reset ? 2 : picker.nextPage + 1;
+      picker.retainedPageCount = reset ? 1 : picker.retainedPageCount + 1;
       picker.error = "";
+      picker.errorRetryable = true;
       picker.autoFetchBlocked = false;
       computePickerVirtualWindow(picker);
       return response;
     } catch (_error) {
       if (state.entityPicker !== picker || token !== picker.requestToken) return null;
       picker.error = "搜索失败，已保留所选项。请重试。";
+      picker.errorRetryable = true;
       picker.autoFetchBlocked = true;
       return null;
     } finally {
@@ -1109,6 +1124,8 @@
     ]);
     state.directory.actors = results[0].items;
     state.directory.groups = results[1].items;
+    state.directory.actorTotal = results[0].totalCount;
+    state.directory.groupTotal = results[1].totalCount;
   }
 
   async function loadRouteData(routeId) {
@@ -1184,9 +1201,13 @@
   function transition(update) {
     if (typeof document.startViewTransition === "function" &&
         !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      document.startViewTransition(update);
+      const viewTransition = document.startViewTransition(update);
+      return viewTransition && viewTransition.updateCallbackDone && typeof viewTransition.updateCallbackDone.then === "function"
+        ? Promise.resolve(viewTransition.updateCallbackDone)
+        : Promise.resolve();
     } else {
       update();
+      return Promise.resolve();
     }
   }
 
@@ -1248,11 +1269,7 @@
     if (method === "queryActors") {
       const groupId = params && params.filters && params.filters.groupId;
       const picker = isDemoPickerRequest(method, params);
-      const source = picker
-        ? (groupId ? demo.pickerActors.filter(function (_actor, index) {
-            return groupId === "group-b" ? index % 2 === 1 : index % 2 === 0;
-          }) : demo.pickerActors)
-        : (groupId ? (demo.groupMembers[groupId] || []) : demo.actors);
+      const source = groupId ? (demo.groupMembers[groupId] || []) : (picker ? demo.pickerActors : demo.actors);
       return demoPickerResponse(demoQuery(source, params, 30, "characterId", true, "actors"), params, picker, source);
     }
     if (method === "queryGroups") {
@@ -1441,11 +1458,16 @@
       return { characterGroupId: "picker-group-" + ordinal, name: "游标群组 " + ordinal, avatarUri: null };
     });
     const groupMembers = {
-      "group-a": actors,
-      "group-b": [actors[1]],
+      "group-a": actors.concat(pickerActors.filter(function (_actor, index) { return index % 2 === 0; })),
+      "group-b": [actors[1]].concat(pickerActors.filter(function (_actor, index) { return index % 2 === 1; })),
     };
     const requestedGroup = groups.concat(pickerGroups).find(function (group) { return group.characterGroupId === request.groupId; }) || groups[0];
-    const requestedActor = actors.concat(pickerActors).find(function (actor) { return actor.characterId === request.actorId; }) || null;
+    const requestedActorCandidate = actors.concat(pickerActors).find(function (actor) { return actor.characterId === request.actorId; }) || null;
+    const requestedMembers = groupMembers[requestedGroup.characterGroupId] || [];
+    const requestedActor = requestedActorCandidate && request.groupId &&
+        !requestedMembers.some(function (actor) { return actor.characterId === requestedActorCandidate.characterId; })
+      ? null
+      : requestedActorCandidate;
     const isGroupProjection = typeof request.groupId === "string" && !request.actorId;
     const activeActor = isGroupProjection ? null : (requestedActor || actors[0]);
     const value = isGroupProjection
