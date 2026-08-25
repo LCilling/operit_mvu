@@ -6,10 +6,11 @@ import type {
   EffectDuration,
   EffectGroupDefinition,
   EffectOperation,
+  EffectReasonConfig,
   EffectReasonSnapshot,
   ResolvedEffectTarget,
 } from "./model-v3";
-import type { ChangeSource } from "./model-v3";
+import { EFFECT_REASON_TEXT_MAX_LENGTH, type ChangeSource } from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
   renderEffectReasonText,
@@ -41,7 +42,8 @@ export interface ActivateEffectGroupInput {
   instanceId: string;
   activatedAt: string;
   duration?: EffectDuration;
-  reason: EffectReasonInput;
+  /** Omit to use the reusable definition default. */
+  reason?: EffectReasonInput;
   reasonVariables?: EffectReasonVariables;
   /** Values use the collision-safe `${scopeKey}\0${fieldId}` address. */
   currentValues?: Readonly<Record<string, number>>;
@@ -82,7 +84,15 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
   const diagnostics: EffectDiagnostic[] = [];
   const resolvedTargets: ResolvedEffectTarget[] = [];
   const immediateChanges: ImmediateFieldChange[] = [];
-  const reason = resolveEffectReason({ reason: input.reason, variables: input.reasonVariables });
+  const configuredReason: EffectReasonInput = input.reason ?? input.definition.defaultReason ?? DEFAULT_EFFECT_REASON;
+  const reason = resolveEffectReason({
+    reason: configuredReason,
+    variables: {
+      effectGroupName: input.definition.name,
+      fieldName: effectFieldNames(input.definition, input.fields),
+      ...input.reasonVariables,
+    },
+  });
   let activationBlocked = false;
 
   if (!input.definition.enabled) return { instances: [], immediateChanges, diagnostics };
@@ -210,6 +220,9 @@ export function resolveEffectReason(input: {
   if (input.reason.mode === "custom" && (input.reason.text?.trim().length ?? 0) === 0) {
     throw new Error("MVU_EFFECT_REASON_EMPTY");
   }
+  if ((input.reason.text?.length ?? 0) > EFFECT_REASON_TEXT_MAX_LENGTH) {
+    throw new Error("MVU_EFFECT_REASON_TOO_LONG");
+  }
   const sourceText = input.reason.mode === "custom"
     ? input.reason.text?.trim() ?? ""
     : TEMPORARY_EFFECT_REASON_TEMPLATES[input.reason.template];
@@ -218,6 +231,21 @@ export function resolveEffectReason(input: {
     template: input.reason.template,
     text: renderEffectReasonText(sourceText, input.variables),
   };
+}
+
+const DEFAULT_EFFECT_REASON: EffectReasonConfig = {
+  mode: "template",
+  template: "general",
+  text: "",
+};
+
+function effectFieldNames(
+  definition: EffectGroupDefinition,
+  fields: readonly DataField[],
+): string {
+  const names = definition.fieldEffects.map((fieldEffect) =>
+    fields.find((field) => field.id === fieldEffect.fieldId)?.name ?? fieldEffect.fieldId);
+  return [...new Set(names)].join("、");
 }
 
 function resolveTargets(

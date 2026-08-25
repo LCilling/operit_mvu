@@ -18,6 +18,7 @@ import type {
 } from "./model-v3";
 import { assertMvuDatasetV3, normalizeMvuDataset } from "./validation";
 import { hydrateLegacyActiveEffectSnapshots } from "./effect-engine";
+import { resolveTemporaryEffectReason } from "./temporary-effect";
 
 const HOURS_IN_MILLISECONDS = 3_600_000;
 const ALL_CHANGE_SOURCES = ["manual", "natural", "per_turn", "rule", "ai"] as const;
@@ -153,6 +154,11 @@ function migrateEffectGroup(effect: DataTemporaryEffect): EffectGroupDefinition 
         ? { kind: "fixed_adjustment", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }
         : { kind: "all_multiplier", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }],
     })),
+    defaultReason: {
+      mode: effect.reasonMode,
+      template: effect.reasonTemplate,
+      text: effect.reason,
+    },
     createdAt,
     updatedAt: createdAt,
   };
@@ -195,7 +201,7 @@ function reasonSnapshot(effect: DataTemporaryEffect): EffectReasonSnapshot {
   return {
     mode: effect.reasonMode,
     template: effect.reasonTemplate,
-    text: effect.reasonMode === "custom" ? effect.reason : effect.reasonTemplate,
+    text: resolveTemporaryEffectReason(effect),
   };
 }
 

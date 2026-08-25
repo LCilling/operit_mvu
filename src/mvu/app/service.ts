@@ -297,12 +297,11 @@ export async function processPersistedMessageV3(
       triggerActorId: input.context.actorId ?? undefined,
       instanceId: v3EffectInstanceId(messageKey, executed.ruleId, executed.actionIndex),
       activatedAt: new Date(input.occurredAt).toISOString(),
-      reason: { mode: "template", template: "general" },
       reasonVariables: {
         triggerActorName: input.context.actorName,
         ruleName: executed.ruleName,
         effectGroupName: definition.name,
-        event: "message",
+        event: input.content,
       },
       currentValues: flattenV3StateValues(draft),
     });
@@ -325,6 +324,7 @@ export async function processPersistedMessageV3(
         effectId: activation.instances[0]?.id ?? null,
         ruleId: executed.ruleId,
         ruleName: executed.ruleName,
+        effectReason: activation.instances[0]?.reason.text ?? definition.name,
         input,
         recordId: v3RecordId(messageKey, recordSequence),
       });
@@ -1523,6 +1523,7 @@ function applyV3ImmediateChange(input: {
   effectId: string | null;
   ruleId: string;
   ruleName: string;
+  effectReason: string;
   input: PersistedMessageV3Input;
   recordId: string;
 }): DataChangeRecord | null {
@@ -1540,7 +1541,7 @@ function applyV3ImmediateChange(input: {
     requestedDelta: input.delta,
     effectiveRequestedDelta: input.delta,
     effectIds: input.effectId === null ? [] : [input.effectId],
-    reason: `规则触发：${input.ruleName}；激活效果组`,
+    reason: `规则触发：${input.ruleName}；效果：${input.effectReason}`,
     ruleId: input.ruleId,
     input: input.input,
     recordId: input.recordId,

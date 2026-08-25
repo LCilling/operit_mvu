@@ -65,12 +65,22 @@ export interface EffectDuration {
   remainingTurns: number | null;
 }
 
+export const EFFECT_REASON_TEXT_MAX_LENGTH = 512;
+
+/** Reusable reason source. Template text is retained for lossless v2 compatibility but ignored when rendered. */
+export interface EffectReasonConfig {
+  mode: "template" | "custom";
+  template: TemporaryEffectReasonTemplate;
+  text: string;
+}
+
 export interface EffectGroupDefinition {
   id: string;
   name: string;
   description: string;
   enabled: boolean;
   fieldEffects: FieldEffectDefinition[];
+  defaultReason: EffectReasonConfig;
   defaultDuration?: EffectDuration;
   createdAt: string;
   updatedAt: string;
@@ -83,11 +93,7 @@ export interface ResolvedEffectTarget {
   scopeKey: string;
 }
 
-export interface EffectReasonSnapshot {
-  mode: "template" | "custom";
-  template: TemporaryEffectReasonTemplate;
-  text: string;
-}
+export interface EffectReasonSnapshot extends EffectReasonConfig {}
 
 export interface ActiveEffectDefinitionSnapshot {
   name: string;

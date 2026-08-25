@@ -27,7 +27,11 @@ import {
 } from "./record-store";
 import type { MvuFileApi, MvuStore, MvuStoreSnapshot } from "./store";
 import { publishOwnedTemporaryFile, StaleRevisionError } from "./store";
-import { assertMvuDataset, assertMvuDatasetV3 } from "./validation";
+import {
+  assertMvuDataset,
+  assertMvuDatasetV3,
+  backfillLegacyV3EffectReasonConfigs,
+} from "./validation";
 
 const V2_FILE_NAME = "operit_mvu.dataset.v2.json";
 const V3_FILE_NAME = "operit_mvu.dataset.v3.json";
@@ -331,7 +335,10 @@ export class V3MvuStore implements MvuStore {
     if (!(await this.files.exists(path))) throw new Error("MVU_V3_CONFIG_MISSING");
     const raw = await this.files.readText(path);
     const parsed = JSON.parse(raw) as unknown;
-    if (isMvuDatasetV3Candidate(parsed)) hydrateLegacyActiveEffectSnapshots(parsed);
+    if (isMvuDatasetV3Candidate(parsed)) {
+      backfillLegacyV3EffectReasonConfigs(parsed);
+      hydrateLegacyActiveEffectSnapshots(parsed);
+    }
     assertMvuDatasetV3(parsed);
     return { revision: parsed.revision, dataset: klona(parsed) };
   }
@@ -368,6 +375,7 @@ export class V3MvuStore implements MvuStore {
     const committed = klona(next);
     committed.revision = commitRevision;
     committed.recordManifest = staged.manifest;
+    backfillLegacyV3EffectReasonConfigs(committed);
     hydrateLegacyActiveEffectSnapshots(committed);
     assertMvuDatasetV3(committed);
     if (supersededPaths.length > 0) {
@@ -699,7 +707,7 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
     }));
     if (targets.length === 0) continue;
     const duration = compatibilityInstanceDuration(instances);
-    const reason = compatibilityInstanceReason(instances);
+    const reason = definition.defaultReason ?? { mode: "template", template: "general", text: "" };
     effects.push({
       id: legacyEffectId(definition.id),
       targets: uniqueTargets(targets),
@@ -710,7 +718,7 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
       remainingTurns: duration.remainingTurns,
       reasonMode: reason.mode,
       reasonTemplate: reason.template,
-      reason: reason.mode === "custom" ? reason.text : "",
+      reason: reason.text,
       createdAt: Date.parse(definition.createdAt),
     });
   }
@@ -999,6 +1007,7 @@ function reconcileCompatibilityEffects(
     const groupIndex = effectGroups.findIndex((group) => group.id === currentGroup.id);
     if (groupIndex < 0) throw new Error(`MVU_V3_COMPAT_EFFECT_NOT_FOUND:${id}`);
     const patchedGroup = klona(currentGroup);
+    patchedGroup.defaultReason = klona(migratedGroup.defaultReason);
     patchedGroup.fieldEffects = patchedGroup.fieldEffects.map((fieldEffect) => ({
       ...fieldEffect,
       operations: fieldEffect.operations.map((operation) => {
@@ -1053,9 +1062,6 @@ function reconcileCompatibilityEffects(
           JSON.stringify(nextEffect.targets);
         const durationChanged = projectedEffect.expiresAt !== nextEffect.expiresAt ||
           projectedEffect.remainingTurns !== nextEffect.remainingTurns;
-        const reasonChanged = projectedEffect.reasonMode !== nextEffect.reasonMode ||
-          projectedEffect.reasonTemplate !== nextEffect.reasonTemplate ||
-          projectedEffect.reason !== nextEffect.reason;
         const replacement = {
           ...klona(currentInstance),
           resolvedTargets: targetsChanged
@@ -1064,9 +1070,7 @@ function reconcileCompatibilityEffects(
           duration: durationChanged
             ? klona(migratedInstance.duration)
             : klona(currentInstance.duration),
-          reason: reasonChanged
-            ? klona(migratedInstance.reason)
-            : klona(currentInstance.reason),
+          reason: klona(currentInstance.reason),
         };
         const instanceIndex = activeEffects.findIndex((instance) => instance.id === currentInstance.id);
         if (!nextEffect.enabled && replacement.duration.remainingTurns === 0) {
@@ -1235,20 +1239,6 @@ function compatibilityInstanceDuration(
   };
 }
 
-function compatibilityInstanceReason(
-  instances: MvuDatasetV3["activeEffects"],
-): MvuDatasetV3["activeEffects"][number]["reason"] {
-  const first = instances.at(0)?.reason;
-  if (first !== undefined && instances.every((instance) =>
-    JSON.stringify(instance.reason) === JSON.stringify(first))) {
-    return first;
-  }
-  // Legacy v2 can render only one reason. A neutral projection prevents a
-  // representable definition edit from borrowing one instance's reason and
-  // writing it over distinct v3 instance snapshots.
-  return { mode: "template", template: "general", text: "" };
-}
-
 function uniqueTargets(targets: DataTemporaryEffect["targets"]): DataTemporaryEffect["targets"] {
   const seen = new Set<string>();
   return targets.filter((target) => {
@@ -1285,17 +1275,11 @@ function sameEffectInstanceProjection(left: DataTemporaryEffect, right: DataTemp
     targets: left.targets,
     expiresAt: left.expiresAt,
     remainingTurns: left.remainingTurns,
-    reasonMode: left.reasonMode,
-    reasonTemplate: left.reasonTemplate,
-    reason: left.reason,
     createdAt: left.createdAt,
   }) === JSON.stringify({
     targets: right.targets,
     expiresAt: right.expiresAt,
     remainingTurns: right.remainingTurns,
-    reasonMode: right.reasonMode,
-    reasonTemplate: right.reasonTemplate,
-    reason: right.reason,
     createdAt: right.createdAt,
   });
 }
