@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MVU_SNAPSHOT_MAX_BYTES,
+  MVU_SNAPSHOT_URI_MAX_BYTES,
   MvuQueryService,
   QUERY_SEARCH_MAX_LENGTH,
 } from "../dist/mvu/app/query.js";
@@ -682,6 +683,264 @@ test("compact snapshot contains summaries counts and first pages without option 
   assert.equal("records" in snapshot, false);
 });
 
+test("compact snapshot preserves exact identity reference timestamp and color values", async () => {
+  const collisionPrefix = "f".repeat(40);
+  const fieldIdA = `${collisionPrefix}A`;
+  const fieldIdB = `${collisionPrefix}B`;
+  const actorId = `Actor_${"A".repeat(64)}`;
+  const groupId = `Group_${"G".repeat(64)}`;
+  const chatId = `Chat_${"C".repeat(64)}`;
+  const stageId = `stage_${"s".repeat(64)}`;
+  const conditionId = `condition_${"c".repeat(64)}`;
+  const ruleId = `rule_${"r".repeat(64)}`;
+  const effectId = `effect_${"e".repeat(64)}`;
+  const recordId = `record_${"d".repeat(64)}`;
+  const longZoneTimestamp = "2033-05-18T03:33:20.000+08:00";
+  const themeColor = "color(display-p3 0.1 0.2 0.3 / 0.75)";
+  const iconProtocol = "custom_protocol_icon_v1_with_suffix";
+  const migrationCode = `MVU_${"P".repeat(64)}`;
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.fields = [
+    {
+      ...field(0),
+      id: fieldIdA,
+      order: 0,
+      scope: "character",
+      bindingIds: [actorId],
+      themeColor,
+      icon: iconProtocol,
+      stages: [{ id: stageId, name: "Identity stage", description: "", threshold: 0 }],
+    },
+    {
+      ...field(1),
+      id: fieldIdB,
+      order: 1,
+      scope: "character",
+      bindingIds: [actorId],
+      themeColor,
+    },
+  ];
+  dataset.conditions = [{ ...condition(0), id: conditionId, updatedAt: longZoneTimestamp }];
+  dataset.rules = [{
+    ...rule(0),
+    id: ruleId,
+    conditionId,
+    updatedAt: longZoneTimestamp,
+    actions: [{
+      kind: "change_field",
+      fieldId: fieldIdA,
+      target: { kind: "selected", actorIds: [actorId] },
+      delta: 1,
+      effectGroupIds: [effectId],
+    }],
+  }];
+  dataset.effectGroups = [{
+    ...effectGroup(0),
+    id: effectId,
+    updatedAt: longZoneTimestamp,
+    fieldEffects: [{ ...effectGroup(0).fieldEffects[0], fieldId: fieldIdA }],
+  }];
+  dataset.stateValues = { [`character:${actorId}`]: { [fieldIdA]: 48 } };
+  const exactRecord = {
+    ...record(0),
+    id: recordId,
+    scopeKey: `character:${actorId}`,
+    fieldId: fieldIdA,
+    actorId,
+    groupId,
+    chatId,
+  };
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({
+      items: [exactRecord], loadedCount: 1, totalCount: 1, hasMore: false, nextOffset: null,
+    }),
+  });
+  const source = {
+    ...fixture.source,
+    async listActors() {
+      return [{ characterId: actorId, name: "Actor identity", avatarUri: null, enabled: true }];
+    },
+    async listGroups() {
+      return [{ characterGroupId: groupId, name: "Group identity", avatarUri: null }];
+    },
+    async activeContext() {
+      return { actorId, groupId, chatId, actorName: "Actor identity" };
+    },
+    async migrationStatus() {
+      return {
+        mode: "v3",
+        source: "existing",
+        cleanup: { state: "pending", error: { code: migrationCode, message: "repair pending" } },
+      };
+    },
+  };
+  const service = new MvuQueryService(source, fixture.options);
+  const snapshot = await service.pageSnapshot();
+
+  assert.deepEqual(snapshot.pages.fields.items.map((item) => item.id), [fieldIdA, fieldIdB]);
+  assert.equal(new Set(snapshot.pages.fields.items.map((item) => item.id)).size, 2);
+  const fieldSummary = snapshot.pages.fields.items[0];
+  assert.equal(fieldSummary.id, fieldIdA);
+  assert.equal(fieldSummary.current.stage.id, stageId);
+  assert.equal(fieldSummary.current.actorId, actorId);
+  assert.equal(fieldSummary.current.groupId, groupId);
+  assert.equal(fieldSummary.current.chatId, chatId);
+  assert.equal(fieldSummary.current.scopeKey, `character:${actorId}`);
+  assert.equal(fieldSummary.theme.color, themeColor);
+  assert.equal(fieldSummary.theme.icon, iconProtocol);
+  assert.equal(snapshot.pages.rules.items[0].id, ruleId);
+  assert.equal(snapshot.pages.rules.items[0].conditionId, conditionId);
+  assert.equal(snapshot.pages.rules.items[0].updatedAt, longZoneTimestamp);
+  assert.equal(snapshot.pages.conditions.items[0].id, conditionId);
+  assert.equal(snapshot.pages.conditions.items[0].updatedAt, longZoneTimestamp);
+  assert.equal(snapshot.pages.effectGroups.items[0].id, effectId);
+  assert.equal(snapshot.pages.effectGroups.items[0].updatedAt, longZoneTimestamp);
+  assert.equal(snapshot.pages.records.items[0].id, recordId);
+  assert.equal(snapshot.pages.records.items[0].fieldId, fieldIdA);
+  assert.equal(snapshot.pages.records.items[0].actorId, actorId);
+  assert.equal(snapshot.pages.records.items[0].groupId, groupId);
+  assert.equal(snapshot.activeContext.actorId, actorId);
+  assert.equal(snapshot.activeContext.groupId, groupId);
+  assert.equal(snapshot.activeContext.chatId, chatId);
+  assert.equal(snapshot.revision, dataset.revision);
+  assert.equal(snapshot.migrationStatus.cleanup.error.code, migrationCode);
+  assert.equal(Number.isFinite(Date.parse(snapshot.pages.rules.items[0].updatedAt)), true);
+
+  const roundTrip = await service.getEntityById({ entityType: "field", id: fieldSummary.id });
+  assert.equal(roundTrip.id, fieldIdA);
+  assert.deepEqual(roundTrip.bindingIds, [actorId]);
+});
+
+test("snapshot avatar URIs are complete below the byte cap or null with an unavailable marker", async () => {
+  const safeUri = `data:image/png;base64,${"a".repeat(2_000)}`;
+  const oversizedUri = `data:image/png;base64,${"😀".repeat(1_100)}`;
+  const fixture = createSource(makeDataset(), {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const source = {
+    ...fixture.source,
+    async listActors() {
+      return [{ characterId: "actor_000", name: "Actor", avatarUri: safeUri, enabled: true }];
+    },
+    async listGroups() {
+      return [{ characterGroupId: "group_000", name: "Group", avatarUri: oversizedUri }];
+    },
+  };
+  const snapshot = await new MvuQueryService(source, fixture.options).pageSnapshot();
+
+  assert.equal(Buffer.byteLength(safeUri, "utf8") <= MVU_SNAPSHOT_URI_MAX_BYTES, true);
+  assert.equal(Buffer.byteLength(oversizedUri, "utf8") > MVU_SNAPSHOT_URI_MAX_BYTES, true);
+  assert.equal(snapshot.selected.actor.avatarUri, safeUri);
+  assert.equal(snapshot.selected.actor.avatarUriUnavailable, false);
+  assert.equal(snapshot.selected.group.avatarUri, null);
+  assert.equal(snapshot.selected.group.avatarUriUnavailable, true);
+});
+
+test("snapshot byte pressure reduces returned summaries without corrupting structured values", async () => {
+  const maxId = (namespace, index) => {
+    const prefix = `${namespace}_${index}_`;
+    return `${prefix}${"x".repeat(256 - prefix.length)}`;
+  };
+  const hugeLabel = "😀".repeat(100_000);
+  const hugeValidColor = `rgb(${" ".repeat(20_000)}1 2 3)`;
+  const actorId = maxId("actor", 0);
+  const groupId = maxId("group", 0);
+  const chatId = maxId("chat", 0);
+  const fieldIds = Array.from({ length: 5 }, (_, index) => maxId("field", index));
+  const conditionIds = Array.from({ length: 5 }, (_, index) => maxId("condition", index));
+  const effectIds = Array.from({ length: 5 }, (_, index) => maxId("effect", index));
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.fields = fieldIds.map((id, index) => ({
+    ...field(index),
+    id,
+    name: hugeLabel,
+    description: hugeLabel,
+    order: index,
+    scope: "character",
+    bindingIds: [actorId],
+    themeColor: hugeValidColor,
+    stages: [{ id: maxId("stage", index), name: hugeLabel, description: hugeLabel, threshold: 0 }],
+  }));
+  dataset.conditions = conditionIds.map((id, index) => ({
+    ...condition(index), id, name: hugeLabel, description: hugeLabel,
+  }));
+  dataset.effectGroups = effectIds.map((id, index) => ({
+    ...effectGroup(index),
+    id,
+    name: hugeLabel,
+    description: hugeLabel,
+    fieldEffects: [{ ...effectGroup(index).fieldEffects[0], fieldId: fieldIds[index] }],
+  }));
+  dataset.rules = Array.from({ length: 5 }, (_, index) => ({
+    ...rule(index),
+    id: maxId("rule", index),
+    name: hugeLabel,
+    description: hugeLabel,
+    conditionId: conditionIds[index],
+    executionOrder: index,
+    actions: [{ kind: "activate_effect_group", effectGroupId: effectIds[index] }],
+  }));
+  dataset.stateValues = {
+    [`character:${actorId}`]: Object.fromEntries(fieldIds.map((id, index) => [id, index])),
+  };
+  const exactRecords = Array.from({ length: 5 }, (_, index) => ({
+    ...record(index),
+    id: maxId("record", index),
+    scopeKey: `character:${actorId}`,
+    fieldId: fieldIds[index],
+    fieldName: hugeLabel,
+    actorId,
+    actorName: hugeLabel,
+    groupId,
+    chatId,
+    reason: hugeLabel,
+  }));
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({
+      items: exactRecords, loadedCount: 5, totalCount: 5, hasMore: false, nextOffset: null,
+    }),
+  });
+  const source = {
+    ...fixture.source,
+    async listActors() {
+      return [{ characterId: actorId, name: hugeLabel, avatarUri: hugeLabel, enabled: true }];
+    },
+    async listGroups() {
+      return [{ characterGroupId: groupId, name: hugeLabel, avatarUri: hugeLabel }];
+    },
+    async activeContext() {
+      return { actorId, groupId, chatId, actorName: hugeLabel };
+    },
+  };
+  const snapshot = await new MvuQueryService(source, fixture.options).pageSnapshot({
+    groupName: hugeLabel,
+    chatName: hugeLabel,
+  });
+
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= MVU_SNAPSHOT_MAX_BYTES);
+  assert.equal(snapshot.snapshotTruncated, true);
+  assert.deepEqual(snapshot.counts, {
+    fields: 5, actors: 1, groups: 1, rules: 5, conditions: 5, effectGroups: 5, records: 5,
+  });
+  for (const key of ["fields", "rules", "conditions", "effectGroups", "records"]) {
+    assert.equal(snapshot.returnedCount[key], snapshot.pages[key].items.length);
+    assert.equal(snapshot.pages[key].totalCount, 5);
+    if (snapshot.returnedCount[key] < 5) assert.equal(snapshot.pages[key].hasMore, true);
+  }
+  assert.ok(snapshot.returnedCount.fields > 0 && snapshot.returnedCount.fields < 5);
+  for (const item of snapshot.pages.fields.items) {
+    assert.equal(item.id.length, 256);
+    assert.equal(item.theme.color, hugeValidColor);
+  }
+  assert.equal(snapshot.selected.actor.characterId, actorId);
+  assert.equal(snapshot.selected.group.characterGroupId, groupId);
+  assert.equal(snapshot.activeContext.chatId, chatId);
+  assert.equal(snapshot.selected.actor.avatarUri, null);
+  assert.equal(snapshot.selected.actor.avatarUriUnavailable, true);
+});
+
 test("compact snapshot stays below a deterministic byte cap for multi-megabyte legacy labels", async () => {
   const huge = "😀".repeat(1_000_000);
   assert.equal(huge.length, 2_000_000);
@@ -728,7 +987,7 @@ test("compact snapshot stays below a deterministic byte cap for multi-megabyte l
           migratedEffectGroups: 1,
           warnings: Array.from({ length: 12 }, () => huge),
         },
-        cleanup: { state: "pending", error: { code: huge, message: huge } },
+        cleanup: { state: "pending", error: { code: "MVU_LEGACY_WARNING", message: huge } },
       };
     },
   };
@@ -745,6 +1004,10 @@ test("compact snapshot stays below a deterministic byte cap for multi-megabyte l
   assert.equal(snapshot.pages.records.items[0].truncated, true);
   assert.equal(snapshot.selected.actor.truncated, true);
   assert.equal(snapshot.selected.group.truncated, true);
+  assert.equal(snapshot.selected.actor.avatarUri, null);
+  assert.equal(snapshot.selected.actor.avatarUriUnavailable, true);
+  assert.equal(snapshot.selected.group.avatarUri, null);
+  assert.equal(snapshot.selected.group.avatarUriUnavailable, true);
   assert.equal(snapshot.activeContext.truncated, true);
   assert.equal(snapshot.contextLabels.truncated, true);
   assert.equal(snapshot.migrationStatus.truncated, true);
