@@ -435,14 +435,23 @@ export class MvuQueryService {
 
   async queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
     const groupId = request.filters?.groupId;
+    const fieldId = request.filters?.fieldId;
     if (groupId !== undefined && (typeof groupId !== "string" || this.source.listActorsForGroup === undefined)) {
       throw new Error("MVU_QUERY_FILTER_INVALID");
     }
+    if (fieldId !== undefined && typeof fieldId !== "string") throw new Error("MVU_QUERY_FILTER_INVALID");
+    let actors = typeof groupId === "string"
+      ? await this.source.listActorsForGroup!(groupId)
+      : await this.source.listActors();
+    if (typeof fieldId === "string") {
+      const field = (await this.source.readV3()).dataset.fields.find((candidate) => candidate.id === fieldId);
+      if (field === undefined || field.scope !== "character") throw new Error("MVU_QUERY_FILTER_INVALID");
+      const bindingIds = new Set(field.bindingIds);
+      actors = actors.filter((actor) => bindingIds.has(actor.characterId));
+    }
     return queryCollection({
       entity: "actors",
-      items: typeof groupId === "string"
-        ? await this.source.listActorsForGroup!(groupId)
-        : await this.source.listActors(),
+      items: actors,
       request,
       pageSize: PICKER_BATCH_SIZE,
       cursor: true,
@@ -455,10 +464,12 @@ export class MvuQueryService {
       filterKeys: {
         enabled: (item, value) => item.enabled === value,
         groupId: (_item, value) => value === groupId,
+        fieldId: (_item, value) => value === fieldId,
       },
       validateFilters: (filters) => {
         requireFilter(filters, "enabled", (value) => typeof value === "boolean");
         requireFilter(filters, "groupId", isNonEmptyFilterString);
+        requireFilter(filters, "fieldId", isNonEmptyFilterString);
       },
       searchText: (item) => [item.characterId, item.name],
       id: (item) => item.characterId,

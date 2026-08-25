@@ -160,7 +160,8 @@ async function runCase(browser, origin, width, scale) {
     assert.equal(management.countPage2, "已显示 5 个字段 / 匹配 13 个字段 / 共 13 个字段");
 
     await page.evaluate(() => window.MvuUi.navigate("rule-editor"));
-    await page.locator('[data-picker-key="rule-result-field"]').click();
+    await page.locator('[data-action="add-rule-change"]').click();
+    await page.locator("[data-rule-change-field]").click();
     const dialog = page.getByRole("dialog", { name: "选择字段" });
     await dialog.waitFor({ state: "visible" });
     const initialCursor = await page.evaluate(() => window.MvuUi.state.entityPicker.nextCursor);

@@ -293,14 +293,36 @@
 
   function stageStrip(field, value, colors) {
     const stages = field.stages.slice().sort(function (a, b) { return a.threshold - b.threshold; });
+    const viewportWidth = typeof window !== "undefined" && Number.isFinite(window.innerWidth) && window.innerWidth > 0 ? window.innerWidth : 393;
+    const computedBodySize = typeof window !== "undefined" && typeof window.getComputedStyle === "function" &&
+      typeof document !== "undefined" && document.body ? Number.parseFloat(window.getComputedStyle(document.body).fontSize) : 14;
+    const textScale = Number.isFinite(computedBodySize) && computedBodySize > 0 ? Math.max(0.75, Math.min(2, computedBodySize / 14)) : 1;
+    const trackWidth = Math.max(160, viewportWidth - 74 * textScale);
+    const markerWidth = Math.min(68 * textScale, Math.max(44 * textScale, viewportWidth * 0.18));
+    const laneRightEdges = [];
+    const layout = stages.map(function (stage) {
+      const position = percent(stage.threshold, field.minimum, field.maximum);
+      const positionPx = position / 100 * trackWidth;
+      const nameWidth = Math.min(markerWidth, Math.max(22 * textScale, Array.from(stage.name || "").length * 11 * textScale));
+      const thresholdWidth = Math.min(markerWidth, Math.max(18 * textScale, String(ui.formatNumber(stage.threshold)).length * 7 * textScale));
+      const labelWidth = Math.max(nameWidth, thresholdWidth);
+      const left = position <= 0 ? 0 : position >= 100 ? trackWidth - labelWidth : positionPx - labelWidth / 2;
+      const right = left + labelWidth;
+      let lane = laneRightEdges.findIndex(function (edge) { return edge + 4 * textScale <= left; });
+      if (lane < 0) lane = laneRightEdges.length;
+      laneRightEdges[lane] = right;
+      return { stage, position, lane, laneOffset: lane * 18 };
+    });
+    const extraHeight = Math.max(0, laneRightEdges.length - 1) * 18;
     return '<article class="detail-card stage-card"><div class="card-heading"><strong>阶段</strong><span>' +
-      ui.formatNumber(field.minimum) + " – " + ui.formatNumber(field.maximum) + '</span></div><div class="stage-map"><div class="stage-track">' +
-      stages.map(function (stage, index) {
+      ui.formatNumber(field.minimum) + " – " + ui.formatNumber(field.maximum) + '</span></div><div class="stage-map" style="--stage-extra-height:' + extraHeight + 'px"><div class="stage-track">' +
+      layout.map(function (item, index) {
+        const stage = item.stage;
         const active = value >= stage.threshold && (index === stages.length - 1 || value < stages[index + 1].threshold);
         const edge = index === 0 ? " edge-start" : index === stages.length - 1 ? " edge-end" : "";
         return '<span class="stage-marker' + (active ? " active" : "") + edge + '" style="--stage-position:' +
-          percent(stage.threshold, field.minimum, field.maximum) + '%;--stage-color:' + colors[index] + '" data-stage-lane="' +
-          (index % 2) + '"><span class="stage-name">' + ui.escapeHtml(stage.name) + '</span><i aria-hidden="true"></i><span class="stage-threshold">' +
+          item.position + '%;--stage-color:' + colors[index] + ';--stage-lane-offset:' + item.laneOffset + 'px" data-stage-lane="' +
+          item.lane + '"><span class="stage-name">' + ui.escapeHtml(stage.name) + '</span><i aria-hidden="true"></i><span class="stage-threshold">' +
           ui.formatNumber(stage.threshold) + "</span></span>";
       }).join("") + '<b class="stage-current" style="--stage-position:' + percent(value, field.minimum, field.maximum) +
       '%" aria-label="当前值位置"></b></div></div></article>';

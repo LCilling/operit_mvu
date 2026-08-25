@@ -18,7 +18,7 @@
     const view = ui.state.listViews.rules;
     return managementPage("规则设置", "每页 5 条，触发条件与结果分开显示", page, "条规则", "rule", function (rule) {
       const labels = ui.state.ruleLabels.get(rule.id) || { actor: "绑定信息读取中", condition: "条件读取中", actions: rule.actions.length + " 个结果" };
-      const disabled = ui.state.managementRecoveries.rules ? " disabled" : "";
+      const disabled = ui.state.managementRecoveries.rules || ui.state.managementPending.rules ? " disabled" : "";
       return '<article class="management-entity-row rule-management-row" data-rule-row="' + ui.escapeHtml(rule.id) + '"><button type="button" class="management-row-main" data-open-entity="rule" data-entity-id="' +
         ui.escapeHtml(rule.id) + '"><span class="management-row-copy"><span><strong>' + ui.escapeHtml(rule.name) + '</strong><em class="status-dot ' +
         (rule.enabled ? "enabled" : "") + '">' + (rule.enabled ? "已启用" : "已停用") + '</em></span><small>触发角色：' +
@@ -143,7 +143,7 @@
     const view = ui.state.listViews.effectGroups;
     return managementPage("临时效果", "一个效果组可以影响多个字段", page, "个效果组", "effectGroup", function (effect) {
       const fieldCount = effect.fieldEffects ? effect.fieldEffects.length : effect.fieldCount;
-      const disabled = ui.state.managementRecoveries.effectGroups ? " disabled" : "";
+      const disabled = ui.state.managementRecoveries.effectGroups || ui.state.managementPending.effectGroups ? " disabled" : "";
       return '<article class="management-entity-row effect-management-row" data-effect-row="' + ui.escapeHtml(effect.id) + '"><button type="button" class="management-row-main" data-open-entity="effectGroup" data-entity-id="' +
         ui.escapeHtml(effect.id) + '"><span class="management-row-copy"><span><strong>' + ui.escapeHtml(effect.name) + '</strong><em class="status-dot ' +
         (effect.enabled ? "enabled" : "") + '">' + (effect.enabled ? "已启用" : "已停用") + '</em></span><small>' + ui.escapeHtml(effect.description || "未填写说明") +
@@ -189,10 +189,10 @@
     const guidance = dialog.loading ? '<p class="dialog-status">正在检查引用…</p>' : dialog.error
       ? '<p class="inline-error" role="alert">' + ui.escapeHtml(dialog.error) + '</p>' : references.length
         ? '<p class="reference-guidance">此' + label + '仍被引用。请先从规则中移除相关引用，再返回删除。</p>'
-        : '<p class="reference-guidance">没有发现引用。删除后无法恢复。</p>';
+        : '<p class="reference-guidance">' + (dialog.entityType === "rule" ? "确认删除这条规则。删除后无法恢复。" : "没有发现引用。删除后无法恢复。") + '</p>';
     return '<div class="management-delete-layer" data-action="close-management-delete"><section class="management-delete-dialog" data-management-delete-dialog="' +
       dialog.entityType + '" role="dialog" aria-modal="true" aria-labelledby="management-delete-title" data-stop-close><header><div><h2 id="management-delete-title">删除「' +
-      ui.escapeHtml(dialog.name) + '」</h2><p>删除前检查受影响内容</p></div><button type="button" class="icon-button" data-action="close-management-delete" aria-label="关闭">' +
+      ui.escapeHtml(dialog.name) + '」</h2><p>' + (dialog.entityType === "rule" ? "确认删除规则" : "删除前检查受影响内容") + '</p></div><button type="button" class="icon-button" data-action="close-management-delete" aria-label="关闭">' +
       c.icon("close") + '</button></header>' + guidance + list + '<footer><button type="button" class="button secondary" data-action="close-management-delete">取消</button>' +
       (!dialog.loading && !dialog.error && !references.length ? '<button type="button" class="button danger" data-action="confirm-management-delete">确认删除</button>' : "") +
       '</footer></section></div>';
@@ -460,9 +460,9 @@
       '<section class="editor-section">' + c.sectionHeading("效果原因", "直接设置；激活时会把当时的原因解析为快照写入变化记录") +
       c.segmented([{ id: "template", label: "默认模板" }, { id: "custom", label: "自定义原因" }], reasonMode, "data-reason-mode", "原因模式") +
       '<div id="segment-panel-reason-mode" role="tabpanel" aria-label="原因预览">' + reasonSettings + '</div></section>' +
-      '<section class="editor-section">' + c.sectionHeading("持续时间", "永久有效、到截止时间、按剩余轮次，或保留到手动结束") +
-      '<div class="form-card duration-settings"><label>持续方式<select name="effectDurationMode">' + selectOptions([["permanent", "永久有效（无默认结束条件）"], ["expires", "到截止时间"], ["turns", "剩余轮次"], ["manual", "手动结束"]], draft.durationMode) +
-      '</select></label>' + durationExtra + '<p class="support-copy">“手动结束”保存为空截止时间与空轮次；运行时由用户明确停用。永久模式不写默认时长。</p></div></section>' +
+      '<section class="editor-section">' + c.sectionHeading("持续时间", "永久有效、到截止时间或按剩余轮次") +
+      '<div class="form-card duration-settings"><label>持续方式<select name="effectDurationMode">' + selectOptions([["permanent", "永久有效（无结束条件）"], ["expires", "到截止时间"], ["turns", "剩余轮次"]], draft.durationMode) +
+      '</select></label>' + durationExtra + '<p class="support-copy">永久有效会清除已有截止时间和剩余轮次；如需结束，可在效果列表中停用或删除。</p></div></section>' +
       error + '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary"' + (locked ? " disabled" : "") + '>' +
       (draft.submitting ? "正在保存" : draft.mutationCommitted ? "已经提交" : draft.stale ? "请重新打开" : "保存效果") + '</button></div></form>';
   }
@@ -496,7 +496,7 @@
     ];
     return '<article class="effect-operation-card" data-effect-operation-card data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '"><header><strong>计算方式 ' + (operationIndex + 1) + '</strong><button type="button" class="icon-button danger-text" data-action="remove-effect-operation" data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '" aria-label="删除计算方式"' + (ui.state.effectEditorDraft.fieldEffects[fieldIndex].operations.length <= 1 ? " disabled" : "") + '>' + c.icon("close") + '</button></header><div class="operation-row"><label>类型<select data-effect-operation-kind data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '">' +
       selectOptions([["immediate_delta", "立即增减"], ["fixed_adjustment", "固定修正"], ["positive_multiplier", "正向倍率"], ["negative_multiplier", "负向倍率"], ["all_multiplier", "通用倍率"]], operation.kind) +
-      '</select></label><label>效果数值<input type="number" step="any" data-effect-operation-value data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '" value="' + ui.escapeHtml(operation.value) + '"></label></div>' +
+      '</select></label><label>效果数值<input type="number" step="any"' + (immediate || operation.kind === "fixed_adjustment" ? "" : ' min="0"') + ' data-effect-operation-value data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '" value="' + ui.escapeHtml(operation.value) + '"></label></div>' +
       '<p class="operation-explanation">' + ui.escapeHtml(operationHelp(operation.kind)) + '</p>' + (immediate ? "" : '<fieldset class="operation-sources"><legend>应用来源（可多选）</legend>' + sources.map(function (source) {
         return '<label><input type="checkbox" data-effect-operation-source="' + source[0] + '" data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '"' + (operation.sources.includes(source[0]) ? " checked" : "") + '><span>' + source[1] + '</span></label>';
       }).join("") + '</fieldset>') + '</article>';

@@ -637,6 +637,27 @@ test("actor picker can be restricted to authoritative members of one group", asy
   assert.equal(ids.includes("outsider"), false);
 });
 
+test("actor picker can be restricted to the selected character field bindings", async () => {
+  const dataset = makeDataset();
+  dataset.fields[0].scope = "character";
+  dataset.fields[0].bindingIds = ["actor_001", "actor_004"];
+  dataset.fields[1].scope = "group";
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+  assert.deepEqual(MVU_REQUEST_PARSERS.queryActors({ filters: { fieldId: dataset.fields[0].id } }), {
+    filters: { fieldId: dataset.fields[0].id },
+  });
+  const result = await service.queryActors({ filters: { fieldId: dataset.fields[0].id } });
+  assert.deepEqual(result.items.map((actor) => actor.characterId), ["actor_001", "actor_004"]);
+  assert.equal(result.totalCount, 2);
+  await assert.rejects(
+    service.queryActors({ filters: { fieldId: dataset.fields[1].id } }),
+    /MVU_QUERY_FILTER_INVALID/,
+  );
+});
+
 test("100,000-record paging reads only the needed committed line range", async () => {
   const manifest = recordManifest();
   const last = manifest.segments.at(-1);

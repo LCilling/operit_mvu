@@ -339,6 +339,7 @@ function installProductionHost(t, files, hostSnapshot, modelCalls, registrations
   };
   globalThis.ToolPkg = {
     getConfigDir() { return CONFIG_DIR; },
+    async readResource() { return ""; },
     chatContext: {
       async snapshot() { return structuredClone(hostSnapshot); },
     },

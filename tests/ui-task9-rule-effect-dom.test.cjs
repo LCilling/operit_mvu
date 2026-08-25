@@ -197,6 +197,7 @@ test("rule list toggle copy and unreferenced delete send revisioned mutations th
   await waitFor(() => window.MvuUi.state.snapshot.revision === 9, "copy did not refresh revision");
   click(window, "[data-rule-row='demo-rule-01'] [data-action='delete-rule']");
   await waitFor(() => document.querySelector("[data-management-delete-dialog='rule']"), "delete reference check did not open");
+  assert.equal(window.MvuUi.state.demoLastRequests.getRuleReferences, undefined, "rule deletion must not confuse outbound dependencies with inbound references");
   click(window, "[data-action='confirm-management-delete']");
   await waitFor(() => window.MvuUi.state.demoLastRequests.deleteRule, "deleteRule was not called");
   assert.equal(window.MvuUi.state.demoLastRequests.deleteRule.expectedRevision, 9);
@@ -311,6 +312,7 @@ test("effect editor is field-first and saves the T/A/B trigger-actor semantics w
   await waitFor(() => window.MvuUi.state.demoLastRequests.createEffectGroup, "createEffectGroup was not called");
   const request = plain(window.MvuUi.state.demoLastRequests.createEffectGroup);
   assert.equal(request.expectedRevision, 7);
+  assert.match(request.effectGroup.fieldEffects[0].id, /^[A-Za-z][A-Za-z0-9_]*$/, "persisted field-effect IDs must satisfy the production stable-ID contract");
   assert.deepEqual(request.effectGroup, {
     name: "T 的 A 欲望响应",
     description: "T 触发 B 后，仅 T 的 A 欲望变化",
@@ -379,6 +381,179 @@ test("group and global fields honestly disable ineffective actor targeting", asy
   assert.equal(globalSelector.value, "all_bound");
   assert.equal(globalSelector.disabled, true);
   assert.match(globalSelector.closest("[data-effect-actor-scope]").textContent, /全局字段|共享值/);
+});
+
+test("rule result pickers follow the selected field scope and server-owned compatibility filters", async (t) => {
+  const window = await createApp("rule-editor");
+  t.after(() => window.close());
+  click(window, '[data-action="add-rule-change"]');
+  await choosePicker(window, '[data-rule-change-field][data-action-index="0"]', "游标字段 001");
+  change(window, '[data-rule-target-kind][data-action-index="0"]', "selected");
+  click(window, '[data-rule-change-actors][data-action-index="0"]');
+  await waitFor(() => window.MvuUi.state.entityPicker?.items?.length, "bound actor picker did not load");
+  assert.equal(window.MvuUi.state.entityPicker.filters.fieldId, "picker-field-001");
+  assert.equal(window.MvuUi.state.entityPicker.maxSelection, 100);
+  assert.ok(window.MvuUi.state.entityPicker.items.every((actor) => ["picker-actor-001", "picker-actor-002"].includes(actor.characterId)));
+  click(window, '.entity-picker [data-action="close-entity-picker"]');
+  click(window, '[data-rule-change-effects][data-action-index="0"]');
+  await waitFor(() => window.MvuUi.state.entityPicker?.items?.length, "compatible effect picker did not load");
+  assert.equal(window.MvuUi.state.entityPicker.filters.fieldId, "picker-field-001");
+  assert.equal(window.MvuUi.state.entityPicker.maxSelection, 100);
+  assert.ok(window.MvuUi.state.entityPicker.items.every((effect) => effect.fieldEffects.some((item) => item.fieldId === "picker-field-001")));
+  click(window, '.entity-picker [data-action="close-entity-picker"]');
+
+  click(window, '[data-rule-change-field][data-action-index="0"]');
+  await waitFor(() => window.document.querySelector(".entity-picker [data-picker-search]"));
+  input(window, ".entity-picker [data-picker-search]", "共享群组值");
+  await waitFor(() => window.document.querySelector(".entity-picker .picker-result")?.textContent.includes("共享群组值"));
+  click(window, ".entity-picker .picker-result");
+  const action = window.MvuUi.state.ruleEditorDraft.actions[0];
+  assert.equal(action.targetKind, "all_bound");
+  assert.deepEqual(plain(action.actorIds), []);
+  assert.deepEqual(plain(action.effectGroupIds), []);
+});
+
+test("permanent duration clears a previous reusable duration and manual duplicate semantics are not exposed", async (t) => {
+  const window = await createApp("effect-library");
+  t.after(() => window.close());
+  const existing = window.MvuUi.state.demoStore.effectGroups.find((effect) => effect.id === "effect-1");
+  existing.defaultDuration = { expiresAt: null, remainingTurns: 3 };
+  window.MvuUi.state.entities.delete("effectGroup:effect-1");
+  click(window, "[data-effect-row='effect-1'] [data-open-entity='effectGroup']");
+  await waitFor(() => window.MvuUi.state.route === "effect-editor" && window.document.querySelector('[name="effectDurationMode"]'));
+  const duration = window.document.querySelector('[name="effectDurationMode"]');
+  assert.equal(duration.value, "turns");
+  assert.equal(duration.querySelector('option[value="manual"]'), null, "manual end is indistinguishable from permanent in the persisted model");
+  change(window, '[name="effectDurationMode"]', "permanent");
+  submit(window, '[data-form="effect-editor"]');
+  await waitFor(() => window.MvuUi.state.demoLastRequests.updateEffectGroup, "effect update was not called");
+  assert.deepEqual(plain(window.MvuUi.state.demoLastRequests.updateEffectGroup.patch.defaultDuration), { expiresAt: null, remainingTurns: null });
+});
+
+test("committed editor refresh recovery exits the locked editor without submitting twice", async (t) => {
+  const window = await createApp("rule-library");
+  t.after(() => window.close());
+  click(window, "[data-rule-row='rule-1'] [data-open-entity='rule']");
+  await waitFor(() => window.MvuUi.state.route === "rule-editor" && window.MvuUi.state.ruleEditorDraft);
+  input(window, '[name="ruleName"]', "提交后刷新恢复");
+  window.MvuUi.state.demoNextFailureMethod = "snapshot";
+  submit(window, '[data-form="rule-editor"]');
+  await waitFor(() => window.MvuUi.state.ruleEditorDraft?.mutationCommitted, "rule was not committed before refresh failure");
+  assert.ok(window.document.querySelector('[data-action="reload-management-list"]'));
+  click(window, '[data-action="reload-management-list"]');
+  await waitFor(() => window.MvuUi.state.route === "rule-library", "recovery did not return to the authoritative list");
+  assert.equal(window.MvuUi.state.ruleEditorDraft, null);
+});
+
+test("committed list mutation keeps the current page and exposes refresh-only recovery when its route query fails", async (t) => {
+  const window = await createApp("rule-library");
+  t.after(() => window.close());
+  click(window, '[data-page-route="rule-library"][data-page-direction="next"]');
+  await waitFor(() => window.MvuUi.state.listViews.rules.page === 2);
+  const before = Array.from(window.document.querySelectorAll("[data-rule-row]"), (row) => row.dataset.ruleRow);
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let failQuery = true;
+  window.MvuUi.native.call = function (method, request) {
+    if (method === "queryRules" && failQuery) {
+      failQuery = false;
+      return Promise.reject(new Error("list unavailable"));
+    }
+    return originalCall(method, request);
+  };
+  click(window, "[data-rule-row] [data-action='toggle-rule']");
+  await waitFor(() => window.MvuUi.state.managementRecoveries.rules?.kind === "committed", "refresh-only recovery missing");
+  assert.equal(window.MvuUi.state.routeError, null, "management recovery must own the failure instead of replacing the page");
+  assert.equal(window.MvuUi.state.listViews.rules.page, 2);
+  assert.deepEqual(Array.from(window.document.querySelectorAll("[data-rule-row]"), (row) => row.dataset.ruleRow), before,
+    "failed refresh must not pair page-two controls with snapshot page-one rows");
+});
+
+test("management mutations suppress rapid duplicate requests and disable the affected list", async (t) => {
+  const window = await createApp("rule-library");
+  t.after(() => window.close());
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let release = () => {};
+  t.after(() => release());
+  let toggleCalls = 0;
+  window.MvuUi.native.call = function (method, request) {
+    if (method !== "toggleRule") return originalCall(method, request);
+    toggleCalls += 1;
+    return new Promise((resolve, reject) => {
+      release = () => originalCall(method, request).then(resolve, reject);
+    });
+  };
+  click(window, "[data-rule-row='demo-rule-01'] [data-action='toggle-rule']");
+  click(window, "[data-rule-row='demo-rule-01'] [data-action='toggle-rule']");
+  assert.equal(toggleCalls, 1);
+  assert.equal(window.document.querySelector("[data-rule-row='demo-rule-01'] [data-action='toggle-rule']").disabled, true);
+  release();
+  await waitFor(() => window.MvuUi.state.snapshot.revision === 8, "single toggle did not finish");
+});
+
+test("negative multipliers are rejected while negative fixed adjustments remain valid", async (t) => {
+  const window = await createApp("effect-editor");
+  t.after(() => window.close());
+  input(window, '[name="effectName"]', "非法倍率保护");
+  click(window, '[data-action="add-field-effect"]');
+  await choosePicker(window, '[data-effect-field-picker][data-field-effect-index="0"]', "游标字段 001");
+  change(window, '[data-effect-operation-kind][data-field-effect-index="0"][data-operation-index="0"]', "all_multiplier");
+  const valueInput = input(window, '[data-effect-operation-value][data-field-effect-index="0"][data-operation-index="0"]', "-0.5");
+  assert.equal(valueInput.min, "0");
+  setChecked(window, '[data-effect-operation-source="rule"][data-field-effect-index="0"][data-operation-index="0"]', true);
+  submit(window, '[data-form="effect-editor"]');
+  assert.equal(window.MvuUi.state.demoLastRequests.createEffectGroup, undefined);
+  assert.match(window.document.querySelector("[data-effect-editor-error]").textContent, /倍率.*非负|非负.*倍率/);
+
+  const effectGroup = plain(window.MvuUi.state.demoStore.effectGroups[0]);
+  effectGroup.name = "负数固定修正";
+  effectGroup.fieldEffects[0].operations = [{ kind: "fixed_adjustment", value: -2, sources: ["rule"] }];
+  const result = await window.MvuUi.native.call("createEffectGroup", { expectedRevision: 7, effectGroup });
+  assert.equal(result.revision, 8, "fixed adjustments must support reductions as well as increases");
+});
+
+test("Demo rejects rule and effect selections above the production 100-item boundary", async (t) => {
+  const window = await createApp("rule-library");
+  t.after(() => window.close());
+  const oversized = Array.from({ length: 101 }, (_, index) => "actor_" + index);
+  const rule = plain(window.MvuUi.state.demoStore.rules[0]);
+  rule.triggerActorSelector = { kind: "selected", actorIds: oversized };
+  await assert.rejects(
+    window.MvuUi.native.call("createRule", { expectedRevision: 7, rule }),
+    /MVU_RULE_ACTOR_SELECTOR_INVALID/,
+  );
+  const effectGroup = plain(window.MvuUi.state.demoStore.effectGroups[0]);
+  effectGroup.fieldEffects[0].actorSelector = { kind: "selected", actorIds: oversized };
+  await assert.rejects(
+    window.MvuUi.native.call("createEffectGroup", { expectedRevision: 7, effectGroup }),
+    /MVU_EFFECT_ACTOR_SELECTOR_INVALID/,
+  );
+  assert.equal(window.MvuUi.state.demoStore.revision, 7);
+});
+
+test("editor redraw and delete dialogs keep keyboard focus inside the current task", async (t) => {
+  const window = await createApp("rule-editor");
+  t.after(() => window.close());
+  Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+  const actorKind = window.document.querySelector('[name="ruleActorKind"]');
+  actorKind.focus();
+  change(window, '[name="ruleActorKind"]', "selected");
+  assert.equal(window.document.activeElement, window.document.querySelector('[name="ruleActorKind"]'));
+
+  await window.MvuUi.navigate("rule-library");
+  const opener = window.document.querySelector("[data-rule-row='demo-rule-01'] [data-action='delete-rule']");
+  opener.focus();
+  click(window, "[data-rule-row='demo-rule-01'] [data-action='delete-rule']");
+  await waitFor(() => window.document.querySelector("[data-management-delete-dialog='rule']"));
+  const dialog = window.document.querySelector("[data-management-delete-dialog='rule']");
+  assert.ok(dialog.contains(window.document.activeElement), "delete dialog must receive initial focus");
+  window.document.activeElement.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.equal(window.document.activeElement, window.document.querySelector("[data-rule-row='demo-rule-01'] [data-action='delete-rule']"));
+  click(window, "[data-rule-row='demo-rule-01'] [data-action='delete-rule']");
+  await waitFor(() => window.document.querySelector("[data-management-delete-dialog='rule']"));
+  click(window, '[data-action="confirm-management-delete"]');
+  await waitFor(() => window.MvuUi.state.snapshot.revision === 8 &&
+    window.document.activeElement === window.document.querySelector('[data-new-entity="rule"]'),
+  "confirmed deletion did not move focus to the stable new-rule action");
 });
 
 test("rule and effect editors expose stable add remove and reorder controls without inline full datasets", async (t) => {

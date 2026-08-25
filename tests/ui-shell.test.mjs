@@ -91,6 +91,7 @@ function validEffectEntity(overrides = {}) {
       id: "field_effect_a", fieldId: "field_a", actorSelector: { kind: "trigger_actor" },
       operations: [{ kind: "immediate_delta", value: 1 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: "2033-01-01T00:00:00.000Z", updatedAt: "2033-01-01T00:00:00.000Z",
     ...overrides,
   };
@@ -110,6 +111,7 @@ function validSnapshot(overrides = {}) {
     activeContext: { chatId: "chat_a", actorId: "actor_a", groupId: null, actorName: "角色甲", truncated: false },
     settings: { aiEnabled: true },
     migrationStatus: { mode: "v3", source: "existing", truncated: false },
+    modelBudget: { used: 1, total: 1, limit: 40, referencedIncluded: 0, referencedTotal: 0, overflow: false, diagnostics: [] },
     counts: { fields: 1, actors: 2, groups: 1, rules: 1, conditions: 1, effectGroups: 1, records: 1 },
     selected: {
       actor: { characterId: "actor_a", name: "角色甲", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
@@ -136,6 +138,7 @@ function createHarness(search = "?route=field-detail&field=field_a") {
     addEventListener(type, listener) { this.listeners.set(type, listener); }
     querySelector() { return null; }
     querySelectorAll() { return []; }
+    hasAttribute() { return false; }
     toggleAttribute() {}
     click() {}
     closest() { return null; }
@@ -202,7 +205,18 @@ test("import and export honor the native JSON/path contracts", async () => {
     if (method === "snapshot") return validSnapshot();
     if (method === "queryActors") return page([]);
     if (method === "queryGroups") return page([]);
-    if (method === "exportDataset") return { fileName: "mvu.json", savedPath: "/sdcard/Download/Operit/exports/mvu.json" };
+    if (method === "previewDatasetImport") return {
+      valid: true, kind: "full_v3", sourceFormatVersion: 3, schemaVersion: 1,
+      exportedAt: "2033-05-18T03:33:20.000Z", sourceRevision: 1, previewRevision: 1, expectedRevision: 1,
+      summary: { fieldCount: 1, conditionCount: 1, ruleCount: 1, effectGroupCount: 1, activeEffectCount: 0, recordCount: 1 },
+      migrationWarnings: { items: [], totalCount: 0, truncated: false },
+      replacementWarning: "导入会替换全部当前 MVU 数据。", confirmationValue: "REPLACE_ALL_MVU_DATA",
+    };
+    if (method === "exportDataset") return {
+      fileName: "mvu.json", savedPath: "/sdcard/Download/Operit/exports/mvu.json",
+      summary: { sourceRevision: 1, fieldCount: 1, conditionCount: 1, ruleCount: 1, effectGroupCount: 1,
+        activeEffectCount: 0, recordCount: 1, byteCount: 1024 },
+    };
     return null;
   };
   vm.runInContext(appSource, context, { filename: "app.js" });
@@ -211,8 +225,8 @@ test("import and export honor the native JSON/path contracts", async () => {
   await ui.importDatasetText('{"formatVersion":3}');
   const exported = await ui.exportDataset();
 
-  const imported = calls.find(([method]) => method === "importDataset");
-  assert.equal(imported[0], "importDataset");
+  const imported = calls.find(([method]) => method === "previewDatasetImport");
+  assert.equal(imported[0], "previewDatasetImport");
   assert.equal(imported[1].json, '{"formatVersion":3}');
   assert.equal(exported.fileName, "mvu.json");
   assert.equal(exported.savedPath, "/sdcard/Download/Operit/exports/mvu.json");
@@ -636,8 +650,48 @@ test("stage names dots and thresholds share exact normalized positions for arbit
   assert.match(html, /class="stage-marker active" style="--stage-position:10%/);
   assert.match(html, /class="stage-marker edge-end" style="--stage-position:90%/);
   assert.doesNotMatch(stylesSource, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/);
-  assert.match(stylesSource, /\.stage-map\s*\{[^}]*margin:\s*24px 7px 0;/);
-  assert.match(stylesSource, /\.stage-marker\[data-stage-lane="1"\]\s+\.stage-name\s*\{[^}]*translateY\(-24px\)/);
+  assert.match(stylesSource, /\.stage-map\s*\{[^}]*margin:\s*calc\(24px \+ var\(--stage-extra-height, 0px\)\) 7px 0;/);
+  assert.match(stylesSource, /\.stage-marker\s+\.stage-name\s*\{[^}]*--stage-lane-offset/);
+  assert.deepEqual(Array.from(html.matchAll(/data-stage-lane="(\d)"/g), (match) => match[1]), ["0", "1", "0"]);
+
+  const balanced = ui.components.stageStrip({
+    ...field,
+    stages: [
+      { id: "a", name: "陌生", threshold: 0 },
+      { id: "b", name: "熟悉", threshold: 20 },
+      { id: "c", name: "亲密", threshold: 50 },
+      { id: "d", name: "依赖", threshold: 80 },
+    ],
+  }, 48, ["#8a8fe0", "#5b91ff", "#d45fe2", "#ff4f88"]);
+  assert.deepEqual(Array.from(balanced.matchAll(/data-stage-lane="(\d)"/g), (match) => match[1]), ["0", "0", "0", "0"],
+    "well-spaced stage labels should share one visual baseline");
+  context.window.innerWidth = 393;
+  context.document.body = {};
+  context.window.getComputedStyle = () => ({ fontSize: "18.2px" });
+  const scaled = ui.components.stageStrip({
+    ...field,
+    stages: [
+      { id: "scaled-a", name: "第一阶段", threshold: 20 },
+      { id: "scaled-b", name: "第二阶段", threshold: 36 },
+    ],
+  }, 24, ["#8a8fe0", "#5b91ff"]);
+  assert.deepEqual(Array.from(scaled.matchAll(/data-stage-lane="(\d)"/g), (match) => match[1]), ["0", "1"],
+    "130% text scale must widen collision estimates before assigning lanes");
+  const dense = ui.components.stageStrip({
+    ...field,
+    stages: [
+      { id: "dense-a", name: "第一阶段", threshold: 0 },
+      { id: "dense-b", name: "第二阶段", threshold: 4 },
+      { id: "dense-c", name: "第三阶段", threshold: 8 },
+    ],
+  }, 4, ["#8a8fe0", "#5b91ff", "#d45fe2"]);
+  assert.deepEqual(Array.from(dense.matchAll(/data-stage-lane="(\d)"/g), (match) => match[1]), ["0", "1", "2"],
+    "three dense stages must receive three independent text lanes");
+  assert.match(dense, /--stage-extra-height:36px/);
+  assert.match(stylesSource, /\.stage-marker\s+\.stage-threshold\s*\{[^}]*translateY\(var\(--stage-lane-offset(?:,\s*0px)?\)\)/,
+    "threshold labels must move with the collision lane as well as stage names");
+  assert.match(stylesSource, /\.field-detail-stack\s*\{[^}]*gap:\s*16px;/,
+    "stage and trend cards should use the same primary spacing rhythm as the rest of the detail page");
 });
 
 test("field detail requests bounded records for its field and exact scope", async () => {
@@ -679,7 +733,7 @@ test("segmented keyboard activation restores focus and reason tabs switch conten
   assert.match(appSource, /pendingSegmentFocusId\s*=\s*nextTab\.id/);
   assert.match(appSource, /getElementById\(pendingSegmentFocusId\)/);
   assert.match(appSource, /data-reason-mode/);
-  assert.match(rulesSource, /effectReasonMode/);
+  assert.match(rulesSource, /draft\.reason\.mode/);
   assert.match(rulesSource, /自定义原因内容/);
 });
 
