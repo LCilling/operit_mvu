@@ -6,8 +6,9 @@
   "license": "MIT",
   "packageManager": "pnpm@11.19.0",
   "scripts": {
-    "audit": "node scripts/audit-manifest.mjs && node scripts/audit-web-ui.mjs",
+    "audit": "node scripts/audit-manifest.mjs && node scripts/audit-web-ui.mjs && node scripts/audit-v3-ui.mjs",
     "audit:manifest": "node scripts/audit-manifest.mjs",
+    "audit:v3": "node scripts/audit-v3-ui.mjs",
     "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test:v3": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
