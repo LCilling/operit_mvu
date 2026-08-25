@@ -32,6 +32,32 @@ export interface MvuFileApi {
   mkdir(path: string): Promise<void>;
 }
 
+/**
+ * Publish a file whose temporary source is owned by this operation. A normal
+ * promise rejection is observable in-process, so remove that known temporary
+ * path whether the write rejected after writing or atomic replacement failed.
+ * A process crash can still leave the uniquely named source behind.
+ */
+export async function publishOwnedTemporaryFile(
+  files: MvuFileApi,
+  temporaryPath: string,
+  destinationPath: string,
+  content: string,
+): Promise<void> {
+  try {
+    await files.writeText(temporaryPath, content);
+    await files.replaceAtomically(temporaryPath, destinationPath);
+  } catch (error) {
+    try {
+      if (await files.exists(temporaryPath)) await files.deleteFile(temporaryPath);
+    } catch {
+      // Preserve the publication error. The unique source name prevents a
+      // failed best-effort deletion from colliding with a future operation.
+    }
+    throw error;
+  }
+}
+
 export interface FileMvuStoreOptions {
   getConfigDir: () => string;
   files: MvuFileApi;
@@ -154,8 +180,12 @@ export class FileMvuStore implements MvuStore {
 
   private async persist(filePath: string, dataset: MvuDataset): Promise<void> {
     const temporaryPath = `${filePath}.tmp.${nextPersistenceId()}`;
-    await this.files.writeText(temporaryPath, JSON.stringify(dataset, null, 2));
-    await this.files.replaceAtomically(temporaryPath, filePath);
+    await publishOwnedTemporaryFile(
+      this.files,
+      temporaryPath,
+      filePath,
+      JSON.stringify(dataset, null, 2),
+    );
   }
 
   private async loadFromDisk(configDir: string, filePath: string): Promise<MvuStoreSnapshot> {
