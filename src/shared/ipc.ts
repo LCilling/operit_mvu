@@ -13,6 +13,18 @@ import type {
 } from "../mvu/app/model";
 import type { PersistedAiChange } from "../mvu/app/service";
 import {
+  FIELD_TEMPLATE_MAX_BYTES,
+  FIELD_TEMPLATE_MAX_FIELDS,
+  FIELD_TEMPLATE_MAX_ID_LENGTH,
+  FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD,
+  type ExportFieldTemplateRequest,
+  type FieldTemplateExportSummary,
+  type FieldTemplateImportResult,
+  type FieldTemplatePreview,
+  type ImportFieldTemplateRequest,
+  type PreviewFieldTemplateImportRequest,
+} from "../mvu/app/field-template";
+import {
   QUERY_CURSOR_MAX_LENGTH,
   QUERY_SEARCH_MAX_LENGTH,
   type ConditionInput,
@@ -81,6 +93,9 @@ export const MVU_IPC = {
   judgeState: "operit_mvu:judge_state",
   exportDataset: "operit_mvu:export_dataset",
   importDataset: "operit_mvu:import_dataset",
+  exportFieldTemplate: "operit_mvu:export_field_template",
+  previewFieldTemplateImport: "operit_mvu:preview_field_template_import",
+  importFieldTemplate: "operit_mvu:import_field_template",
   addTemporaryEffect: "operit_mvu:add_temporary_effect",
   updateTemporaryEffect: "operit_mvu:update_temporary_effect",
   deleteTemporaryEffect: "operit_mvu:delete_temporary_effect",
@@ -158,6 +173,12 @@ export interface JudgeStateResponse {
 export interface ExportDatasetResponse {
   fileName: string;
   savedPath: string;
+}
+
+export interface ExportFieldTemplateResponse {
+  fileName: string;
+  savedPath: string;
+  summary: FieldTemplateExportSummary;
 }
 
 export interface ImportDatasetRequest { json: string; }
@@ -758,6 +779,92 @@ function parseImportDatasetRequest(value: unknown): ImportDatasetRequest {
   return { json: requireString(record, "json", "MVU_IMPORT_JSON_REQUIRED") };
 }
 
+function parseTemplateJsonRequest(value: unknown): PreviewFieldTemplateImportRequest {
+  const code = "MVU_FIELD_TEMPLATE_PREVIEW_REQUEST_INVALID";
+  const record = requireRecord(value, code);
+  assertKeys(record, ["json"], [], code);
+  const json = requireString(record, "json", code);
+  if (json.length > FIELD_TEMPLATE_MAX_BYTES) fail("MVU_FIELD_TEMPLATE_TOO_LARGE");
+  return { json };
+}
+
+function parseExportFieldTemplateRequest(value: unknown): ExportFieldTemplateRequest {
+  const code = "MVU_FIELD_TEMPLATE_EXPORT_REQUEST_INVALID";
+  const record = requireRecord(value, code);
+  assertKeys(record, ["fieldIds", "targetSelections"], [], code);
+  const fieldIds = requireStringArray(record.fieldIds, code);
+  if (fieldIds.length === 0 || fieldIds.length > FIELD_TEMPLATE_MAX_FIELDS ||
+    fieldIds.some((id) => id.length === 0 || id.length > FIELD_TEMPLATE_MAX_ID_LENGTH) ||
+    new Set(fieldIds).size !== fieldIds.length) fail(code);
+  if (!Array.isArray(record.targetSelections) || record.targetSelections.length > FIELD_TEMPLATE_MAX_FIELDS) fail(code);
+  const selectedFields = new Set<string>();
+  const targetSelections = record.targetSelections.map((value) => {
+    const selection = requireRecord(value, code);
+    assertKeys(selection, ["fieldId", "targets"], [], code);
+    const fieldId = requireBoundedNonEmptyString(selection, "fieldId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
+    if (!fieldIds.includes(fieldId) || selectedFields.has(fieldId) || !Array.isArray(selection.targets) ||
+      selection.targets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
+    selectedFields.add(fieldId);
+    const targetIds = new Set<string>();
+    const targets = selection.targets.map((targetValue) => {
+      const target = requireRecord(targetValue, code);
+      assertKeys(target, ["targetId", "enabled", "includeValue"], [], code);
+      const targetId = requireBoundedNonEmptyString(target, "targetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
+      if (targetIds.has(targetId)) fail(code);
+      targetIds.add(targetId);
+      const enabled = requireBoolean(target, "enabled", code);
+      const includeValue = requireBoolean(target, "includeValue", code);
+      if (!enabled && includeValue) fail(code);
+      return { targetId, enabled, includeValue };
+    });
+    return { fieldId, targets };
+  });
+  return { fieldIds, targetSelections };
+}
+
+function parseImportFieldTemplateRequest(value: unknown): ImportFieldTemplateRequest {
+  const code = "MVU_FIELD_TEMPLATE_IMPORT_REQUEST_INVALID";
+  const record = requireRecord(value, code);
+  assertKeys(record, ["json", "expectedRevision", "decisions"], [], code);
+  const json = requireString(record, "json", code);
+  if (json.length > FIELD_TEMPLATE_MAX_BYTES) fail("MVU_FIELD_TEMPLATE_TOO_LARGE");
+  const decisionsRecord = requireRecord(record.decisions, code);
+  assertKeys(decisionsRecord, ["fields"], [], code);
+  if (!Array.isArray(decisionsRecord.fields) || decisionsRecord.fields.length > FIELD_TEMPLATE_MAX_FIELDS) fail(code);
+  const fields = decisionsRecord.fields.map((fieldValue) => {
+    const field = requireRecord(fieldValue, code);
+    assertKeys(field, ["sourceFieldId", "mappings"], ["strategy"], code);
+    const sourceFieldId = requireBoundedNonEmptyString(field, "sourceFieldId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
+    if (!Array.isArray(field.mappings) || field.mappings.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
+    const mappings = field.mappings.map((mappingValue) => {
+      const mapping = requireRecord(mappingValue, code);
+      assertKeys(mapping, ["sourceTargetId", "targets"], [], code);
+      const sourceTargetId = requireBoundedNonEmptyString(mapping, "sourceTargetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
+      if (!Array.isArray(mapping.targets) || mapping.targets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
+      const targets = mapping.targets.map((targetValue) => {
+        const target = requireRecord(targetValue, code);
+        assertKeys(target, ["targetId", "enabled", "valuePolicy"], [], code);
+        return {
+          targetId: requireBoundedNonEmptyString(target, "targetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code),
+          enabled: requireBoolean(target, "enabled", code),
+          valuePolicy: requireEnum(target, "valuePolicy", ["template_value", "keep_existing", "field_initial"], code),
+        };
+      });
+      return { sourceTargetId, targets };
+    });
+    const parsed = { sourceFieldId, mappings } as ImportFieldTemplateRequest["decisions"]["fields"][number];
+    if (hasOwn(field, "strategy")) {
+      parsed.strategy = requireEnum(field, "strategy", ["create_copy", "update", "replace"] as const, code);
+    }
+    return parsed;
+  });
+  return {
+    json,
+    expectedRevision: requireExpectedRevision(record, code),
+    decisions: { fields },
+  };
+}
+
 function parseAddTemporaryEffectRequest(value: unknown): AddTemporaryEffectRequest {
   const record = requireRecord(value, "MVU_ADD_EFFECT_REQUEST_INVALID");
   assertKeys(record, ["effect"], [], "MVU_ADD_EFFECT_REQUEST_INVALID");
@@ -1292,6 +1399,9 @@ export const MVU_REQUEST_PARSERS = {
   judgeState: parseJudgeStateRequest,
   exportDataset: parseEmptyRequest,
   importDataset: parseImportDatasetRequest,
+  exportFieldTemplate: parseExportFieldTemplateRequest,
+  previewFieldTemplateImport: parseTemplateJsonRequest,
+  importFieldTemplate: parseImportFieldTemplateRequest,
   addTemporaryEffect: parseAddTemporaryEffectRequest,
   updateTemporaryEffect: parseUpdateTemporaryEffectRequest,
   deleteTemporaryEffect: parseIdRequest,
@@ -1463,6 +1573,31 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
         const parsed = normalizeMvuDataset(JSON.parse(request.json));
         await runtime.service.replaceDataset(parsed);
       })
+    ),
+    ToolPkg.ipc.on<unknown, ExportFieldTemplateResponse>(
+      MVU_IPC.exportFieldTemplate,
+      guarded("exportFieldTemplate", MVU_REQUEST_PARSERS.exportFieldTemplate, async (request) => {
+        const exported = await deps.queries.exportFieldTemplate(request);
+        if (!/^operit-mvu-field-template-[a-z0-9][a-z0-9-]{0,80}-\d{8}-\d{6}Z\.json$/.test(exported.fileName)) {
+          throw new Error("MVU_FIELD_TEMPLATE_EXPORT_FILENAME_INVALID");
+        }
+        const savedPath = `${MVU_EXPORT_DIRECTORY}/${exported.fileName}`;
+        const directoryResult = await Tools.Files.mkdir(MVU_EXPORT_DIRECTORY, true, "android");
+        requireSuccessfulFileOperation("DIRECTORY_CREATE", directoryResult);
+        const writeResult = await Tools.Files.write(savedPath, exported.json, false, "android");
+        requireSuccessfulFileOperation("WRITE", writeResult);
+        return { fileName: exported.fileName, savedPath, summary: exported.summary };
+      })
+    ),
+    ToolPkg.ipc.on<unknown, FieldTemplatePreview>(
+      MVU_IPC.previewFieldTemplateImport,
+      guarded("previewFieldTemplateImport", MVU_REQUEST_PARSERS.previewFieldTemplateImport,
+        (request) => deps.queries.previewFieldTemplateImport(request))
+    ),
+    ToolPkg.ipc.on<unknown, FieldTemplateImportResult>(
+      MVU_IPC.importFieldTemplate,
+      guarded("importFieldTemplate", MVU_REQUEST_PARSERS.importFieldTemplate,
+        (request) => deps.queries.importFieldTemplate(request))
     ),
     ToolPkg.ipc.on<unknown, DataTemporaryEffect>(
       MVU_IPC.addTemporaryEffect,
@@ -1642,6 +1777,15 @@ export const mvuIpcClient = {
   },
   importDataset(request: ImportDatasetRequest): Promise<void> {
     return call<ImportDatasetRequest, void>(MVU_IPC.importDataset, request);
+  },
+  exportFieldTemplate(request: ExportFieldTemplateRequest): Promise<ExportFieldTemplateResponse> {
+    return call<ExportFieldTemplateRequest, ExportFieldTemplateResponse>(MVU_IPC.exportFieldTemplate, request);
+  },
+  previewFieldTemplateImport(request: PreviewFieldTemplateImportRequest): Promise<FieldTemplatePreview> {
+    return call<PreviewFieldTemplateImportRequest, FieldTemplatePreview>(MVU_IPC.previewFieldTemplateImport, request);
+  },
+  importFieldTemplate(request: ImportFieldTemplateRequest): Promise<FieldTemplateImportResult> {
+    return call<ImportFieldTemplateRequest, FieldTemplateImportResult>(MVU_IPC.importFieldTemplate, request);
   },
   addTemporaryEffect(request: AddTemporaryEffectRequest): Promise<DataTemporaryEffect> {
     return call<AddTemporaryEffectRequest, DataTemporaryEffect>(MVU_IPC.addTemporaryEffect, request);

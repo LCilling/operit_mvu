@@ -161,6 +161,12 @@ async function dispatch(method: string, params: JsonParams): Promise<unknown> {
       return mvuIpcClient.exportDataset(MVU_REQUEST_PARSERS.exportDataset(params));
     case "importDataset":
       return mvuIpcClient.importDataset(MVU_REQUEST_PARSERS.importDataset(params));
+    case "exportFieldTemplate":
+      return mvuIpcClient.exportFieldTemplate(MVU_REQUEST_PARSERS.exportFieldTemplate(params));
+    case "previewFieldTemplateImport":
+      return mvuIpcClient.previewFieldTemplateImport(MVU_REQUEST_PARSERS.previewFieldTemplateImport(params));
+    case "importFieldTemplate":
+      return mvuIpcClient.importFieldTemplate(MVU_REQUEST_PARSERS.importFieldTemplate(params));
     case "addTemporaryEffect":
       return mvuIpcClient.addTemporaryEffect(MVU_REQUEST_PARSERS.addTemporaryEffect(params));
     case "updateTemporaryEffect":
