@@ -62,6 +62,7 @@ export interface RuleJudgementResult {
   available: boolean;
   judgements: AiRuleJudgement[];
   raw: string;
+  diagnostics: string[];
 }
 
 export interface RoleAwareConditionMessage {
@@ -247,14 +248,23 @@ export class HostSystemModelApi implements SystemModelApi {
   async judgeRules(request: RuleJudgementRequest): Promise<RuleJudgementResult> {
     const message = normalizeCurrentMessage(request.context, request.message);
     if (message.content.length === 0) throw new Error("MVU_AI_RULE_MESSAGE_EMPTY");
-    const rules = request.rules.filter((rule) =>
+    const eligibleRules = request.rules.filter((rule) =>
       rule.enabled && rule.condition.kind === "aiJudgement"
     );
-    if (rules.length === 0) throw new Error("MVU_AI_RULES_EMPTY");
-    if (rules.length > MODEL_RULE_LIMIT) throw new Error("MVU_AI_RULE_LIMIT_EXCEEDED");
+    if (eligibleRules.length === 0) throw new Error("MVU_AI_RULES_EMPTY");
+    const rules = [...eligibleRules]
+      .sort((left, right) => {
+        const orderDifference = left.order - right.order;
+        if (orderDifference !== 0) return orderDifference;
+        return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+      })
+      .slice(0, MODEL_RULE_LIMIT);
+    const diagnostics = eligibleRules.length > MODEL_RULE_LIMIT
+      ? [`MVU_AI_RULES_OVERFLOW:${eligibleRules.length}:${rules.length}`]
+      : [];
 
     const capability = await this.probe();
-    if (!capability.available) return { available: false, judgements: [], raw: "" };
+    if (!capability.available) return { available: false, judgements: [], raw: "", diagnostics };
 
     try {
       const systemPrompt = buildRuleJudgementSystemPrompt(
@@ -275,6 +285,7 @@ export class HostSystemModelApi implements SystemModelApi {
         available: true,
         judgements: document.matches,
         raw: completion.text,
+        diagnostics,
       };
     } catch (error) {
       console.error("MVU system model rule judgement failed", error);

@@ -15,9 +15,87 @@ import { createEmptyRecordManifest, SegmentedRecordStore } from "../dist/mvu/app
 import { FileMvuStore } from "../dist/mvu/app/store.js";
 import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
 import { installMvuIpc } from "../dist/shared/ipc.js";
-import { createFakeMvuFileApi } from "./helpers.mjs";
+import { createFakeMvuFileApi, legacyDatasetFixture } from "./helpers.mjs";
 
 const CONTEXT = { chatId: "chat-main", actorId: "actor-t", groupId: "group-main", actorName: "T" };
+const PRODUCTION_CONFIG_DIR = "/model-budget-production";
+const PRODUCTION_V2_PATH = `${PRODUCTION_CONFIG_DIR}/operit_mvu.dataset.v2.json`;
+const PRODUCTION_V3_PATH = `${PRODUCTION_CONFIG_DIR}/operit_mvu.dataset.v3.json`;
+
+function installPersistedMessageHost(t, files, hostSnapshot, modelCalls) {
+  const previous = {
+    hasToolPkg: Object.prototype.hasOwnProperty.call(globalThis, "ToolPkg"),
+    toolPkg: globalThis.ToolPkg,
+    hasTools: Object.prototype.hasOwnProperty.call(globalThis, "Tools"),
+    tools: globalThis.Tools,
+  };
+  t.after(() => {
+    if (previous.hasToolPkg) globalThis.ToolPkg = previous.toolPkg;
+    else delete globalThis.ToolPkg;
+    if (previous.hasTools) globalThis.Tools = previous.tools;
+    else delete globalThis.Tools;
+  });
+
+  const successful = () => ({ successful: true, details: "" });
+  globalThis.Tools = { Files: {
+    async exists(path) { return { exists: await files.exists(path) }; },
+    async read(path) { return { content: await files.readText(path) }; },
+    async readPart(path, startLine, endLine) {
+      return { content: await files.readTextPart(path, startLine, endLine) };
+    },
+    async write(path, content, append = false) {
+      if (append) await files.appendText(path, content);
+      else await files.writeText(path, content);
+      return successful();
+    },
+    async move(source, destination) {
+      await files.move(source, destination);
+      return successful();
+    },
+    async replaceAtomically(source, destination) {
+      await files.replaceAtomically(source, destination);
+      return successful();
+    },
+    async deleteFile(path) {
+      await files.deleteFile(path);
+      return successful();
+    },
+    async mkdir(path) {
+      await files.mkdir(path);
+      return successful();
+    },
+  } };
+  globalThis.ToolPkg = {
+    getConfigDir() { return PRODUCTION_CONFIG_DIR; },
+    chatContext: {
+      async snapshot() { return structuredClone(hostSnapshot); },
+    },
+    ipc: {
+      on() { return () => {}; },
+      async call() { throw new Error("UNEXPECTED_IPC_CALL"); },
+    },
+    systemModel: {
+      async probe() { return { available: true, provider: "test", model: "test" }; },
+      async complete(request) {
+        modelCalls.push(structuredClone(request));
+        if (request.jsonSchema.name === "mvu_rule_judgement") {
+          const line = request.systemPrompt.split("\n").find((item) => item.startsWith("候选规则："));
+          const candidates = JSON.parse(line.slice("候选规则：".length));
+          return { text: JSON.stringify({ matches: candidates.map((candidate) => ({
+            ruleId: candidate.ruleId,
+            matched: false,
+            confidence: 0.9,
+            reason: "not matched",
+          })) }) };
+        }
+        if (request.jsonSchema.name === "mvu_state_judgement") {
+          return { text: JSON.stringify({ changes: [] }) };
+        }
+        throw new Error(`UNEXPECTED_MODEL_SCHEMA:${request.jsonSchema.name}`);
+      },
+    },
+  };
+}
 
 function field(id, order, overrides = {}) {
   return {
@@ -91,6 +169,20 @@ function effectGroup(id, fieldIds, overrides = {}) {
     defaultReason: { mode: "template", template: "rule", text: "规则触发" },
     createdAt: "2036-01-01T00:00:00.000Z",
     updatedAt: "2036-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function aiAutoRule(id, order, overrides = {}) {
+  return {
+    id,
+    name: id,
+    description: "",
+    enabled: true,
+    condition: { kind: "aiJudgement", triggerType: "event", requirement: "test", minimumConfidence: 0.7 },
+    effects: [{ fieldId: "field_affinity", delta: 1, temporaryEffectIds: [] }],
+    cooldownMs: 0,
+    order,
     ...overrides,
   };
 }
@@ -613,6 +705,103 @@ test("manual judgeState IPC uses the bounded model projection for more than 40 r
   assert.equal(response.applied, false);
   assert.equal(compatibleCalls, 0);
   assert.equal(modelCalls, 1);
+});
+
+test("judgeRules deterministically selects twenty rules in one call and returns an overflow diagnostic", async () => {
+  const completions = [];
+  const api = new HostSystemModelApi({
+    async probe() { return { available: true }; },
+    async complete(request) {
+      completions.push(request);
+      const line = request.systemPrompt.split("\n").find((item) => item.startsWith("候选规则："));
+      const candidates = JSON.parse(line.slice("候选规则：".length));
+      return { text: JSON.stringify({ matches: candidates.map((candidate) => ({
+        ruleId: candidate.ruleId,
+        matched: false,
+        confidence: 0.9,
+        reason: "not matched",
+      })) }) };
+    },
+  });
+  const rules = Array.from({ length: 21 }, (_, index) =>
+    aiAutoRule(`rule_${String(20 - index).padStart(2, "0")}`, index % 3));
+  const expected = [...rules]
+    .sort((left, right) => left.order - right.order || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+    .slice(0, 20)
+    .map((rule) => rule.id);
+
+  const result = await api.judgeRules({
+    context: CONTEXT,
+    rules,
+    fields: [],
+    recentFacts: [],
+    message: { role: "user", actorId: "actor-t", actorName: "T", content: "trigger" },
+  });
+
+  assert.equal(completions.length, 1);
+  const contractLine = completions[0].systemPrompt.split("\n")
+    .find((line) => line.startsWith("候选规则："));
+  assert.deepEqual(JSON.parse(contractLine.slice("候选规则：".length)).map((item) => item.ruleId), expected);
+  assert.deepEqual(result.judgements.map((item) => item.ruleId), expected);
+  assert.deepEqual(result.diagnostics, ["MVU_AI_RULES_OVERFLOW:21:20"]);
+});
+
+test("production v2 event with twenty-one AI rules still judges state and persists after one rule call", async (t) => {
+  const legacy = legacyDatasetFixture();
+  legacy.fields[0].ai = { enabled: true, minConfidence: 0.7, maxDelta: 10, prompt: "judge" };
+  legacy.autoRules = Array.from({ length: 21 }, (_, index) =>
+    aiAutoRule(`production_rule_${String(20 - index).padStart(2, "0")}`, index % 3));
+  legacy.temporaryEffects = [];
+  const files = createFakeMvuFileApi({ [PRODUCTION_V2_PATH]: JSON.stringify(legacy, null, 2) });
+  files.failNext("replaceAtomically", ({ destination }) => destination === PRODUCTION_V3_PATH);
+  const actor = { characterCardId: "actor_t", name: "T", avatarUri: null };
+  const hostSnapshot = {
+    chatId: "chat_main",
+    activePrompt: { type: "character_card", id: "actor_t", name: "T" },
+    activeCharacter: actor,
+    activeGroup: null,
+    characters: [actor],
+    groups: [],
+    members: [],
+    currentCharacter: actor,
+  };
+  const modelCalls = [];
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (...items) => { warnings.push(items.map(String).join(" ")); };
+  t.after(() => { console.warn = previousWarn; });
+  installPersistedMessageHost(t, files, hostSnapshot, modelCalls);
+  const main = await import(`../dist/main.js?v2-rule-overflow=${Date.now()}`);
+  assert.deepEqual(await main.onApplicationCreate(), { ok: true });
+  assert.equal(files.snapshot()[PRODUCTION_V3_PATH], undefined, "fixture must remain in v2 compatibility mode");
+  assert.equal(JSON.parse(files.snapshot()[PRODUCTION_V2_PATH]).autoRules.length, 21);
+
+  assert.equal(await main.onChatMessagePersisted({
+    eventName: "message_persisted",
+    eventPayload: {
+      chatId: "chat_main",
+      messageId: "message_rule_overflow",
+      variantId: null,
+      actorCharacterCardId: "actor_t",
+      characterGroupId: null,
+      actorName: "T",
+      isComplete: true,
+      timestamp: 2_000_000_000_000,
+      sender: "ai",
+      content: "A production v2 overflow event",
+    },
+  }), null);
+
+  const ruleCalls = modelCalls.filter((call) => call.jsonSchema.name === "mvu_rule_judgement");
+  const stateCalls = modelCalls.filter((call) => call.jsonSchema.name === "mvu_state_judgement");
+  const persisted = JSON.parse(files.snapshot()[PRODUCTION_V2_PATH]);
+  assert.equal(ruleCalls.length, 1, JSON.stringify(modelCalls.map((call) => call.jsonSchema.name)));
+  assert.equal(stateCalls.length, 1);
+  assert.equal(JSON.parse(ruleCalls[0].systemPrompt.split("\n")
+    .find((line) => line.startsWith("候选规则：")).slice("候选规则：".length)).length, 20);
+  assert.equal(warnings.some((warning) => warning.includes("MVU_AI_RULES_OVERFLOW:21:20")), true);
+  assert.equal(persisted.processedMessageIds.length, 1);
+  assert.equal(Object.values(persisted.messageFacts).flat().length, 1);
 });
 
 test("sends bounded role and actor metadata for the current message with one completion", async () => {
