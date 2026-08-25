@@ -87,7 +87,6 @@ export default function Screen(ctx: ComposeDslContext): ComposeNode {
           displayZoomControls: false,
           useWideViewPort: false,
           loadWithOverviewMode: false,
-          textZoom: 100,
           fillMaxSize: true,
         })
       : ctx.UI.Text({

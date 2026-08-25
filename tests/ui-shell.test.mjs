@@ -6,6 +6,8 @@ import { readFile } from "node:fs/promises";
 const runtimeSource = await readFile(new URL("../static/app_ui/runtime.js", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../static/app_ui/app.js", import.meta.url), "utf8");
 const componentsSource = await readFile(new URL("../static/app_ui/components.js", import.meta.url), "utf8");
+const rulesSource = await readFile(new URL("../static/app_ui/pages-rules.js", import.meta.url), "utf8");
+const stylesSource = await readFile(new URL("../static/app_ui/styles.css", import.meta.url), "utf8");
 
 function page(items) {
   return { items, loadedCount: items.length, totalCount: items.length, hasMore: false, nextCursor: null };
@@ -200,6 +202,15 @@ test("snapshot and query validation rejects malformed items for every DTO kind",
   assert.throws(() => ui.validateQueryResponse(page([{ characterGroupId: 7 }]), "groups"), /INVALID/);
 });
 
+test("demo snapshot obeys the same validated DTO contracts as the host", async () => {
+  const { ui } = createHarness();
+  ui.state.demo = true;
+
+  const snapshot = await ui.native.call("snapshot", {});
+
+  assert.doesNotThrow(() => ui.validateCompactSnapshot(snapshot));
+});
+
 test("range validation disables unchanged input and previews proportional mapping", async () => {
   const { context, ui } = createHarness();
   ui.native.call = async (method) => method === "snapshot" ? validSnapshot() : page([]);
@@ -236,6 +247,7 @@ test("stage names dots and thresholds share exact normalized positions for arbit
   assert.match(html, /class="stage-marker edge-start" style="--stage-position:0%/);
   assert.match(html, /class="stage-marker active" style="--stage-position:10%/);
   assert.match(html, /class="stage-marker edge-end" style="--stage-position:90%/);
+  assert.doesNotMatch(stylesSource, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/);
 });
 
 test("field detail requests bounded records for its field and exact scope", async () => {
@@ -256,4 +268,38 @@ test("field detail requests bounded records for its field and exact scope", asyn
   assert.equal(request.page, 1);
   assert.equal(request.filters.fieldId, "field_a");
   assert.equal(request.filters.scopeKey, "character:actor_a");
+});
+
+test("segmented tabs have unique transitions, owned panels, and roving tabindex", () => {
+  const { context, ui } = createHarness();
+  vm.runInContext(componentsSource, context, { filename: "components.js" });
+
+  const status = ui.components.segmented([{ id: "character", label: "角色" }, { id: "group", label: "群组" }], "character", "data-mode", "状态范围");
+  const reason = ui.components.segmented([{ id: "template", label: "模板" }, { id: "custom", label: "自定义" }], "custom", "data-reason", "原因模式");
+
+  assert.match(status, /aria-controls="segment-panel-status-scope"/);
+  assert.match(status, /tabindex="0"[^>]*data-mode="character"/);
+  assert.match(status, /tabindex="-1"[^>]*data-mode="group"/);
+  assert.match(status, /--segment-transition:segment-status-scope/);
+  assert.match(reason, /--segment-transition:segment-reason-mode/);
+  assert.doesNotMatch(status + reason, /view-transition-name:segmented-selection/);
+});
+
+test("segmented keyboard activation restores focus and reason tabs switch content", () => {
+  assert.match(appSource, /pendingSegmentFocusId\s*=\s*nextTab\.id/);
+  assert.match(appSource, /getElementById\(pendingSegmentFocusId\)/);
+  assert.match(appSource, /data-reason-mode/);
+  assert.match(rulesSource, /effectReasonMode/);
+  assert.match(rulesSource, /自定义原因内容/);
+});
+
+test("avatar rendering rejects executable URI schemes", () => {
+  const { context, ui } = createHarness();
+  vm.runInContext(componentsSource, context, { filename: "components.js" });
+
+  const unsafe = ui.components.actorSelector([{ characterId: "a", name: "甲", enabled: true, avatarUri: "javascript:alert(1)" }], "a");
+  const safe = ui.components.actorSelector([{ characterId: "b", name: "乙", enabled: true, avatarUri: "content://avatars/b" }], "b");
+
+  assert.doesNotMatch(unsafe, /<img/);
+  assert.match(safe, /<img src="content:\/\/avatars\/b"/);
 });

@@ -23,13 +23,13 @@
       ? '<div class="status-field-list">' + fields.map(function (field) { return c.fieldCard(field); }).join("") + "</div>"
       : c.emptyState("favorite", "当前没有可显示状态", "请前往配置创建字段，并为当前上下文启用。",
         '<button type="button" class="button primary" data-route="config-fields">新增字段</button>');
-    return '<div class="status-page">' + modeControl + identitySelector +
+    return '<div class="status-page">' + modeControl + '<div id="segment-panel-status-scope" role="tabpanel">' + identitySelector +
       '<section class="context-hero"><span class="context-avatar">' + c.icon(groupMode ? "groups" : "person") + '</span><div><p>' +
       (groupMode ? "群组状态" : "角色状态") + '</p><h2>' + ui.escapeHtml(identityName) + '</h2><span>' +
       ui.escapeHtml(snapshot.contextLabels.chatName) + "</span></div>" +
       '<button type="button" class="text-action" data-route="records">查看记录</button></section>' +
       c.sectionHeading("当前状态", fields.length + " 个字段", '<span class="count-badge">' + snapshot.counts.fields + "</span>") +
-      fieldsMarkup + "</div>";
+      fieldsMarkup + "</div></div>";
   }
 
   function fieldDetailPage() {
