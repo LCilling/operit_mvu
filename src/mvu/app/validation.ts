@@ -42,6 +42,41 @@ import {
 } from "./temporary-effect";
 
 const STABLE_ID = /^[A-Za-z][A-Za-z0-9_]*$/;
+export const CONDITION_STRING_ARRAY_MAX_ITEMS = 100;
+export const CONDITION_STRING_ARRAY_ITEM_MAX_LENGTH = 256;
+
+/** Shared production boundary for condition ID/date arrays. Duplicate entries remain allowed. */
+export function isBoundedConditionStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= CONDITION_STRING_ARRAY_MAX_ITEMS &&
+    value.every((entry) => typeof entry === "string" && entry.length > 0 &&
+      entry.length <= CONDITION_STRING_ARRAY_ITEM_MAX_LENGTH);
+}
+
+function daysInGregorianMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leapYear ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+/** Strict YYYY-MM-DD validation without Date.parse rollover behavior. */
+export function isGregorianCalendarDate(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInGregorianMonth(year, month);
+}
+
+/** Repeating dates use the Gregorian month maximum; February 29 is a valid annual target. */
+export function isGregorianRepeatingDate(month: unknown, day: unknown): boolean {
+  return typeof month === "number" && Number.isInteger(month) && month >= 1 && month <= 12 &&
+    typeof day === "number" && Number.isInteger(day) && day >= 1 &&
+    day <= daysInGregorianMonth(2000, month);
+}
 
 function fail(code: string): never {
   throw new Error(code);
@@ -1189,17 +1224,19 @@ function assertConditionPredicateShape(value: unknown): asserts value is Conditi
       assertSenderArray(value.senders, "MVU_V3_CONDITION_SENDER_INVALID");
       return;
     case "actor":
-      assertStringArray(value.actorIds, "MVU_V3_CONDITION_ACTOR_INVALID");
+      if (!isBoundedConditionStringArray(value.actorIds)) fail("MVU_V3_CONDITION_ACTOR_INVALID");
       return;
     case "group":
-      assertStringArray(value.groupIds, "MVU_V3_CONDITION_GROUP_INVALID");
+      if (!isBoundedConditionStringArray(value.groupIds)) fail("MVU_V3_CONDITION_GROUP_INVALID");
       return;
     case "concrete_date":
-      assertStringArray(value.dates, "MVU_V3_CONDITION_CONCRETE_DATE_INVALID");
+      if (!isBoundedConditionStringArray(value.dates) ||
+        !value.dates.every(isGregorianCalendarDate)) {
+        fail("MVU_V3_CONDITION_CONCRETE_DATE_INVALID");
+      }
       return;
     case "repeating_date":
-      if (typeof value.month !== "number" || !Number.isInteger(value.month) || value.month < 1 || value.month > 12 ||
-        typeof value.day !== "number" || !Number.isInteger(value.day) || value.day < 1 || value.day > 31) {
+      if (!isGregorianRepeatingDate(value.month, value.day)) {
         fail("MVU_V3_CONDITION_REPEATING_DATE_INVALID");
       }
       return;

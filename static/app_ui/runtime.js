@@ -125,6 +125,7 @@
     navigate,
     goBack,
     render: null,
+    onSnapshotRevisionChanged: null,
     transition,
     loadSnapshot,
     loadRouteData,
@@ -841,6 +842,10 @@
     if (snapshot.activeContext.actorId) state.lastActorId = snapshot.activeContext.actorId;
     if (!snapshot.activeContext.groupId) state.statusMode = "character";
     state.fatal = null;
+    if (previousRevision !== null && previousRevision !== snapshot.revision &&
+        typeof window.MvuUi.onSnapshotRevisionChanged === "function") {
+      window.MvuUi.onSnapshotRevisionChanged(previousRevision, snapshot.revision);
+    }
     return snapshot;
   }
 

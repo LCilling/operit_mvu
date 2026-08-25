@@ -23,6 +23,7 @@
   ui.hydrateConditionRows = hydrateConditionRows;
   ui.prepareConditionEditor = prepareConditionEditor;
   ui.resetConditionEditorDraft = resetConditionEditorDraft;
+  ui.onSnapshotRevisionChanged = handleConditionSnapshotRevisionChanged;
   ui.conditionEditor = {
     serializeExpression: serializeConditionExpression,
     defaultPredicate: defaultConditionPredicate,
@@ -444,6 +445,7 @@
       references: null,
       referenceError: "",
       referenceLoading: Boolean(entity),
+      referenceRequestSequence: 0,
       referencePage: 1,
       referenceSearch: "",
       submitting: false,
@@ -459,25 +461,49 @@
     return draft;
   }
 
-  async function loadConditionEditorReferences(draft, shouldRender) {
-    if (!draft || !draft.id || (draft.referenceLoading && shouldRender)) return;
+  async function loadConditionEditorReferences(draft, shouldRender, force) {
+    if (!draft || !draft.id || (draft.referenceLoading && shouldRender && !force)) return;
+    const checkedRevision = ui.state.snapshot && ui.state.snapshot.revision;
+    if (!Number.isSafeInteger(checkedRevision) || checkedRevision < 0) {
+      draft.references = null;
+      draft.referenceError = "引用读取失败：当前数据修订无效";
+      draft.referenceLoading = false;
+      if (shouldRender) render();
+      return;
+    }
+    const requestSequence = (draft.referenceRequestSequence || 0) + 1;
+    draft.referenceRequestSequence = requestSequence;
     draft.referenceLoading = true;
     draft.referenceError = "";
     if (shouldRender) render();
     try {
       const response = await ui.native.call("getConditionReferences", { id: draft.id, page: 1 });
-      if (ui.state.conditionEditorDraft !== draft) return;
-      draft.references = validateConditionReferenceResponse(response);
+      if (ui.state.conditionEditorDraft !== draft || draft.referenceRequestSequence !== requestSequence) return;
+      if (!ui.state.snapshot || ui.state.snapshot.revision !== checkedRevision) return;
+      draft.references = { ...validateConditionReferenceResponse(response), checkedRevision };
     } catch (error) {
-      if (ui.state.conditionEditorDraft !== draft) return;
+      if (ui.state.conditionEditorDraft !== draft || draft.referenceRequestSequence !== requestSequence) return;
       draft.references = null;
       draft.referenceError = "引用读取失败：" + conditionErrorMessage(error);
     } finally {
-      if (ui.state.conditionEditorDraft === draft) {
+      if (ui.state.conditionEditorDraft === draft && draft.referenceRequestSequence === requestSequence) {
         draft.referenceLoading = false;
         if (shouldRender) render();
       }
     }
+  }
+
+  function handleConditionSnapshotRevisionChanged(previousRevision, nextRevision) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft || !draft.id || draft.mutationCommitted) return;
+    if (draft.references && draft.references.checkedRevision === nextRevision && !draft.referenceError) return;
+    draft.referenceRequestSequence = (draft.referenceRequestSequence || 0) + 1;
+    draft.references = null;
+    draft.referenceError = "";
+    draft.referenceLoading = false;
+    draft.error = "数据修订已从 " + previousRevision + " 更新为 " + nextRevision + "，正在重新检查受影响规则；完成前无法保存。";
+    render();
+    void loadConditionEditorReferences(draft, true, true);
   }
 
   async function retryConditionEditorReferences() {
@@ -710,7 +736,8 @@
   async function saveConditionEditor() {
     const draft = ui.state.conditionEditorDraft;
     if (!draft || draft.submitting || draft.mutationCommitted) return;
-    if (draft.id && (!draft.references || draft.referenceError || draft.referenceLoading)) {
+    if (draft.id && (!draft.references || draft.referenceError || draft.referenceLoading ||
+        draft.references.checkedRevision !== ui.state.snapshot.revision)) {
       draft.error = "影响范围未知，保存已阻止。请重试引用检查，确认受影响规则后再保存。";
       render();
       return;
@@ -932,6 +959,23 @@
           loading: false,
           error: "删除已经提交，但列表刷新失败。请只重新载入，不要重复删除。",
         };
+      } else if (/MVU_STALE_REVISION/.test(error instanceof Error ? error.message : String(error))) {
+        const recovery = {
+          kind: "stale-delete",
+          revision: null,
+          loading: false,
+          error: "删除前数据已变化，删除未提交。正在重新载入最新权威数据并重新检查条件状态。",
+        };
+        ui.state.conditionDeleteDialog = null;
+        ui.state.conditionListRecovery = recovery;
+        try {
+          await ui.loadSnapshot();
+          await ui.loadRouteData("condition-library");
+          recovery.revision = ui.state.snapshot.revision;
+          recovery.error = "删除前发生修订冲突，删除未提交；已载入最新权威修订 " + recovery.revision + "。请重新载入 / 重新检查后再决定是否删除。";
+        } catch (refreshError) {
+          recovery.error = "删除前发生修订冲突，删除未提交，且最新权威数据读取失败。请使用下方入口重新载入 / 重新检查。";
+        }
       } else {
         dialog.deleting = false;
         dialog.error = conditionErrorMessage(error);
