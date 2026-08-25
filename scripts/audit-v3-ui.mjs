@@ -179,6 +179,46 @@ requireMatch(files["runtime.js"], /records:\s*\{[\s\S]*?method:\s*"queryRecords"
   "records must use the server-owned ten-row policy");
 requireMatch(files["pages-config.js"], /management-summary[\s\S]*?当前值[\s\S]*?数值范围[\s\S]*?>查看<[\s\S]*?>修改</,
   "compact field rows must show scope, binding, value/range, status, view and edit actions");
+requireMatch(files["pages-config.js"], /open-field-template-import[\s\S]*?open-field-template-export[\s\S]*?field-template-dialog/,
+  "field-template import/export must be integrated into the five-row field management flow");
+requireMatch(files["pages-config.js"], /基础信息[\s\S]*?作用范围[\s\S]*?字段外观[\s\S]*?详细配置/,
+  "field editor sections must share the established section-heading hierarchy");
+requireMatch(files["pages-config.js"], /scopeButton\("chat"[\s\S]*?bindCurrentChat[\s\S]*?高级绑定设置/,
+  "conversation scope must default to readable current-chat binding with collapsed advanced controls");
+requireMatch(files["app.js"], /saveFieldEditor[\s\S]*?addField[\s\S]*?updateField[\s\S]*?loadSnapshot[\s\S]*?config-fields/,
+  "field create/update must save through native IPC and reload the authoritative five-row list");
+requireMatch(files["app.js"], /previewFieldTemplateImport[\s\S]*?previewRevision[\s\S]*?importFieldTemplate/,
+  "field-template import must retain preview revision through preview and atomic commit");
+requireMatch(files["pages-config.js"], /all_on[\s\S]*?全部启用[\s\S]*?all_off[\s\S]*?全部停用[\s\S]*?file_suggestion[\s\S]*?采用文件建议/,
+  "field-template mapping must expose per-field bulk enable controls");
+requireMatch(files["pages-config.js"], /不会按源 ID 静默覆盖/,
+  "field-template export must explain that source IDs are only mapping suggestions");
+requireMatch(files["app.js"], /refreshFieldTemplatePreview[\s\S]*?loadFieldTemplatePreview\(flow,\s*true\)[\s\S]*?STALE_REVISION/,
+  "stale field-template imports must visibly re-preview the same file before retry");
+requireMatch(files["pages-config.js"], /data-repair-categories/,
+  "field-template preview and result must render categorized repair work");
+requireMatch(files["app.js"], /规则[\s\S]*?条件[\s\S]*?状态联动[\s\S]*?临时效果[\s\S]*?其他无效引用/,
+  "field-template preview and result must expose categorized repair work");
+requireMatch(files["runtime.js"], /if\s*\(method === "addField"\)[\s\S]*?if\s*\(method === "updateField"\)/,
+  "demo native must implement real field create/update responses");
+requireMatch(files["runtime.js"], /if\s*\(method === "exportFieldTemplate"\)[\s\S]*?if\s*\(method === "previewFieldTemplateImport"\)[\s\S]*?if\s*\(method === "importFieldTemplate"\)/,
+  "demo native must implement field CRUD and real field-template preview/export/import responses");
+requireMatch(index, /id="fieldTemplateImportPicker"[^>]*type="file"[^>]*application\/json/,
+  "field-template import needs its own JSON file input");
+requireMatch(files["app.js"], /fieldTemplateImportPicker\.value\s*=\s*""/,
+  "field-template file input must reset so the same file can be selected again");
+requireMatch(styles, /\.field-template-dialog[\s\S]*?max-width:[\s\S]*?overflow-x:\s*hidden/,
+  "field-template dialog must remain bounded without horizontal overflow on narrow WebViews");
+requireMatch(files["pages-config.js"], /field-template-dialog[^\n]*role="dialog"[^\n]*aria-modal="true"/,
+  "field-template flow must expose modal dialog semantics");
+requireMatch(files["app.js"], /fieldTemplateFlow[\s\S]*?event\.key === "Escape"[\s\S]*?event\.key === "Tab"[\s\S]*?trapFocus/,
+  "field-template dialog must close on Escape and trap keyboard focus");
+requireMatch(files["app.js"], /field-template-layer[\s\S]*?restoreFocusDescriptor[\s\S]*?focusFieldTemplateOpener/,
+  "field-template overlay clicks must stay inside and closing must restore its logical opener");
+requireMatch(styles, /\.template-step[\s\S]*?transition:[\s\S]*?(?:180|200|220)ms/,
+  "field-template step changes need a short purposeful transition");
+requireMatch(files["runtime.js"], /validateEffectReasonConfig\(effect\.defaultReason\)[\s\S]*?keys\.length !== 3[\s\S]*?reason\.text\.length > 512/,
+  "complete effect-group DTOs must fail closed without an exact bounded defaultReason");
 requireMatch(files["pages-rules.js"], /rule-summary[\s\S]*?触发角色[\s\S]*?触发条件[\s\S]*?触发结果[\s\S]*?>查看<[\s\S]*?>修改</,
   "compact rule rows must show actor, condition and action summaries with view/edit actions");
 requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,

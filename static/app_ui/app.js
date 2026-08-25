@@ -3,6 +3,7 @@
   const appRoot = document.getElementById("appRoot");
   const backgroundPicker = document.getElementById("backgroundPicker");
   const datasetImportPicker = document.getElementById("datasetImportPicker");
+  const fieldTemplateImportPicker = document.getElementById("fieldTemplateImportPicker");
   const toast = document.getElementById("toast");
   const BACKGROUND_KEY = "operit_mvu.customBackground";
   const BACKGROUND_MAX_EDGE = 1600;
@@ -16,6 +17,7 @@
   ui.switchStatusMode = switchStatusMode;
   ui.importDatasetText = importDataset;
   ui.exportDataset = exportDataset;
+  ui.importFieldTemplateText = importFieldTemplateText;
   ui.validateFieldRangeDraft = validateFieldRangeDraft;
 
   function render(options) {
@@ -222,7 +224,13 @@
     const editField = target.closest('[data-action="edit-field"]');
     if (editField) {
       ui.state.selectedEntityId = editField.dataset.fieldId;
+      ui.resetFieldEditorDraft();
       await ui.navigate("field-editor");
+      return;
+    }
+    const scopeOption = target.closest("[data-scope]");
+    if (scopeOption && scopeOption.closest('[data-form="field-editor"]')) {
+      selectFieldScope(scopeOption.dataset.scope);
       return;
     }
     const pickerChoice = target.closest("[data-picker-id]");
@@ -275,7 +283,8 @@
     const actionButton = target.closest("[data-action]");
     if (!actionButton) return;
     if (target.closest("[data-stop-close]") &&
-        (actionButton.classList.contains("drawer-layer") || actionButton.classList.contains("picker-layer"))) return;
+        (actionButton.classList.contains("drawer-layer") || actionButton.classList.contains("picker-layer") ||
+          actionButton.classList.contains("field-template-layer"))) return;
     await handleAction(actionButton.dataset.action, actionButton);
   }
 
@@ -306,10 +315,43 @@
       await saveFieldRange(element);
     } else if (action === "new-field") {
       ui.state.selectedEntityId = "";
+      ui.resetFieldEditorDraft();
       await ui.navigate("field-editor");
     } else if (action === "edit-current-field") {
       ui.state.selectedEntityId = ui.state.selectedFieldId;
+      ui.resetFieldEditorDraft();
       await ui.navigate("field-editor");
+    } else if (action === "add-field-stage") {
+      addFieldStage();
+    } else if (action === "remove-field-stage") {
+      removeFieldStage(Number(element.dataset.stageIndex));
+    } else if (action === "open-field-template-import") {
+      ui.state.fieldTemplateImportOpener = element;
+      fieldTemplateImportPicker.click();
+    } else if (action === "open-field-template-export") {
+      openFieldTemplateExport(element);
+    } else if (action === "close-field-template-flow") {
+      closeFieldTemplateFlow();
+    } else if (action === "choose-template-export-fields") {
+      await chooseTemplateExportFields(element);
+    } else if (action === "choose-template-export-targets") {
+      await chooseTemplateExportTargets(element);
+    } else if (action === "commit-field-template-export") {
+      await commitFieldTemplateExport();
+    } else if (action === "next-field-template-import") {
+      moveFieldTemplateImport(1);
+    } else if (action === "previous-field-template-import") {
+      moveFieldTemplateImport(-1);
+    } else if (action === "choose-template-import-targets") {
+      await chooseTemplateImportTargets(element);
+    } else if (action === "set-import-field-enabled") {
+      setImportFieldEnabled(element.dataset.templateFieldId, element.dataset.importBatchMode);
+    } else if (action === "commit-field-template-import") {
+      await commitFieldTemplateImport();
+    } else if (action === "refresh-field-template-preview") {
+      await refreshFieldTemplatePreview();
+    } else if (action === "finish-field-template-import") {
+      closeFieldTemplateFlow();
     } else if (action === "open-status-actor-picker" || action === "open-status-group-picker") {
       await openStatusPicker(action, element);
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
@@ -374,6 +416,13 @@
       opener: element,
       onCommit(ids, items) {
         ui.state.editorSelections[key] = { ids, items };
+        if (key === "field-scope-character" || key === "field-scope-group") {
+          const draft = ui.state.fieldEditorDraft;
+          if (draft) {
+            draft.bindingIds = ids.slice();
+            draft.error = "";
+          }
+        }
       },
     });
   }
@@ -430,6 +479,18 @@
       nextTab.click();
       return;
     }
+    if (ui.state.fieldTemplateFlow) {
+      const dialog = appRoot.querySelector(".field-template-dialog");
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeFieldTemplateFlow();
+        return;
+      }
+      if (event.key === "Tab" && dialog) {
+        trapFocus(dialog, event);
+        return;
+      }
+    }
     if (!ui.state.drawerOpen) return;
     if (event.key === "Escape") {
       event.preventDefault();
@@ -461,6 +522,7 @@
     handleRangeInput(event);
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest('[data-form="field-editor"]')) captureFieldEditorControl(target);
     const pickerSearch = target.closest("[data-picker-search]");
     if (pickerSearch) {
       ui.searchEntityPicker(pickerSearch.value);
@@ -481,6 +543,34 @@
   function handleAppChange(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest('[data-form="field-editor"]')) {
+      captureFieldEditorControl(target);
+      if (target.name === "bindCurrentChat") {
+        const draft = ui.state.fieldEditorDraft;
+        draft.chatAutoBind = target.checked;
+        draft.bindingIds = target.checked && ui.state.snapshot.activeContext.chatId
+          ? [ui.state.snapshot.activeContext.chatId]
+          : [];
+        render();
+      }
+      return;
+    }
+    const exportTargetControl = target.closest("[data-export-target-enabled], [data-export-include-value]");
+    if (exportTargetControl) {
+      updateExportTargetControl(exportTargetControl);
+      return;
+    }
+    const importStrategyControl = target.closest("[data-import-strategy]");
+    if (importStrategyControl) {
+      ui.state.fieldTemplateFlow.strategies[importStrategyControl.dataset.importStrategy] = importStrategyControl.value;
+      ui.state.fieldTemplateFlow.error = "";
+      return;
+    }
+    const importTargetControl = target.closest("[data-import-target-enabled], [data-import-value-policy]");
+    if (importTargetControl) {
+      updateImportTargetControl(importTargetControl);
+      return;
+    }
     const listFilter = target.closest("[data-list-filter-route]");
     if (listFilter) {
       const route = listFilter.dataset.listFilterRoute;
@@ -675,6 +765,582 @@
     return { changed, error: "", previewValue, mappedStep };
   }
 
+  function selectFieldScope(scope) {
+    if (!["character", "group", "global", "chat"].includes(scope)) return;
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || draft.scope === scope) return;
+    draft.scope = scope;
+    draft.error = "";
+    draft.bindingIds = [];
+    draft.chatAutoBind = false;
+    if (scope === "chat" && ui.state.snapshot.activeContext.chatId) {
+      draft.chatAutoBind = true;
+      draft.bindingIds = [ui.state.snapshot.activeContext.chatId];
+    }
+    ui.transition(render);
+  }
+
+  function captureFieldEditorControl(target) {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft) return;
+    draft.error = "";
+    const stageName = target.dataset.stageName;
+    const stageThreshold = target.dataset.stageThreshold;
+    const stageDescription = target.dataset.stageDescription;
+    if (stageName !== undefined && draft.stages[Number(stageName)]) {
+      draft.stages[Number(stageName)].name = target.value;
+      return;
+    }
+    if (stageThreshold !== undefined && draft.stages[Number(stageThreshold)]) {
+      draft.stages[Number(stageThreshold)].threshold = target.value;
+      return;
+    }
+    if (stageDescription !== undefined && draft.stages[Number(stageDescription)]) {
+      draft.stages[Number(stageDescription)].description = target.value;
+      return;
+    }
+    const numberFields = new Set(["minimum", "maximum", "step", "initialValue"]);
+    if (numberFields.has(target.name)) draft[target.name] = target.value;
+    else if (["name", "description", "icon", "themeColor", "modelVisibility"].includes(target.name)) draft[target.name] = target.value;
+    else if (target.name === "enabled") draft.enabled = target.checked;
+    else if (target.name === "naturalEnabled") draft.naturalChange.enabled = target.checked;
+    else if (target.name === "naturalUnitMs") draft.naturalChange.unitMs = target.value;
+    else if (target.name === "naturalAmount") draft.naturalChange.amount = target.value;
+    else if (target.name === "turnEnabled") draft.perTurnChange.enabled = target.checked;
+    else if (target.name === "turnInterval") draft.perTurnChange.intervalTurns = target.value;
+    else if (target.name === "turnAmount") draft.perTurnChange.amount = target.value;
+    else if (target.name === "turnCountMode") draft.perTurnChange.countMode = target.value;
+    else if (target.name === "aiEnabled") draft.ai.enabled = target.checked;
+    else if (target.name === "aiMinConfidence") draft.ai.minConfidence = target.value;
+    else if (target.name === "aiMaxDelta") draft.ai.maxDelta = target.value;
+    else if (target.name === "aiPrompt") draft.ai.prompt = target.value;
+  }
+
+  function addFieldStage() {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft) return;
+    const previous = draft.stages.at(-1);
+    const threshold = previous ? Number(previous.threshold) + Number(draft.step || 1) : Number(draft.minimum || 0);
+    draft.stages.push({ id: "stage-" + Date.now().toString(36) + "-" + draft.stages.length, name: "新阶段", description: "", threshold });
+    render();
+  }
+
+  function removeFieldStage(index) {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft || draft.stages.length <= 1 || !Number.isSafeInteger(index) || index < 0 || index >= draft.stages.length) return;
+    draft.stages.splice(index, 1);
+    render();
+  }
+
+  function numberFromDraft(value, label) {
+    if (typeof value === "string" && value.trim().length === 0) throw new Error("请填写" + label + "。");
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) throw new Error(label + "必须是有效数值。");
+    return parsed;
+  }
+
+  function buildFieldInput(draft) {
+    const minimum = numberFromDraft(draft.minimum, "数值下限");
+    const maximum = numberFromDraft(draft.maximum, "数值上限");
+    const step = numberFromDraft(draft.step, "变化步长");
+    const initialValue = numberFromDraft(draft.initialValue, "初始值");
+    if (!draft.name.trim()) throw new Error("请填写字段名称。");
+    if (minimum >= maximum) throw new Error("数值下限必须小于上限。");
+    if (step <= 0 || step > maximum - minimum) throw new Error("变化步长必须大于 0，且不能超过数值范围。");
+    if (initialValue < minimum || initialValue > maximum) throw new Error("初始值必须位于数值范围内。");
+    const stages = draft.stages.map(function (stage, index) {
+      const threshold = numberFromDraft(stage.threshold, "第 " + (index + 1) + " 个阶段起始值");
+      if (!String(stage.name).trim()) throw new Error("请填写第 " + (index + 1) + " 个阶段名称。");
+      return { id: String(stage.id || "stage-" + (index + 1)), name: String(stage.name).trim(), description: String(stage.description || ""), threshold };
+    }).sort(function (left, right) { return left.threshold - right.threshold; });
+    if (stages[0].threshold !== minimum) throw new Error("首个阶段起始值必须等于数值下限。");
+    if (stages.some(function (stage, index) {
+      return stage.threshold < minimum || stage.threshold > maximum || (index > 0 && stage.threshold <= stages[index - 1].threshold);
+    })) throw new Error("阶段起始值需在范围内并严格递增。");
+    if ((draft.scope === "character" || draft.scope === "group") && draft.bindingIds.length === 0) {
+      throw new Error("请选择至少一个" + (draft.scope === "character" ? "角色" : "群组") + "，或改用其它作用范围。");
+    }
+    return {
+      name: draft.name.trim(),
+      description: String(draft.description || "").trim(),
+      minimum,
+      maximum,
+      step,
+      initialValue,
+      icon: String(draft.icon || "favorite").trim() || "favorite",
+      themeColor: String(draft.themeColor || "#7058d8"),
+      enabled: Boolean(draft.enabled),
+      scope: draft.scope,
+      modelVisibility: draft.modelVisibility,
+      ai: {
+        enabled: Boolean(draft.ai.enabled),
+        minConfidence: numberFromDraft(draft.ai.minConfidence, "AI 最低置信度"),
+        maxDelta: numberFromDraft(draft.ai.maxDelta, "AI 单次最大变化"),
+        prompt: String(draft.ai.prompt || ""),
+      },
+      stages,
+      bindingIds: draft.scope === "global" ? [] : draft.bindingIds.slice(),
+      naturalChange: {
+        enabled: Boolean(draft.naturalChange.enabled),
+        unitMs: numberFromDraft(draft.naturalChange.unitMs, "自然变化间隔"),
+        amount: numberFromDraft(draft.naturalChange.amount, "自然变化量"),
+      },
+      perTurnChange: {
+        enabled: Boolean(draft.perTurnChange.enabled),
+        intervalTurns: numberFromDraft(draft.perTurnChange.intervalTurns, "每轮变化间隔"),
+        amount: numberFromDraft(draft.perTurnChange.amount, "每轮变化量"),
+        countMode: draft.perTurnChange.countMode,
+      },
+    };
+  }
+
+  async function saveFieldEditor() {
+    const draft = ui.state.fieldEditorDraft;
+    if (!draft) return;
+    try {
+      const field = buildFieldInput(draft);
+      setBusy(true);
+      if (draft.identity === "__new__") await ui.native.call("addField", { field });
+      else await ui.native.call("updateField", { id: draft.identity, patch: field });
+      await ui.loadSnapshot();
+      ui.state.listViews.fields = { ...ui.state.listViews.fields, page: 1, search: field.name, filters: {} };
+      ui.resetFieldEditorDraft();
+      ui.state.selectedEntityId = "";
+      await ui.navigate("config-fields", { replace: true, force: true });
+      showToast(draft.identity === "__new__" ? "字段已创建" : "字段已保存");
+    } catch (error) {
+      draft.error = error instanceof Error ? error.message : "保存失败，请重试。";
+      render();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function fieldTemplateFocusDescriptor(action) {
+    return { action };
+  }
+
+  function focusFieldTemplateDialog() {
+    Promise.resolve().then(function () {
+      const dialog = appRoot.querySelector(".field-template-dialog");
+      if (!dialog) return;
+      const first = dialog.querySelector("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])");
+      if (first && typeof first.focus === "function") first.focus();
+    });
+  }
+
+  function focusFieldTemplateOpener(restoreFocus, descriptor) {
+    let target = restoreFocus;
+    if (descriptor && descriptor.action) {
+      target = Array.from(appRoot.querySelectorAll("[data-action]")).find(function (candidate) {
+        return candidate.dataset.action === descriptor.action;
+      }) || target;
+    }
+    if (target && typeof target.focus === "function") target.focus();
+  }
+
+  function openFieldTemplateExport(opener) {
+    ui.state.fieldTemplateFlow = {
+      mode: "export",
+      selectedFields: [],
+      exportTargets: {},
+      error: "",
+      result: null,
+      restoreFocus: opener || null,
+      restoreFocusDescriptor: fieldTemplateFocusDescriptor("open-field-template-export"),
+    };
+    render();
+    focusFieldTemplateDialog();
+  }
+
+  function closeFieldTemplateFlow() {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow) return;
+    const restoreFocus = flow.restoreFocus;
+    const descriptor = flow.restoreFocusDescriptor;
+    ui.state.fieldTemplateFlow = null;
+    void ui.transition(render).then(function () {
+      focusFieldTemplateOpener(restoreFocus, descriptor);
+    });
+  }
+
+  async function chooseTemplateExportFields(opener) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "export") return;
+    await ui.openEntityPicker({
+      entity: "fields",
+      title: "选择要导出的字段",
+      mode: "multiple",
+      selectedIds: flow.selectedFields.map(function (field) { return field.id; }),
+      selectedItems: flow.selectedFields,
+      opener,
+      onCommit(ids, items) {
+        const itemById = new Map(items.map(function (item) { return [item.id, item]; }));
+        flow.selectedFields = ids.map(function (id) { return itemById.get(id); }).filter(Boolean);
+        const retained = {};
+        flow.selectedFields.forEach(function (field) { retained[field.id] = flow.exportTargets[field.id] || []; });
+        flow.exportTargets = retained;
+        flow.error = "";
+      },
+    });
+  }
+
+  async function chooseTemplateExportTargets(opener) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "export") return;
+    const field = flow.selectedFields.find(function (candidate) { return candidate.id === opener.dataset.templateFieldId; });
+    if (!field) return;
+    const previous = flow.exportTargets[field.id] || [];
+    const group = opener.dataset.templateTargetEntity === "groups";
+    await ui.openEntityPicker({
+      entity: group ? "groups" : "actors",
+      title: group ? "选择已绑定群组" : "选择已绑定角色",
+      mode: "multiple",
+      selectedIds: previous.map(function (target) { return target.targetId; }),
+      selectedItems: previous.map(function (target) {
+        return group ? { characterGroupId: target.targetId, name: target.name } : { characterId: target.targetId, name: target.name, enabled: true };
+      }),
+      opener,
+      onCommit(ids, items) {
+        const invalid = ids.filter(function (id) { return !field.bindingIds.includes(id); });
+        if (invalid.length) {
+          flow.error = "只能导出该字段已经绑定的" + (group ? "群组" : "角色") + "；请先修改字段作用范围。";
+          return;
+        }
+        const itemById = new Map(items.map(function (item) { return [group ? item.characterGroupId : item.characterId, item]; }));
+        const oldById = new Map(previous.map(function (target) { return [target.targetId, target]; }));
+        flow.exportTargets[field.id] = ids.map(function (id) {
+          const old = oldById.get(id);
+          const item = itemById.get(id);
+          return { targetId: id, name: item ? item.name : old ? old.name : id, enabled: old ? old.enabled : true, includeValue: old ? old.includeValue : false };
+        });
+        flow.error = "";
+      },
+    });
+  }
+
+  function updateExportTargetControl(target) {
+    const row = target.closest("[data-template-export-target-id]");
+    const flow = ui.state.fieldTemplateFlow;
+    if (!row || !flow || flow.mode !== "export") return;
+    const matrix = flow.exportTargets[row.dataset.templateFieldId] || [];
+    const entry = matrix.find(function (item) { return item.targetId === row.dataset.templateExportTargetId; });
+    if (!entry) return;
+    if (target.hasAttribute("data-export-target-enabled")) {
+      entry.enabled = target.checked;
+      if (!entry.enabled) entry.includeValue = false;
+      render();
+    } else {
+      entry.includeValue = target.checked;
+    }
+    flow.error = "";
+  }
+
+  async function commitFieldTemplateExport() {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "export" || flow.selectedFields.length === 0) return;
+    const request = {
+      fieldIds: flow.selectedFields.map(function (field) { return field.id; }),
+      targetSelections: flow.selectedFields.filter(function (field) {
+        return field.scope === "character" || field.scope === "group";
+      }).map(function (field) {
+        return {
+          fieldId: field.id,
+          targets: (flow.exportTargets[field.id] || []).map(function (target) {
+            return { targetId: target.targetId, enabled: Boolean(target.enabled), includeValue: Boolean(target.enabled && target.includeValue) };
+          }),
+        };
+      }),
+    };
+    flow.error = "";
+    setBusy(true);
+    try {
+      const result = await ui.native.call("exportFieldTemplate", request);
+      if (!result || typeof result.fileName !== "string" || typeof result.savedPath !== "string" || !result.summary) {
+        throw new Error("宿主返回的导出结果不完整。");
+      }
+      flow.result = result;
+      render();
+      showToast("已保存到 " + result.savedPath);
+    } catch (error) {
+      flow.error = "导出失败：" + (error instanceof Error ? error.message : "请重试");
+      render();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importFieldTemplateText(json, fileName) {
+    const source = String(json || "");
+    const opener = ui.state.fieldTemplateImportOpener;
+    ui.state.fieldTemplateImportOpener = null;
+    const flow = {
+      mode: "import",
+      step: 1,
+      fileName: fileName || "字段模板.json",
+      json: source,
+      error: "正在检查模板…",
+      result: null,
+      refreshing: false,
+      staleRevision: false,
+      restoreFocus: opener || null,
+      restoreFocusDescriptor: fieldTemplateFocusDescriptor("open-field-template-import"),
+    };
+    ui.state.fieldTemplateFlow = flow;
+    render();
+    focusFieldTemplateDialog();
+    await loadFieldTemplatePreview(flow, false);
+  }
+
+  function supportedImportStrategy(field, strategy) {
+    if (strategy === "create_copy") return true;
+    if (strategy === "update") return field.conflict === "id" && field.updateCompatibility.available;
+    return strategy === "replace" && field.conflict === "id";
+  }
+
+  function defaultImportMappings(preview) {
+    const mappings = {};
+    preview.mappingNeeds.forEach(function (need) {
+      need.sourceTargets.forEach(function (sourceTarget) {
+        const key = need.fieldId + "\u0000" + sourceTarget.sourceId;
+        mappings[key] = sourceTarget.suggestedTarget ? [{
+          targetId: sourceTarget.suggestedTarget.targetId,
+          name: sourceTarget.suggestedTarget.name,
+          enabled: true,
+          suggestedEnabled: true,
+          valuePolicy: sourceTarget.hasValue ? "template_value" : "field_initial",
+        }] : [];
+      });
+      if (need.requiresLocalTargets) mappings[need.fieldId + "\u0000__unbound__"] = [];
+    });
+    return mappings;
+  }
+
+  function repairSummary(preview) {
+    const categoryOrder = ["rule", "condition", "link_rule", "effect_group", "other_dependency", "unexpanded", "invalid"];
+    const labels = {
+      rule: "规则",
+      condition: "条件",
+      link_rule: "状态联动",
+      effect_group: "临时效果",
+      other_dependency: "其他依赖",
+      unexpanded: "其他未展开依赖",
+      invalid: "其他无效引用",
+    };
+    const counts = new Map();
+    const omittedFields = new Set();
+    const omittedKeys = new Set();
+    let omittedTotal = 0;
+    preview.omittedDependencies.forEach(function (group) {
+      omittedFields.add(group.fieldId);
+      omittedTotal += group.totalCount;
+      let displayed = 0;
+      const seenItems = new Set();
+      group.items.forEach(function (item) {
+        const key = group.fieldId + "\u0000" + item.kind + "\u0000" + item.sourceId;
+        if (seenItems.has(key)) return;
+        seenItems.add(key);
+        displayed += 1;
+        const category = Object.prototype.hasOwnProperty.call(labels, item.kind) ? item.kind : "other_dependency";
+        counts.set(category, (counts.get(category) || 0) + 1);
+        omittedKeys.add("OMITTED_DEPENDENCY:" + group.fieldId + ":" + item.kind + ":" + item.sourceId);
+      });
+      const hidden = Math.max(0, group.totalCount - displayed);
+      if (hidden) counts.set("unexpanded", (counts.get("unexpanded") || 0) + hidden);
+    });
+    const uniqueInvalid = new Set(preview.invalidReferences.filter(function (reference) {
+      if (omittedKeys.has(reference)) return false;
+      const omittedMatch = /^OMITTED_DEPENDENCY:([^:]+):/.exec(reference);
+      if (omittedMatch && omittedFields.has(omittedMatch[1])) return false;
+      const truncatedMatch = /^OMITTED_DEPENDENCIES_TRUNCATED:([^:]+):/.exec(reference);
+      return !(truncatedMatch && omittedFields.has(truncatedMatch[1]));
+    }));
+    if (uniqueInvalid.size) counts.set("invalid", uniqueInvalid.size);
+    const categories = categoryOrder.filter(function (key) { return counts.has(key); }).map(function (key) {
+      return { key, label: labels[key], count: counts.get(key) };
+    });
+    return { count: omittedTotal + uniqueInvalid.size, categories };
+  }
+
+  async function loadFieldTemplatePreview(flow, preserveDecisions) {
+    if (!flow || ui.state.fieldTemplateFlow !== flow) return;
+    const previousStrategies = preserveDecisions ? { ...(flow.strategies || {}) } : {};
+    const previousMappings = preserveDecisions ? { ...(flow.importMappings || {}) } : {};
+    const previousStep = flow.step || 1;
+    flow.refreshing = preserveDecisions;
+    flow.error = preserveDecisions ? "正在用当前文件刷新预览…" : "正在检查模板…";
+    render();
+    setBusy(true);
+    try {
+      const preview = await ui.native.call("previewFieldTemplateImport", { json: flow.json });
+      if (!preview || preview.valid !== true || !Number.isSafeInteger(preview.revision) || !Array.isArray(preview.fields) ||
+          !Array.isArray(preview.mappingNeeds) || !Array.isArray(preview.invalidReferences) || !Array.isArray(preview.omittedDependencies)) {
+        throw new Error("模板预览结果不完整。");
+      }
+      const strategies = {};
+      preview.fields.forEach(function (field) {
+        const previous = previousStrategies[field.sourceFieldId];
+        strategies[field.sourceFieldId] = supportedImportStrategy(field, previous) ? previous : "create_copy";
+      });
+      const importMappings = defaultImportMappings(preview);
+      if (preserveDecisions) {
+        Object.keys(importMappings).forEach(function (key) {
+          if (Array.isArray(previousMappings[key])) importMappings[key] = previousMappings[key];
+        });
+      }
+      const repairs = repairSummary(preview);
+      if (ui.state.fieldTemplateFlow !== flow) return;
+      flow.preview = preview;
+      flow.previewRevision = preview.revision;
+      flow.strategies = strategies;
+      flow.importMappings = importMappings;
+      flow.repairCount = repairs.count;
+      flow.repairCategories = repairs.categories;
+      flow.step = preserveDecisions ? Math.max(1, Math.min(3, previousStep)) : 1;
+      flow.staleRevision = false;
+      flow.refreshing = false;
+      flow.error = "";
+      flow.result = null;
+      render();
+    } catch (error) {
+      if (ui.state.fieldTemplateFlow === flow) {
+        flow.refreshing = false;
+        flow.error = (preserveDecisions ? "重新预览失败：" : "无法预览模板：") + (error instanceof Error ? error.message : "文件无效");
+        render();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshFieldTemplatePreview() {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "import" || flow.refreshing) return;
+    await loadFieldTemplatePreview(flow, true);
+  }
+
+  function moveFieldTemplateImport(delta) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "import" || !flow.preview) return;
+    flow.step = Math.max(1, Math.min(3, flow.step + delta));
+    flow.error = "";
+    ui.transition(render);
+  }
+
+  async function chooseTemplateImportTargets(opener) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "import") return;
+    const fieldId = opener.dataset.templateFieldId;
+    const sourceId = opener.dataset.templateSourceId;
+    const key = fieldId + "\u0000" + sourceId;
+    const previous = flow.importMappings[key] || [];
+    const group = opener.dataset.templateTargetEntity === "groups";
+    await ui.openEntityPicker({
+      entity: group ? "groups" : "actors",
+      title: group ? "映射到本地群组" : "映射到本地角色",
+      mode: "multiple",
+      selectedIds: previous.map(function (target) { return target.targetId; }),
+      selectedItems: previous.map(function (target) {
+        return group ? { characterGroupId: target.targetId, name: target.name } : { characterId: target.targetId, name: target.name, enabled: true };
+      }),
+      opener,
+      onCommit(ids, items) {
+        const itemById = new Map(items.map(function (item) { return [group ? item.characterGroupId : item.characterId, item]; }));
+        const oldById = new Map(previous.map(function (target) { return [target.targetId, target]; }));
+        const need = flow.preview.mappingNeeds.find(function (item) { return item.fieldId === fieldId; });
+        const source = sourceId === "__unbound__" ? null : need.sourceTargets.find(function (item) { return item.sourceId === sourceId; });
+        flow.importMappings[key] = ids.map(function (id) {
+          const old = oldById.get(id);
+          const item = itemById.get(id);
+          return {
+            targetId: id,
+            name: item ? item.name : old ? old.name : id,
+            enabled: old ? old.enabled : true,
+            suggestedEnabled: old ? old.suggestedEnabled : true,
+            valuePolicy: old ? old.valuePolicy : source && source.hasValue ? "template_value" : "field_initial",
+          };
+        });
+        flow.error = "";
+      },
+    });
+  }
+
+  function updateImportTargetControl(target) {
+    const row = target.closest("[data-template-import-target-id]");
+    const flow = ui.state.fieldTemplateFlow;
+    if (!row || !flow || flow.mode !== "import") return;
+    const key = row.dataset.templateFieldId + "\u0000" + row.dataset.templateSourceId;
+    const entry = (flow.importMappings[key] || []).find(function (item) { return item.targetId === row.dataset.templateImportTargetId; });
+    if (!entry) return;
+    if (target.hasAttribute("data-import-target-enabled")) entry.enabled = target.checked;
+    else if (["template_value", "keep_existing", "field_initial"].includes(target.value)) entry.valuePolicy = target.value;
+    flow.error = "";
+  }
+
+  function setImportFieldEnabled(fieldId, mode) {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "import" || !fieldId || !["all_on", "all_off", "file_suggestion"].includes(mode)) return;
+    Object.keys(flow.importMappings || {}).forEach(function (key) {
+      if (!key.startsWith(fieldId + "\u0000")) return;
+      flow.importMappings[key].forEach(function (target) {
+        target.enabled = mode === "all_on" ? true : mode === "all_off" ? false : target.suggestedEnabled !== false;
+      });
+    });
+    flow.error = "";
+    render();
+  }
+
+  function buildFieldTemplateImportDecisions(flow) {
+    return flow.preview.fields.map(function (field) {
+      const strategy = flow.strategies[field.sourceFieldId] || "create_copy";
+      const need = flow.preview.mappingNeeds.find(function (item) { return item.fieldId === field.sourceFieldId; });
+      const decision = { sourceFieldId: field.sourceFieldId, strategy, mappings: [] };
+      if (!need || strategy === "update") return decision;
+      if (need.requiresLocalTargets) {
+        decision.unboundTargets = (flow.importMappings[field.sourceFieldId + "\u0000__unbound__"] || []).map(importTargetPayload);
+      } else {
+        decision.mappings = need.sourceTargets.map(function (source) {
+          return { sourceTargetId: source.sourceId, targets: (flow.importMappings[field.sourceFieldId + "\u0000" + source.sourceId] || []).map(importTargetPayload) };
+        });
+      }
+      return decision;
+    });
+  }
+
+  function importTargetPayload(target) {
+    return { targetId: target.targetId, enabled: Boolean(target.enabled), valuePolicy: target.valuePolicy };
+  }
+
+  async function commitFieldTemplateImport() {
+    const flow = ui.state.fieldTemplateFlow;
+    if (!flow || flow.mode !== "import" || !flow.preview) return;
+    const decisions = buildFieldTemplateImportDecisions(flow);
+    flow.error = "";
+    setBusy(true);
+    try {
+      const result = await ui.native.call("importFieldTemplate", {
+        json: flow.json,
+        expectedRevision: flow.previewRevision,
+        decisions: { fields: decisions },
+      });
+      if (!result || !Number.isSafeInteger(result.revision) || !result.summary) throw new Error("宿主返回的导入结果不完整。");
+      flow.result = result;
+      await ui.loadSnapshot();
+      await ui.loadRouteData("config-fields");
+      render();
+      showToast("字段模板已导入");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "请重试";
+      flow.staleRevision = /STALE_REVISION|stale revision|revision mismatch/i.test(message);
+      flow.error = flow.staleRevision
+        ? "导入前数据已变化，请用同一文件重新预览后再提交。已选策略与映射会尽量保留。"
+        : "导入失败：" + message;
+      render();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function exportDataset() {
     setBusy(true);
     try {
@@ -738,6 +1404,32 @@
     reader.readAsText(file);
   });
 
+  if (fieldTemplateImportPicker) {
+    fieldTemplateImportPicker.addEventListener("change", function () {
+      const file = fieldTemplateImportPicker.files && fieldTemplateImportPicker.files[0];
+      fieldTemplateImportPicker.value = "";
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function () { void importFieldTemplateText(String(reader.result || ""), file.name); };
+      reader.onerror = function () {
+        const opener = ui.state.fieldTemplateImportOpener;
+        ui.state.fieldTemplateImportOpener = null;
+        ui.state.fieldTemplateFlow = {
+          mode: "import",
+          step: 1,
+          fileName: file.name,
+          error: "无法读取字段模板文件。",
+          result: null,
+          restoreFocus: opener || null,
+          restoreFocusDescriptor: fieldTemplateFocusDescriptor("open-field-template-import"),
+        };
+        render();
+        focusFieldTemplateDialog();
+      };
+      reader.readAsText(file);
+    });
+  }
+
   async function importDataset(source) {
     setBusy(true);
     try {
@@ -779,6 +1471,12 @@
   });
   appRoot.addEventListener("input", handleAppInput);
   appRoot.addEventListener("change", handleAppChange);
+  appRoot.addEventListener("submit", function (event) {
+    const form = event.target instanceof Element ? event.target.closest('[data-form="field-editor"]') : null;
+    if (!form) return;
+    event.preventDefault();
+    void saveFieldEditor();
+  });
   appRoot.addEventListener("keydown", handleAppKeydown);
   appRoot.addEventListener("scroll", handleAppScroll, true);
   window.addEventListener("resize", drawCharts);
