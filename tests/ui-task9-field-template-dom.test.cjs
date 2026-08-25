@@ -805,20 +805,23 @@ test("effect-group responses accept legacy reason sources while create and updat
   unknown.defaultReason.extra = true;
   assert.throws(() => validate(unknown), /MVU_EFFECT_REASON_CONFIG_INVALID/);
   const blankCustom = plain(full);
-  blankCustom.defaultReason = { mode: "custom", template: "relationship", text: "   " };
+  blankCustom.defaultReason = { mode: "custom", template: "manual", text: "   " };
   assert.throws(() => validate(blankCustom), /MVU_EFFECT_REASON_CONFIG_INVALID/);
   const legacy = plain(full);
-  legacy.defaultReason = { mode: "template", template: "positive", text: "字".repeat(513) };
+  legacy.defaultReason = { mode: "template", template: "rule", text: "字".repeat(513) };
   assert.doesNotThrow(() => validate(legacy));
   const legacyBoundary = plain(full);
-  legacyBoundary.defaultReason = { mode: "custom", template: "positive", text: "字".repeat(16384) };
+  legacyBoundary.defaultReason = { mode: "custom", template: "natural", text: "字".repeat(16384) };
   assert.doesNotThrow(() => validate(legacyBoundary));
   const persistedOversized = plain(full);
-  persistedOversized.defaultReason = { mode: "template", template: "positive", text: "字".repeat(16385) };
+  persistedOversized.defaultReason = { mode: "template", template: "ai", text: "字".repeat(16385) };
   assert.throws(() => validate(persistedOversized), /MVU_EFFECT_REASON_CONFIG_INVALID/);
   const bounded = plain(full);
-  bounded.defaultReason = { mode: "custom", template: "environment", text: "字".repeat(512) };
+  bounded.defaultReason = { mode: "custom", template: "per_turn", text: "字".repeat(512) };
   assert.doesNotThrow(() => validate(bounded));
+  const oldTemplate = plain(full);
+  oldTemplate.defaultReason = { mode: "template", template: "positive", text: "" };
+  assert.throws(() => validate(oldTemplate), /MVU_EFFECT_REASON_CONFIG_INVALID/);
 
   const createInput = plain(full);
   delete createInput.id;

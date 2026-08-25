@@ -233,6 +233,8 @@ requireMatch(styles, /\.template-step[\s\S]*?transition:[\s\S]*?(?:180|200|220)m
   "field-template step changes need a short purposeful transition");
 requireMatch(files["runtime.js"], /validateEffectReasonConfig\(effect\.defaultReason,\s*16384\)[\s\S]*?keys\.length !== 3[\s\S]*?reason\.text\.length > textLimit/,
   "complete effect-group response DTOs must fail closed while accepting the legacy persisted reason boundary");
+requireMatch(files["runtime.js"], /\["general",\s*"rule",\s*"natural",\s*"per_turn",\s*"ai",\s*"manual"\]\.includes\(reason\.template\)/,
+  "effect reason browser validation must match the v3 IPC template enum");
 requireMatch(files["runtime.js"], /validateNativeMutationRequest[\s\S]*?createEffectGroup[\s\S]*?updateEffectGroup[\s\S]*?validateEffectReasonConfig\([^\n]*512\)/,
   "effect-group create and update requests must retain the 512-character editor boundary");
 requireMatch(files["app.js"] + files["pages-config.js"], /loading:\s*true[\s\S]*?flow\.loading\s*=\s*false[\s\S]*?flow\.loading\s*\?\s*"progress_activity"\s*:\s*"error"/,

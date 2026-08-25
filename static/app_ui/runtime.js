@@ -535,7 +535,7 @@
     const keys = Object.keys(reason).sort();
     if (keys.length !== 3 || keys[0] !== "mode" || keys[1] !== "template" || keys[2] !== "text") throw new Error(code);
     if (!["template", "custom"].includes(reason.mode) ||
-        !["general", "positive", "negative", "environment", "relationship"].includes(reason.template) ||
+        !["general", "rule", "natural", "per_turn", "ai", "manual"].includes(reason.template) ||
         typeof reason.text !== "string" || reason.text.length > textLimit ||
         (reason.mode === "custom" && reason.text.trim().length === 0)) {
       throw new Error(code);
