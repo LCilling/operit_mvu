@@ -23,7 +23,12 @@
   ui.hydrateConditionRows = hydrateConditionRows;
   ui.prepareConditionEditor = prepareConditionEditor;
   ui.resetConditionEditorDraft = resetConditionEditorDraft;
-  ui.onSnapshotRevisionChanged = handleConditionSnapshotRevisionChanged;
+  ui.prepareRuleEditor = prepareRuleEditor;
+  ui.prepareEffectEditor = prepareEffectEditor;
+  ui.resetRuleEditorDraft = resetRuleEditorDraft;
+  ui.resetEffectEditorDraft = resetEffectEditorDraft;
+  ui.effectReasonPreview = effectReasonPreview;
+  ui.onSnapshotRevisionChanged = handleEditorSnapshotRevisionChanged;
   ui.conditionEditor = {
     serializeExpression: serializeConditionExpression,
     defaultPredicate: defaultConditionPredicate,
@@ -222,6 +227,8 @@
     if (entityButton) {
       ui.state.selectedEntityId = entityButton.dataset.entityId;
       if (entityButton.dataset.openEntity === "condition") resetConditionEditorDraft();
+      if (entityButton.dataset.openEntity === "rule") resetRuleEditorDraft();
+      if (entityButton.dataset.openEntity === "effectGroup") resetEffectEditorDraft();
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[entityButton.dataset.openEntity];
       await ui.navigate(route);
       return;
@@ -230,6 +237,8 @@
     if (newEntityButton) {
       ui.state.selectedEntityId = "";
       if (newEntityButton.dataset.newEntity === "condition") resetConditionEditorDraft();
+      if (newEntityButton.dataset.newEntity === "rule") resetRuleEditorDraft();
+      if (newEntityButton.dataset.newEntity === "effectGroup") resetEffectEditorDraft();
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[newEntityButton.dataset.newEntity];
       await ui.navigate(route);
       return;
@@ -269,7 +278,12 @@
     }
     const reasonMode = target.closest("[data-reason-mode]");
     if (reasonMode) {
-      ui.state.effectReasonMode = reasonMode.dataset.reasonMode === "custom" ? "custom" : "template";
+      const nextMode = reasonMode.dataset.reasonMode === "custom" ? "custom" : "template";
+      ui.state.effectReasonMode = nextMode;
+      if (ui.state.effectEditorDraft) {
+        ui.state.effectEditorDraft.reason.mode = nextMode;
+        ui.state.effectEditorDraft.error = "";
+      }
       ui.transition(render);
       return;
     }
@@ -297,7 +311,7 @@
     if (!actionButton) return;
     if (target.closest("[data-stop-close]") &&
         (actionButton.classList.contains("drawer-layer") || actionButton.classList.contains("picker-layer") ||
-          actionButton.classList.contains("field-template-layer"))) return;
+          actionButton.classList.contains("field-template-layer") || actionButton.classList.contains("management-delete-layer"))) return;
     await handleAction(actionButton.dataset.action, actionButton);
   }
 
@@ -411,6 +425,59 @@
       await pageConditionReferences(Number(element.dataset.referencePageNumber));
     } else if (action === "close-condition-dialog") {
       closeConditionDialog();
+    } else if (action === "toggle-rule") {
+      await mutateManagementEntity("rules", "toggleRule", {
+        id: element.dataset.ruleId,
+        enabled: element.dataset.ruleEnabled !== "true",
+      });
+    } else if (action === "copy-rule") {
+      await mutateManagementEntity("rules", "copyRule", { id: element.dataset.ruleId });
+    } else if (action === "delete-rule") {
+      await openManagementDelete("rule", element.dataset.ruleId);
+    } else if (action === "toggle-effect-group") {
+      await mutateManagementEntity("effectGroups", "toggleEffectGroup", {
+        id: element.dataset.effectId,
+        enabled: element.dataset.effectEnabled !== "true",
+      });
+    } else if (action === "copy-effect-group") {
+      await mutateManagementEntity("effectGroups", "copyEffectGroup", { id: element.dataset.effectId });
+    } else if (action === "delete-effect-group") {
+      await openManagementDelete("effectGroup", element.dataset.effectId);
+    } else if (action === "close-management-delete") {
+      closeManagementDelete();
+    } else if (action === "confirm-management-delete") {
+      await confirmManagementDelete();
+    } else if (action === "reload-management-list") {
+      await reloadManagementList(element.dataset.managementKey);
+    } else if (action === "edit-rule-condition") {
+      const draft = ui.state.ruleEditorDraft;
+      if (draft && draft.conditionId && !draft.conditionMissing) {
+        ui.state.selectedEntityId = draft.conditionId;
+        resetConditionEditorDraft();
+        await ui.navigate("condition-editor");
+      }
+    } else if (action === "add-rule-change") {
+      addRuleAction("change_field");
+    } else if (action === "add-rule-effect-activation") {
+      addRuleAction("activate_effect_group");
+    } else if (action === "remove-rule-action") {
+      mutateOrderedDraftItem(ui.state.ruleEditorDraft, "actions", Number(element.dataset.actionIndex), "remove");
+    } else if (action === "move-rule-action-up") {
+      mutateOrderedDraftItem(ui.state.ruleEditorDraft, "actions", Number(element.dataset.actionIndex), "up");
+    } else if (action === "move-rule-action-down") {
+      mutateOrderedDraftItem(ui.state.ruleEditorDraft, "actions", Number(element.dataset.actionIndex), "down");
+    } else if (action === "add-field-effect") {
+      addFieldEffect();
+    } else if (action === "remove-field-effect") {
+      mutateOrderedDraftItem(ui.state.effectEditorDraft, "fieldEffects", Number(element.dataset.fieldEffectIndex), "remove");
+    } else if (action === "move-field-effect-up") {
+      mutateOrderedDraftItem(ui.state.effectEditorDraft, "fieldEffects", Number(element.dataset.fieldEffectIndex), "up");
+    } else if (action === "move-field-effect-down") {
+      mutateOrderedDraftItem(ui.state.effectEditorDraft, "fieldEffects", Number(element.dataset.fieldEffectIndex), "down");
+    } else if (action === "add-effect-operation") {
+      addEffectOperation(Number(element.dataset.fieldEffectIndex));
+    } else if (action === "remove-effect-operation") {
+      removeEffectOperation(Number(element.dataset.fieldEffectIndex), Number(element.dataset.operationIndex));
     } else if (action === "open-status-actor-picker" || action === "open-status-group-picker") {
       await openStatusPicker(action, element);
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
@@ -504,6 +571,15 @@
     draft.error = "数据修订已从 " + previousRevision + " 更新为 " + nextRevision + "，正在重新检查受影响规则；完成前无法保存。";
     render();
     void loadConditionEditorReferences(draft, true, true);
+  }
+
+  function handleEditorSnapshotRevisionChanged(previousRevision, nextRevision) {
+    handleConditionSnapshotRevisionChanged(previousRevision, nextRevision);
+    [ui.state.ruleEditorDraft, ui.state.effectEditorDraft].forEach(function (draft) {
+      if (!draft || draft.mutationCommitted || draft.baseRevision === nextRevision) return;
+      draft.stale = true;
+      draft.error = "数据已在其它位置更新，请重新载入后再保存。";
+    });
   }
 
   async function retryConditionEditorReferences() {
@@ -1184,6 +1260,602 @@
     return parsed;
   }
 
+  let editorClientSequence = 0;
+
+  function nextEditorClientId(prefix) {
+    editorClientSequence += 1;
+    return prefix + "-" + Date.now().toString(36) + "-" + editorClientSequence.toString(36);
+  }
+
+  function resetRuleEditorDraft() {
+    ui.state.ruleEditorDraft = null;
+    Object.keys(ui.state.editorSelections).forEach(function (key) {
+      if (key.startsWith("rule-")) delete ui.state.editorSelections[key];
+    });
+  }
+
+  function resetEffectEditorDraft() {
+    ui.state.effectEditorDraft = null;
+    Object.keys(ui.state.editorSelections).forEach(function (key) {
+      if (key.startsWith("effect-")) delete ui.state.editorSelections[key];
+    });
+  }
+
+  async function entityOrNull(type, id) {
+    if (!id) return null;
+    try {
+      return await ui.getEntity(type, id);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function prepareRuleEditor(rule) {
+    const identity = rule && rule.id ? rule.id : "__new__";
+    if (ui.state.ruleEditorDraft && ui.state.ruleEditorDraft.identity === identity) return ui.state.ruleEditorDraft;
+    const source = rule || {
+      name: "",
+      description: "",
+      enabled: true,
+      triggerActorSelector: { kind: "any" },
+      conditionId: "",
+      actions: [],
+      cooldownHours: 0,
+      executionOrder: 0,
+    };
+    const selector = source.triggerActorSelector || { kind: "any" };
+    const draft = {
+      identity,
+      baseRevision: ui.state.snapshot.revision,
+      name: source.name || "",
+      description: source.description || "",
+      enabled: source.enabled !== false,
+      actorKind: selector.kind,
+      actorIds: selector.kind === "selected" ? selector.actorIds.slice() : [],
+      actorItems: [],
+      groupIds: selector.kind === "group" ? selector.groupIds.slice() : [],
+      groupItems: [],
+      conditionId: source.conditionId || "",
+      condition: null,
+      conditionMissing: false,
+      actions: (source.actions || []).map(function (action) {
+        return action.kind === "activate_effect_group"
+          ? { clientId: nextEditorClientId("rule-action"), kind: action.kind, effectGroupId: action.effectGroupId, effect: null }
+          : {
+              clientId: nextEditorClientId("rule-action"), kind: action.kind, fieldId: action.fieldId, field: null,
+              targetKind: action.target.kind,
+              actorIds: action.target.kind === "selected" ? action.target.actorIds.slice() : [], actorItems: [],
+              delta: String(action.delta), effectGroupIds: action.effectGroupIds.slice(), effectItems: [],
+            };
+      }),
+      cooldownHours: String(source.cooldownHours ?? 0),
+      executionOrder: String(source.executionOrder ?? 0),
+      error: "",
+      stale: false,
+      submitting: false,
+      mutationCommitted: false,
+    };
+    ui.state.ruleEditorDraft = draft;
+    const actorType = draft.actorKind === "group" ? "group" : "actor";
+    const actorIds = draft.actorKind === "group" ? draft.groupIds : draft.actorIds;
+    const actorItems = await Promise.all(actorIds.map(function (id) { return entityOrNull(actorType, id); }));
+    if (ui.state.ruleEditorDraft !== draft) return draft;
+    if (draft.actorKind === "group") draft.groupItems = actorItems.filter(Boolean);
+    else draft.actorItems = actorItems.filter(Boolean);
+    draft.condition = await entityOrNull("condition", draft.conditionId);
+    draft.conditionMissing = Boolean(draft.conditionId && !draft.condition);
+    await Promise.all(draft.actions.map(async function (action) {
+      if (action.kind === "activate_effect_group") {
+        action.effect = await entityOrNull("effectGroup", action.effectGroupId);
+        return;
+      }
+      action.field = await entityOrNull("field", action.fieldId);
+      action.actorItems = (await Promise.all(action.actorIds.map(function (id) { return entityOrNull("actor", id); }))).filter(Boolean);
+      action.effectItems = (await Promise.all(action.effectGroupIds.map(function (id) { return entityOrNull("effectGroup", id); }))).filter(Boolean);
+    }));
+    if (ui.state.ruleEditorDraft === draft) render();
+    return draft;
+  }
+
+  async function prepareEffectEditor(effect) {
+    const identity = effect && effect.id ? effect.id : "__new__";
+    if (ui.state.effectEditorDraft && ui.state.effectEditorDraft.identity === identity) return ui.state.effectEditorDraft;
+    const source = effect || {
+      name: "",
+      description: "",
+      enabled: true,
+      fieldEffects: [],
+      defaultReason: { mode: "template", template: "general", text: "" },
+    };
+    const duration = source.defaultDuration;
+    const draft = {
+      identity,
+      baseRevision: ui.state.snapshot.revision,
+      name: source.name || "",
+      description: source.description || "",
+      enabled: source.enabled !== false,
+      fieldEffects: (source.fieldEffects || []).map(function (fieldEffect) {
+        return {
+          clientId: nextEditorClientId("field-effect"), id: fieldEffect.id, fieldId: fieldEffect.fieldId, field: null,
+          actorKind: fieldEffect.actorSelector.kind,
+          actorIds: fieldEffect.actorSelector.kind === "selected" ? fieldEffect.actorSelector.actorIds.slice() : [],
+          actorItems: [],
+          operations: fieldEffect.operations.map(function (operation) {
+            return { clientId: nextEditorClientId("operation"), kind: operation.kind, value: String(operation.value), sources: (operation.sources || []).slice() };
+          }),
+        };
+      }),
+      reason: JSON.parse(JSON.stringify(source.defaultReason || { mode: "template", template: "general", text: "" })),
+      durationMode: !duration ? "permanent" : duration.expiresAt ? "expires" : duration.remainingTurns !== null ? "turns" : "manual",
+      expiresAt: duration && duration.expiresAt ? toLocalDateTimeValue(duration.expiresAt) : "",
+      remainingTurns: duration && duration.remainingTurns !== null ? String(duration.remainingTurns) : "",
+      error: "",
+      stale: false,
+      submitting: false,
+      mutationCommitted: false,
+    };
+    ui.state.effectReasonMode = draft.reason.mode;
+    ui.state.effectEditorDraft = draft;
+    await Promise.all(draft.fieldEffects.map(async function (fieldEffect) {
+      fieldEffect.field = await entityOrNull("field", fieldEffect.fieldId);
+      fieldEffect.actorItems = (await Promise.all(fieldEffect.actorIds.map(function (id) { return entityOrNull("actor", id); }))).filter(Boolean);
+      if (fieldEffect.field && fieldEffect.field.scope !== "character") {
+        fieldEffect.actorKind = "all_bound";
+        fieldEffect.actorIds = [];
+        fieldEffect.actorItems = [];
+      }
+    }));
+    if (ui.state.effectEditorDraft === draft) render();
+    return draft;
+  }
+
+  function toLocalDateTimeValue(value) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return "";
+    const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return shifted.toISOString().slice(0, 16);
+  }
+
+  function captureRuleEditorControl(target) {
+    const draft = ui.state.ruleEditorDraft;
+    if (!draft || draft.mutationCommitted) return;
+    draft.error = "";
+    if (target.name === "ruleName") draft.name = target.value;
+    else if (target.name === "ruleDescription") draft.description = target.value;
+    else if (target.name === "ruleEnabled") draft.enabled = target.checked;
+    else if (target.name === "ruleActorKind") draft.actorKind = target.value;
+    else if (target.name === "ruleCooldownHours") draft.cooldownHours = target.value;
+    else if (target.name === "ruleExecutionOrder") draft.executionOrder = target.value;
+    else if (target.hasAttribute("data-rule-target-kind")) {
+      const action = draft.actions[Number(target.dataset.actionIndex)];
+      if (action && action.kind === "change_field") action.targetKind = target.value;
+    } else if (target.hasAttribute("data-rule-delta")) {
+      const action = draft.actions[Number(target.dataset.actionIndex)];
+      if (action && action.kind === "change_field") action.delta = target.value;
+    }
+  }
+
+  function captureEffectEditorControl(target) {
+    const draft = ui.state.effectEditorDraft;
+    if (!draft || draft.mutationCommitted) return;
+    draft.error = "";
+    if (target.name === "effectName") draft.name = target.value;
+    else if (target.name === "effectDescription") draft.description = target.value;
+    else if (target.name === "effectEnabled") draft.enabled = target.checked;
+    else if (target.name === "effectReasonTemplate") draft.reason.template = target.value;
+    else if (target.name === "effectReasonText") {
+      draft.reason.text = target.value;
+      patchEffectReasonPreview();
+    } else if (target.name === "effectDurationMode") draft.durationMode = target.value;
+    else if (target.name === "effectExpiresAt") draft.expiresAt = target.value;
+    else if (target.name === "effectRemainingTurns") draft.remainingTurns = target.value;
+    else if (target.hasAttribute("data-effect-actor-kind")) {
+      const fieldEffect = draft.fieldEffects[Number(target.dataset.fieldEffectIndex)];
+      if (fieldEffect && (!fieldEffect.field || fieldEffect.field.scope === "character")) fieldEffect.actorKind = target.value;
+    } else if (target.hasAttribute("data-effect-operation-kind")) {
+      const operation = effectOperationAt(draft, target);
+      if (operation) operation.kind = target.value;
+    } else if (target.hasAttribute("data-effect-operation-value")) {
+      const operation = effectOperationAt(draft, target);
+      if (operation) operation.value = target.value;
+    } else if (target.hasAttribute("data-effect-operation-source")) {
+      const operation = effectOperationAt(draft, target);
+      if (operation) {
+        const source = target.dataset.effectOperationSource;
+        const selected = new Set(operation.sources);
+        if (target.checked) selected.add(source);
+        else selected.delete(source);
+        operation.sources = Array.from(selected);
+      }
+    }
+  }
+
+  function patchEffectReasonPreview() {
+    const output = appRoot.querySelector("[data-effect-reason-preview]");
+    const draft = ui.state.effectEditorDraft;
+    if (output && draft) output.textContent = effectReasonPreview(draft);
+  }
+
+  function effectOperationAt(draft, target) {
+    const fieldEffect = draft.fieldEffects[Number(target.dataset.fieldEffectIndex)];
+    return fieldEffect && fieldEffect.operations[Number(target.dataset.operationIndex)];
+  }
+
+  function addRuleAction(kind) {
+    const draft = ui.state.ruleEditorDraft;
+    if (!draft || draft.mutationCommitted || draft.actions.length >= 100) return;
+    draft.actions.push(kind === "activate_effect_group"
+      ? { clientId: nextEditorClientId("rule-action"), kind, effectGroupId: "", effect: null }
+      : { clientId: nextEditorClientId("rule-action"), kind, fieldId: "", field: null, targetKind: "trigger_actor", actorIds: [], actorItems: [], delta: "0", effectGroupIds: [], effectItems: [] });
+    draft.error = "";
+    render();
+  }
+
+  function addFieldEffect() {
+    const draft = ui.state.effectEditorDraft;
+    if (!draft || draft.mutationCommitted || draft.fieldEffects.length >= 100) return;
+    draft.fieldEffects.push({
+      clientId: nextEditorClientId("field-effect"), id: nextEditorClientId("field_effect"), fieldId: "", field: null,
+      actorKind: "all_bound", actorIds: [], actorItems: [],
+      operations: [{ clientId: nextEditorClientId("operation"), kind: "immediate_delta", value: "0", sources: [] }],
+    });
+    draft.error = "";
+    render();
+  }
+
+  function addEffectOperation(fieldEffectIndex) {
+    const draft = ui.state.effectEditorDraft;
+    const fieldEffect = draft && draft.fieldEffects[fieldEffectIndex];
+    if (!fieldEffect || draft.mutationCommitted || fieldEffect.operations.length >= 100) return;
+    fieldEffect.operations.push({ clientId: nextEditorClientId("operation"), kind: "fixed_adjustment", value: "0", sources: ["manual"] });
+    draft.error = "";
+    render();
+  }
+
+  function removeEffectOperation(fieldEffectIndex, operationIndex) {
+    const draft = ui.state.effectEditorDraft;
+    const fieldEffect = draft && draft.fieldEffects[fieldEffectIndex];
+    if (!fieldEffect || fieldEffect.operations.length <= 1 || draft.mutationCommitted) return;
+    fieldEffect.operations.splice(operationIndex, 1);
+    draft.error = "";
+    render();
+  }
+
+  function mutateOrderedDraftItem(draft, key, index, operation) {
+    const items = draft && draft[key];
+    if (!items || draft.mutationCommitted || !Number.isSafeInteger(index) || index < 0 || index >= items.length) return;
+    if (operation === "remove") items.splice(index, 1);
+    else {
+      const target = operation === "up" ? index - 1 : index + 1;
+      if (target < 0 || target >= items.length) return;
+      [items[index], items[target]] = [items[target], items[index]];
+    }
+    draft.error = "";
+    render();
+  }
+
+  function commitRuleOrEffectPicker(element, ids, items) {
+    const role = element.dataset.editorPicker;
+    if (!role) return;
+    const itemById = new Map(items.map(function (item) {
+      return [item.id || item.characterId || item.characterGroupId, item];
+    }));
+    if (role === "rule-trigger") {
+      const draft = ui.state.ruleEditorDraft;
+      if (!draft) return;
+      if (draft.actorKind === "group") {
+        draft.groupIds = ids.slice(); draft.groupItems = ids.map(function (id) { return itemById.get(id) || ui.state.entities.get("group:" + id); }).filter(Boolean);
+      } else {
+        draft.actorIds = ids.slice(); draft.actorItems = ids.map(function (id) { return itemById.get(id) || ui.state.entities.get("actor:" + id); }).filter(Boolean);
+      }
+      draft.error = "";
+      render();
+      return;
+    }
+    if (role === "rule-condition") {
+      const draft = ui.state.ruleEditorDraft;
+      if (!draft) return;
+      draft.conditionId = ids[0] || "";
+      draft.condition = itemById.get(draft.conditionId) || ui.state.entities.get("condition:" + draft.conditionId) || null;
+      draft.conditionMissing = false;
+      draft.error = "";
+      render();
+      return;
+    }
+    if (role.startsWith("rule-action-")) {
+      const draft = ui.state.ruleEditorDraft;
+      const action = draft && draft.actions[Number(element.dataset.actionIndex)];
+      if (!action) return;
+      if (role === "rule-action-field") {
+        action.fieldId = ids[0] || ""; action.field = itemById.get(action.fieldId) || ui.state.entities.get("field:" + action.fieldId) || null;
+      } else if (role === "rule-action-actors") {
+        action.actorIds = ids.slice(); action.actorItems = ids.map(function (id) { return itemById.get(id) || ui.state.entities.get("actor:" + id); }).filter(Boolean);
+      } else if (role === "rule-action-effects") {
+        action.effectGroupIds = ids.slice(); action.effectItems = ids.map(function (id) { return itemById.get(id) || ui.state.entities.get("effectGroup:" + id); }).filter(Boolean);
+      } else if (role === "rule-action-activation") {
+        action.effectGroupId = ids[0] || ""; action.effect = itemById.get(action.effectGroupId) || ui.state.entities.get("effectGroup:" + action.effectGroupId) || null;
+      }
+      draft.error = "";
+      render();
+      return;
+    }
+    if (role === "effect-field") {
+      const draft = ui.state.effectEditorDraft;
+      const fieldEffect = draft && draft.fieldEffects[Number(element.dataset.fieldEffectIndex)];
+      if (!fieldEffect) return;
+      fieldEffect.fieldId = ids[0] || "";
+      fieldEffect.field = itemById.get(fieldEffect.fieldId) || ui.state.entities.get("field:" + fieldEffect.fieldId) || null;
+      if (fieldEffect.field && fieldEffect.field.scope !== "character") {
+        fieldEffect.actorKind = "all_bound"; fieldEffect.actorIds = []; fieldEffect.actorItems = [];
+      }
+      draft.error = "";
+      render();
+      return;
+    }
+    if (role === "effect-actors") {
+      const draft = ui.state.effectEditorDraft;
+      const fieldEffect = draft && draft.fieldEffects[Number(element.dataset.fieldEffectIndex)];
+      if (!fieldEffect) return;
+      fieldEffect.actorIds = ids.slice();
+      fieldEffect.actorItems = ids.map(function (id) { return itemById.get(id) || ui.state.entities.get("actor:" + id); }).filter(Boolean);
+      draft.error = "";
+      render();
+    }
+  }
+
+  function requiredName(value, label) {
+    const result = String(value || "").trim();
+    if (!result) throw new Error(label + "不能为空");
+    if (result.length > 256) throw new Error(label + "不能超过 256 个字符");
+    return result;
+  }
+
+  function buildRuleInput(draft) {
+    const actorKind = draft.actorKind;
+    let triggerActorSelector;
+    if (actorKind === "any" || actorKind === "current_actor") triggerActorSelector = { kind: actorKind };
+    else if (actorKind === "selected" && draft.actorIds.length) triggerActorSelector = { kind: actorKind, actorIds: draft.actorIds.slice() };
+    else if (actorKind === "group" && draft.groupIds.length) triggerActorSelector = { kind: actorKind, groupIds: draft.groupIds.slice() };
+    else throw new Error(actorKind === "group" ? "请选择至少一个触发群组" : "请选择至少一个触发角色");
+    if (!draft.conditionId || draft.conditionMissing) throw new Error("请选择一个有效条件");
+    if (!draft.actions.length) throw new Error("至少添加一个触发结果");
+    const actions = draft.actions.map(function (action, index) {
+      if (action.kind === "activate_effect_group") {
+        if (!action.effectGroupId) throw new Error("第 " + (index + 1) + " 个结果尚未选择效果组");
+        return { kind: action.kind, effectGroupId: action.effectGroupId };
+      }
+      if (!action.fieldId) throw new Error("第 " + (index + 1) + " 个字段结果尚未选择字段");
+      let target;
+      if (action.targetKind === "trigger_actor" || action.targetKind === "all_bound") target = { kind: action.targetKind };
+      else if (action.targetKind === "selected" && action.actorIds.length) target = { kind: "selected", actorIds: action.actorIds.slice() };
+      else throw new Error("第 " + (index + 1) + " 个字段结果尚未选择目标角色");
+      return {
+        kind: "change_field", fieldId: action.fieldId, target, delta: parseRequiredFinite(action.delta, "变化值"),
+        effectGroupIds: action.effectGroupIds.slice(),
+      };
+    });
+    const cooldownHours = parseRequiredFinite(draft.cooldownHours, "冷却时间");
+    const executionOrder = parseRequiredFinite(draft.executionOrder, "执行顺序");
+    if (cooldownHours < 0) throw new Error("冷却时间不能小于 0");
+    if (!Number.isSafeInteger(executionOrder)) throw new Error("执行顺序必须是整数");
+    return {
+      name: requiredName(draft.name, "规则名称"), description: String(draft.description || ""), enabled: Boolean(draft.enabled),
+      triggerActorSelector, conditionId: draft.conditionId, actions, cooldownHours, executionOrder,
+    };
+  }
+
+  async function saveRuleEditor() {
+    const draft = ui.state.ruleEditorDraft;
+    if (!draft || draft.submitting || draft.mutationCommitted) return;
+    let rule;
+    try { rule = buildRuleInput(draft); } catch (error) {
+      draft.error = error instanceof Error ? error.message : "规则配置无效"; render(); return;
+    }
+    draft.submitting = true; draft.error = ""; render(); setBusy(true);
+    try {
+      const method = draft.identity === "__new__" ? "createRule" : "updateRule";
+      const request = draft.identity === "__new__"
+        ? { expectedRevision: draft.baseRevision, rule }
+        : { id: draft.identity, expectedRevision: draft.baseRevision, patch: rule };
+      const response = await ui.native.call(method, request);
+      if (!response || !Number.isSafeInteger(response.revision) || !response.entity) throw new Error("规则保存响应不完整");
+      draft.mutationCommitted = true;
+      try {
+        await ui.loadSnapshot();
+        ui.state.selectedEntityId = "";
+        resetRuleEditorDraft();
+        await ui.navigate("rule-library", { replace: true, force: true });
+        showToast("规则已保存");
+      } catch (refreshError) {
+        draft.error = "规则已经提交，但列表刷新失败。请只重新载入，不要重复保存。";
+        draft.refreshError = refreshError instanceof Error ? refreshError.message : "刷新失败";
+        render();
+      }
+    } catch (error) {
+      draft.submitting = false;
+      const message = error instanceof Error ? error.message : "保存失败";
+      if (/STALE_REVISION/i.test(message)) {
+        try { await ui.loadSnapshot(); } catch (_refreshError) { /* persistent recovery remains in the editor */ }
+        draft.stale = true;
+        draft.error = "检测到修订冲突，已读取最新版本。请返回列表重新打开后再保存。";
+      } else draft.error = "保存规则失败：" + message;
+      render();
+    } finally { setBusy(false); }
+  }
+
+  function buildEffectGroupInput(draft) {
+    if (!draft.fieldEffects.length) throw new Error("至少添加一个目标字段");
+    const seenFields = new Set();
+    const fieldEffects = draft.fieldEffects.map(function (fieldEffect, fieldIndex) {
+      if (!fieldEffect.fieldId || !fieldEffect.field) throw new Error("第 " + (fieldIndex + 1) + " 个目标尚未选择字段");
+      if (seenFields.has(fieldEffect.fieldId)) throw new Error("同一个字段只能在效果组中出现一次");
+      seenFields.add(fieldEffect.fieldId);
+      let actorSelector;
+      if (fieldEffect.field.scope !== "character" || fieldEffect.actorKind === "all_bound") actorSelector = { kind: "all_bound" };
+      else if (fieldEffect.actorKind === "trigger_actor") actorSelector = { kind: "trigger_actor" };
+      else if (fieldEffect.actorKind === "selected" && fieldEffect.actorIds.length) actorSelector = { kind: "selected", actorIds: fieldEffect.actorIds.slice() };
+      else throw new Error("第 " + (fieldIndex + 1) + " 个字段尚未选择生效角色");
+      if (!fieldEffect.operations.length) throw new Error("每个目标字段至少需要一种计算方式");
+      const operations = fieldEffect.operations.map(function (operation, operationIndex) {
+        const value = parseRequiredFinite(operation.value, "第 " + (operationIndex + 1) + " 个效果数值");
+        if (operation.kind === "immediate_delta") return { kind: operation.kind, value };
+        if (!["fixed_adjustment", "positive_multiplier", "negative_multiplier", "all_multiplier"].includes(operation.kind)) {
+          throw new Error("计算方式无效");
+        }
+        if (!operation.sources.length) throw new Error("第 " + (operationIndex + 1) + " 个计算方式至少选择一个来源");
+        return { kind: operation.kind, value, sources: operation.sources.slice() };
+      });
+      return { id: fieldEffect.id, fieldId: fieldEffect.fieldId, actorSelector, operations };
+    });
+    const reason = { mode: draft.reason.mode, template: draft.reason.template, text: String(draft.reason.text || "") };
+    if (reason.text.length > 512) throw new Error("效果原因保存上限为 512 个字符，请精简旧版内容后再保存");
+    if (reason.mode === "custom" && !reason.text.trim()) throw new Error("自定义原因不能为空");
+    let defaultDuration;
+    if (draft.durationMode === "manual") defaultDuration = { expiresAt: null, remainingTurns: null };
+    else if (draft.durationMode === "turns") {
+      const turns = parseRequiredFinite(draft.remainingTurns, "剩余轮次");
+      if (!Number.isSafeInteger(turns) || turns < 0) throw new Error("剩余轮次必须是非负整数");
+      defaultDuration = { expiresAt: null, remainingTurns: turns };
+    } else if (draft.durationMode === "expires") {
+      const date = new Date(draft.expiresAt);
+      if (!draft.expiresAt || !Number.isFinite(date.getTime())) throw new Error("请选择有效的截止时间");
+      defaultDuration = { expiresAt: date.toISOString(), remainingTurns: null };
+    } else if (draft.durationMode !== "permanent") throw new Error("持续方式无效");
+    const result = {
+      name: requiredName(draft.name, "效果组名称"), description: String(draft.description || ""), enabled: Boolean(draft.enabled),
+      fieldEffects, defaultReason: reason,
+    };
+    if (defaultDuration) result.defaultDuration = defaultDuration;
+    return result;
+  }
+
+  async function saveEffectEditor() {
+    const draft = ui.state.effectEditorDraft;
+    if (!draft || draft.submitting || draft.mutationCommitted) return;
+    let effectGroup;
+    try { effectGroup = buildEffectGroupInput(draft); } catch (error) {
+      draft.error = error instanceof Error ? error.message : "效果组配置无效"; render(); return;
+    }
+    draft.submitting = true; draft.error = ""; render(); setBusy(true);
+    try {
+      const method = draft.identity === "__new__" ? "createEffectGroup" : "updateEffectGroup";
+      const request = draft.identity === "__new__"
+        ? { expectedRevision: draft.baseRevision, effectGroup }
+        : { id: draft.identity, expectedRevision: draft.baseRevision, patch: effectGroup };
+      const response = await ui.native.call(method, request);
+      if (!response || !Number.isSafeInteger(response.revision) || !response.entity) throw new Error("效果组保存响应不完整");
+      draft.mutationCommitted = true;
+      try {
+        await ui.loadSnapshot();
+        ui.state.selectedEntityId = "";
+        resetEffectEditorDraft();
+        await ui.navigate("effect-library", { replace: true, force: true });
+        showToast("临时效果已保存");
+      } catch (refreshError) {
+        draft.error = "效果组已经提交，但列表刷新失败。请只重新载入，不要重复保存。";
+        draft.refreshError = refreshError instanceof Error ? refreshError.message : "刷新失败";
+        render();
+      }
+    } catch (error) {
+      draft.submitting = false;
+      const message = error instanceof Error ? error.message : "保存失败";
+      if (/STALE_REVISION/i.test(message)) {
+        try { await ui.loadSnapshot(); } catch (_refreshError) { /* persistent recovery remains in the editor */ }
+        draft.stale = true;
+        draft.error = "检测到修订冲突，已读取最新版本。请返回列表重新打开后再保存。";
+      } else draft.error = "保存效果组失败：" + message;
+      render();
+    } finally { setBusy(false); }
+  }
+
+  async function mutateManagementEntity(key, method, payload) {
+    if (ui.state.managementRecoveries[key]) return;
+    const route = key === "rules" ? "rule-library" : "effect-library";
+    const expectedRevision = ui.state.snapshot.revision;
+    setBusy(true);
+    try {
+      const response = await ui.native.call(method, { ...payload, expectedRevision });
+      if (!response || !Number.isSafeInteger(response.revision)) throw new Error("操作响应不完整");
+      try {
+        await ui.loadSnapshot();
+        await ui.loadRouteData(route);
+        patchManagementList(route);
+      } catch (refreshError) {
+        ui.state.managementRecoveries[key] = { kind: "committed", error: "操作已经提交，但刷新失败。请只重新载入列表。" };
+        render();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "操作失败";
+      if (/STALE_REVISION/i.test(message)) {
+        try { await ui.loadSnapshot(); } catch (_refreshError) { /* recovery remains */ }
+        ui.state.managementRecoveries[key] = { kind: "stale", error: "检测到修订冲突，已读取最新修订。请重新核对列表。" };
+        render();
+      } else showToast("操作失败：" + message);
+    } finally { setBusy(false); }
+  }
+
+  async function reloadManagementList(key) {
+    if (key !== "rules" && key !== "effectGroups") return;
+    const route = key === "rules" ? "rule-library" : "effect-library";
+    setBusy(true);
+    try {
+      await ui.loadSnapshot();
+      await ui.loadRouteData(route);
+      ui.state.managementRecoveries[key] = null;
+      render();
+    } catch (error) {
+      ui.state.managementRecoveries[key] = { kind: "stale", error: "重新载入失败：" + (error instanceof Error ? error.message : "请重试") };
+      render();
+    } finally { setBusy(false); }
+  }
+
+  async function openManagementDelete(entityType, id) {
+    const entity = await ui.getEntity(entityType, id);
+    const dialog = { entityType, id, name: entity.name, loading: true, references: [], error: "" };
+    ui.state.managementDeleteDialog = dialog;
+    render();
+    try {
+      const method = entityType === "rule" ? "getRuleReferences" : "getEffectGroupReferences";
+      const response = await ui.native.call(method, entityType === "rule" ? { id } : { id, page: 1 });
+      if (ui.state.managementDeleteDialog !== dialog) return;
+      dialog.references = Array.isArray(response) ? response : Array.isArray(response && response.items) ? response.items : [];
+      dialog.loading = false;
+      render();
+    } catch (error) {
+      if (ui.state.managementDeleteDialog !== dialog) return;
+      dialog.loading = false;
+      dialog.error = "无法检查引用：" + (error instanceof Error ? error.message : "请重试");
+      render();
+    }
+  }
+
+  function closeManagementDelete() {
+    ui.state.managementDeleteDialog = null;
+    render();
+  }
+
+  async function confirmManagementDelete() {
+    const dialog = ui.state.managementDeleteDialog;
+    if (!dialog || dialog.loading || dialog.error || dialog.references.length) return;
+    const key = dialog.entityType === "rule" ? "rules" : "effectGroups";
+    const method = dialog.entityType === "rule" ? "deleteRule" : "deleteEffectGroup";
+    ui.state.managementDeleteDialog = null;
+    render();
+    await mutateManagementEntity(key, method, { id: dialog.id });
+  }
+
+  function effectReasonPreview(draft) {
+    const templates = {
+      general: "{触发角色} 受到「{效果组名称}」影响，{字段名称} 发生变化。",
+      rule: "规则触发「{效果组名称}」，改变 {触发角色} 的 {字段名称}。",
+      natural: "自然变化应用「{效果组名称}」，调整 {字段名称}。",
+      per_turn: "每轮变化应用「{效果组名称}」，调整 {字段名称}。",
+      ai: "AI 更新应用「{效果组名称}」，调整 {字段名称}。",
+      manual: "手动应用「{效果组名称}」，调整 {字段名称}。",
+    };
+    return draft.reason.mode === "custom" ? (draft.reason.text || "输入自定义原因后在此预览") : templates[draft.reason.template] || templates.general;
+  }
+
   async function openStatusPicker(action, element) {
     const groupMode = action === "open-status-group-picker";
     const activeGroupId = ui.state.snapshot.activeContext.groupId;
@@ -1247,6 +1919,7 @@
             draft.error = "";
           }
         }
+        commitRuleOrEffectPicker(element, ids, items);
       },
     });
   }
@@ -1321,6 +1994,18 @@
         return;
       }
     }
+    if (ui.state.managementDeleteDialog) {
+      const dialog = appRoot.querySelector(".management-delete-dialog");
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeManagementDelete();
+        return;
+      }
+      if (event.key === "Tab" && dialog) {
+        trapFocus(dialog, event);
+        return;
+      }
+    }
     const tab = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
     if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
       const tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
@@ -1382,6 +2067,14 @@
       render();
       return;
     }
+    if (target.closest('[data-form="rule-editor"]')) {
+      captureRuleEditorControl(target);
+      return;
+    }
+    if (target.closest('[data-form="effect-editor"]')) {
+      captureEffectEditorControl(target);
+      return;
+    }
     if (target.closest('[data-form="condition-editor"]')) {
       captureConditionEditorControl(target);
       return;
@@ -1422,6 +2115,17 @@
   function handleAppChange(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest('[data-form="rule-editor"]')) {
+      captureRuleEditorControl(target);
+      if (target.name === "ruleActorKind" || target.hasAttribute("data-rule-target-kind")) render();
+      return;
+    }
+    if (target.closest('[data-form="effect-editor"]')) {
+      captureEffectEditorControl(target);
+      if (target.hasAttribute("data-effect-actor-kind") || target.hasAttribute("data-effect-operation-kind") ||
+          target.name === "effectDurationMode" || target.name === "effectReasonTemplate") render();
+      return;
+    }
     if (target.closest('[data-form="condition-editor"]')) {
       captureConditionEditorControl(target);
       if (target.matches("[data-condition-predicate-kind]")) renderConditionDraftChange(target.dataset.conditionPath);
@@ -2572,6 +3276,18 @@
   appRoot.addEventListener("input", handleAppInput);
   appRoot.addEventListener("change", handleAppChange);
   appRoot.addEventListener("submit", function (event) {
+    const ruleForm = event.target instanceof Element ? event.target.closest('[data-form="rule-editor"]') : null;
+    if (ruleForm) {
+      event.preventDefault();
+      void saveRuleEditor();
+      return;
+    }
+    const effectForm = event.target instanceof Element ? event.target.closest('[data-form="effect-editor"]') : null;
+    if (effectForm) {
+      event.preventDefault();
+      void saveEffectEditor();
+      return;
+    }
     const conditionForm = event.target instanceof Element ? event.target.closest('[data-form="condition-editor"]') : null;
     if (conditionForm) {
       event.preventDefault();
