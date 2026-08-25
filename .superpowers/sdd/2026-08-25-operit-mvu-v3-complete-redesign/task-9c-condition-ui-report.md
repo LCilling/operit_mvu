@@ -5,6 +5,7 @@ Branch: `codex/mvu-v3-complete-redesign`
 Original commit: `a1bb95c feat: complete condition library editor`
 First follow-up: `95d5cf0 fix: harden condition editor UX`
 Second follow-up message: `fix: align condition production contract`
+Final narrow follow-up message: `fix: reject empty condition selections`
 
 ## Outcome
 
@@ -33,7 +34,7 @@ The recursive editor renders AND, OR, NOT, and all 14 production predicates as e
 ## Production-contract alignment
 
 1. One pure validation implementation now owns strict Gregorian dates and repeating month/day limits. IPC and `assertMvuDatasetV3` both reject `2026-02-31`, `1900-02-29`, and February 30/31; both accept `2000-02-29` and repeating February 29. Error codes remain `MVU_CONDITION_PREDICATE_INVALID` at IPC and the existing predicate-specific `MVU_V3_CONDITION_*_INVALID` codes at dataset validation.
-2. Actor IDs, group IDs, and concrete dates share the production limit of 100 items and 256 code units per non-empty item in IPC, dataset assertion, and signed full-v3 import. Exactly 100 is accepted and 101 is rejected. Duplicate entries remain accepted to preserve the pre-existing IPC contract, and dataset validation now matches it exactly.
+2. Actor IDs, group IDs, and concrete dates share the production limit of 1–100 items and 256 code units per non-empty item in IPC, dataset assertion, and signed full-v3 import. Zero selections are rejected, while exactly 1 and 100 are accepted and 101 is rejected. Duplicate entries remain accepted to preserve the pre-existing IPC contract, and dataset validation now matches it exactly.
 3. A condition editor reference result carries `checkedRevision`. Any later snapshot revision invalidates the old result immediately, shows `影响范围未知`, blocks save, and starts a race-safe automatic recheck. The stale-save test proves the full sequence: one reference at revision 7, external change to two references at revision 8, blocked save while unknown, authoritative two-reference result, then update with `expectedRevision: 8`.
 4. A stale zero-reference delete now closes the obsolete confirmation, reloads the authoritative snapshot/list, and leaves a persistent `重新载入 / 重新检查` recovery panel. Row mutations remain disabled, so the delete cannot be repeated accidentally.
 
@@ -48,11 +49,12 @@ Review fixes were test-first and observed failing before implementation:
 - Hydrated-picker cache RED: 0/1 passed when direct confirmation duplicated the display ID; the display-only label is now stripped before the authoritative cache update.
 - Production contract RED: 0/4 passed. IPC accepted impossible calendar dates, dataset validation accepted impossible dates and 101-item arrays, and a re-signed full-v3 import bypassed both boundaries.
 - Revision/delete recovery RED: 29/31 passed. Reference results lacked `checkedRevision`, and stale delete timed out without a persistent list recovery entry.
+- Empty-selection RED: 4/5 contract tests passed; the new 0/1 matrix failed at `actor IPC rejects zero selections` until the shared production helper gained the lower bound.
 
 Final verification after the second follow-up:
 
 - `node --test tests/ui-task9-condition-dom.test.cjs`: 31/31 passed, including live Chromium 320px/130% editor and opened-picker pressure checks.
-- `node --test tests/condition-contract-boundary.test.mjs`: 4/4 passed.
+- `node --test tests/condition-contract-boundary.test.mjs`: 5/5 passed, including 0/1 matrices for actor, group, and concrete-date selections across IPC, dataset, and signed full-v3 import.
 - Condition/full-backup/query/migration focused Node regression: 82/82 passed.
 - `node --test tests/ui-task9-field-template-dom.test.cjs`: 20/20 passed.
 - `node --test tests/field-template.test.mjs tests/ui-shell.test.mjs`: 77/77 passed; `node --test tests/ui-task8-dom-behavior.cjs`: 4/4 passed.
