@@ -1076,6 +1076,7 @@ test("adding a legacy effect target adds a matching definition field effect", as
 });
 
 test("registered production chat hook commits legacy changes, v3 effects, AI rules, facts, and records atomically", async (t) => {
+  t.mock.method(Date, "now", () => NOW);
   const legacy = legacyDatasetFixture();
   legacy.autoRules = [];
   legacy.temporaryEffects = [];
@@ -1109,6 +1110,18 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
   const configured = await seedStore.readV3();
   const next = structuredClone(configured.dataset);
   const createdAt = new Date(NOW).toISOString();
+  for (let index = 0; index < 42; index += 1) {
+    const template = structuredClone(next.fields[0]);
+    template.id = `field_budget_${String(index).padStart(2, "0")}`;
+    template.name = `Budget field ${index}`;
+    template.description = "Production model budget fixture";
+    template.order = 100 + index;
+    template.naturalChange = { enabled: false, unitMs: HOUR, amount: 0 };
+    template.perTurnChange = { enabled: false, intervalTurns: 1, amount: 0, countMode: "both" };
+    template.ai = { enabled: true, minConfidence: 0.5, maxDelta: 10, prompt: "Track bounded state." };
+    next.fields.push(template);
+    next.stateValues["character:T"][template.id] = template.initialValue;
+  }
   next.conditions = [
     {
       id: "condition_ai_character",
@@ -1286,10 +1299,26 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
     role: "character",
     actorId: "T",
     actorName: "T",
+    chatId: "chat_main",
+    groupId: null,
     content: "A role-aware production event",
   });
   assert.equal(modelCalls.filter((call) => call.jsonSchema.name === "mvu_condition_judgement").length, 1);
   assert.equal(modelCalls.filter((call) => call.jsonSchema.name === "mvu_state_judgement").length, 1);
+  const stateCall = modelCalls.find((call) => call.jsonSchema.name === "mvu_state_judgement");
+  const stateFieldsLine = stateCall.systemPrompt.split("\n")
+    .find((line) => line.startsWith("可判断字段："));
+  assert.equal(JSON.parse(stateFieldsLine.slice("可判断字段：".length)).length <= 40, true);
+  const currentMessage = stateCall.userPrompt.split("\n")
+    .find((line) => line.startsWith("本次消息："));
+  assert.deepEqual(JSON.parse(currentMessage.slice("本次消息：".length)), {
+    role: "character",
+    actorId: "T",
+    actorName: "T",
+    chatId: "chat_main",
+    groupId: null,
+    content: "A role-aware production event",
+  });
 
   const storedLines = Object.entries(files.snapshot())
     .filter(([path]) => path.startsWith(`${RECORD_DIRECTORY}/segment-`))
@@ -1350,6 +1379,7 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
     chatId: "chat_main", actorId: "T", groupId: null, actorName: "T",
   });
   assert.equal(compatibility.fields.find((field) => field.definition.id === "field_affinity").currentValue, 28);
+  assert.equal(compatibility.fields.length, 44);
   assert.equal(compatibility.records.length, 7);
   assert.equal(compatibility.migrationStatus.mode, "v3");
 
@@ -1359,6 +1389,17 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
   assert.equal((await repairRuntime.initialize()).mode, "v3");
   assert.equal(files.snapshot()[orphanPath], undefined);
   assert.equal(fileCalls.some((call) => call.operation === "deleteFile" && call.path === orphanPath), true);
+  const compact = await registrations.ipc["operit_mvu:snapshot"]({});
+  assert.deepEqual(compact.modelBudget, {
+    used: 40,
+    total: 44,
+    limit: 40,
+    referencedIncluded: 1,
+    referencedTotal: 1,
+    overflow: true,
+    diagnostics: [],
+  });
+  assert.equal("fields" in compact, false);
 });
 
 test("production runtime composes legacy field behavior with v3 rules in one committed transaction", async () => {

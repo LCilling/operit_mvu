@@ -160,7 +160,19 @@ async function processPersistedMessage(
     const migrationStatus = await activeRuntime.migrationStatus();
     const recentFacts = await activeRuntime.getRecentMessageFacts(context);
     const dataset = await activeRuntime.dataset();
-    const fields = await activeRuntime.service.projectFields(context);
+    const role = persistedRole(payload.sender);
+    const currentActorId = activeContextFromHostSnapshot(hostSnapshot).actorId;
+    const trustedMessage = {
+      role,
+      actorId: context.actorId,
+      actorName: context.actorName,
+      content: payload.content,
+    } as const;
+    const fields = (await activeRuntime.service.projectModelFields(context, {
+      eventActorId: context.actorId,
+      currentActorId,
+      occurredAt: payload.timestamp,
+    })).fields;
     let aiRuleJudgements: Awaited<ReturnType<HostSystemModelApi["judgeRules"]>>["judgements"] = [];
     if (migrationStatus.mode === "v2_compat") {
       const aiRules = await activeRuntime.service.getApplicableAiRules(context, payload.timestamp);
@@ -170,7 +182,7 @@ async function processPersistedMessage(
         rules: aiRules,
         fields,
         recentFacts,
-        message: payload.content,
+        message: trustedMessage,
       });
       if (judgement.available) aiRuleJudgements = judgement.judgements;
       }
@@ -183,7 +195,7 @@ async function processPersistedMessage(
         context,
         fields,
         recentFacts,
-        message: payload.content,
+        message: trustedMessage,
       });
       if (judgement.available) aiChanges = judgement.changes;
     }
@@ -193,12 +205,12 @@ async function processPersistedMessage(
       messageId: payload.messageId,
       variantId: payload.variantId,
       content: payload.content,
-      role: persistedRole(payload.sender),
+      role,
       occurredAt: payload.timestamp,
       signals: automationSignalsForMessage(recentFacts, payload),
       aiChanges,
       aiRuleJudgements,
-      currentActorId: activeContextFromHostSnapshot(hostSnapshot).actorId,
+      currentActorId,
       actorNamesById: Object.fromEntries((await activeRuntime.listActors()).map((actor) => [
         actor.characterId,
         actor.name,
@@ -333,6 +345,10 @@ function createQuerySource(
     },
     async activeContext() {
       return fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
+    },
+    async modelBudget() {
+      const context = fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
+      return activeRuntime.modelBudget(context);
     },
     migrationStatus() {
       return activeRuntime.migrationStatus();

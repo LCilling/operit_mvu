@@ -37,6 +37,8 @@ import {
   createEmptyRecordManifest,
   RECORDS_PER_SEGMENT,
   SegmentedRecordStore,
+  type LatestFieldChange,
+  type LatestFieldChangeTarget,
   type RecordQueryRequest,
   type RecordQueryResult,
 } from "./record-store";
@@ -211,6 +213,17 @@ export class V3MvuStore implements MvuStore {
     return this.enqueuePath(async () => {
       const snapshot = await this.loadV3Config();
       return this.records.queryRecords(snapshot.dataset.recordManifest, request);
+    });
+  }
+
+  async queryLatestFieldChanges(
+    targets: readonly LatestFieldChangeTarget[],
+  ): Promise<LatestFieldChange[]> {
+    const status = await this.initialize();
+    if (status.mode !== "v3") throw new V3UnavailableError(status);
+    return this.enqueuePath(async () => {
+      const snapshot = await this.loadV3Config();
+      return this.records.queryLatestFieldChanges(snapshot.dataset.recordManifest, targets);
     });
   }
 
