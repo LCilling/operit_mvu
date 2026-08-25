@@ -272,3 +272,20 @@ export {
   buildStateSectionBlock,
   visibleFieldsForContext,
 };
+export {
+  MvuQueryService,
+  PICKER_BATCH_SIZE,
+  QUERY_CURSOR_MAX_LENGTH,
+  QUERY_SEARCH_MAX_LENGTH,
+} from "./query";
+export type {
+  EntityReferenceSummary,
+  GetEntityByIdRequest,
+  MvuCompactPageSnapshot,
+  MvuQueryServiceOptions,
+  MvuQuerySource,
+  QueryEntityType,
+  QueryGroup,
+  QueryRequest,
+  QueryResponse,
+} from "./query";

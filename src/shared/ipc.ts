@@ -1,8 +1,10 @@
 /** Strict typed IPC contract shared by the ToolPkg main runtime and WebView container. */
-import type { MvuRuntime, MvuSnapshotView } from "../mvu/app/index";
+import type { MvuRuntime } from "../mvu/app/index";
 import type {
   AutoRuleCondition,
+  DataActor,
   DataAutoRule,
+  DataChangeRecord,
   DataField,
   DataLinkRule,
   DataTemporaryEffect,
@@ -10,6 +12,38 @@ import type {
   StateScopeContext,
 } from "../mvu/app/model";
 import type { PersistedAiChange } from "../mvu/app/service";
+import {
+  QUERY_CURSOR_MAX_LENGTH,
+  QUERY_SEARCH_MAX_LENGTH,
+  type ConditionInput,
+  type ConditionPatch,
+  type EffectGroupInput,
+  type EffectGroupPatch,
+  type EntityReferenceSummary,
+  type GetEntityByIdRequest,
+  type MvuCompactPageSnapshot,
+  type MvuQueryService,
+  type QueryGroup,
+  type QueryRequest,
+  type QueryResponse,
+  type RuleInput,
+  type RulePatch,
+} from "../mvu/app/query";
+import type {
+  ConditionDefinition,
+  ConditionExpression,
+  ConditionPredicate,
+  ChangeSource,
+  EffectActorSelector,
+  EffectDuration,
+  EffectGroupDefinition,
+  EffectOperation,
+  FieldEffectDefinition,
+  RuleActionV3,
+  RuleActorSelector,
+  RuleDefinitionV3,
+  RuleTargetSelector,
+} from "../mvu/app/model-v3";
 import type {
   BackgroundModelProbeResult,
   SystemModelApi,
@@ -45,13 +79,37 @@ export const MVU_IPC = {
   addTemporaryEffect: "operit_mvu:add_temporary_effect",
   updateTemporaryEffect: "operit_mvu:update_temporary_effect",
   deleteTemporaryEffect: "operit_mvu:delete_temporary_effect",
+  queryFields: "operit_mvu:query_fields",
+  queryActors: "operit_mvu:query_actors",
+  queryGroups: "operit_mvu:query_groups",
+  queryRules: "operit_mvu:query_rules_v3",
+  queryConditions: "operit_mvu:query_conditions",
+  queryEffectGroups: "operit_mvu:query_effect_groups",
+  queryRecords: "operit_mvu:query_records",
+  getEntityById: "operit_mvu:get_entity_by_id",
+  createCondition: "operit_mvu:create_condition",
+  updateCondition: "operit_mvu:update_condition",
+  copyCondition: "operit_mvu:copy_condition",
+  toggleCondition: "operit_mvu:toggle_condition",
+  deleteCondition: "operit_mvu:delete_condition",
+  getConditionReferences: "operit_mvu:get_condition_references",
+  createEffectGroup: "operit_mvu:create_effect_group",
+  updateEffectGroup: "operit_mvu:update_effect_group",
+  copyEffectGroup: "operit_mvu:copy_effect_group",
+  toggleEffectGroup: "operit_mvu:toggle_effect_group",
+  deleteEffectGroup: "operit_mvu:delete_effect_group",
+  getEffectGroupReferences: "operit_mvu:get_effect_group_references",
+  createRule: "operit_mvu:create_rule_v3",
+  updateRule: "operit_mvu:update_rule_v3",
+  copyRule: "operit_mvu:copy_rule_v3",
+  toggleRule: "operit_mvu:toggle_rule_v3",
+  deleteRule: "operit_mvu:delete_rule_v3",
+  getRuleReferences: "operit_mvu:get_rule_references",
 } as const;
 
 export type EmptyRequest = Record<string, never>;
 export interface SnapshotRequest { actorId?: string; groupId?: string; }
-export interface MvuPageSnapshot extends MvuSnapshotView {
-  selectableActorIds: string[];
-  groups: ToolPkg.ChatContextGroupSnapshot[];
+export interface MvuPageSnapshot extends MvuCompactPageSnapshot {
   contextLabels: {
     groupName: string | null;
     chatName: string;
@@ -105,10 +163,18 @@ export interface ExportDatasetResponse {
 export interface ImportDatasetRequest { json: string; }
 export interface AddTemporaryEffectRequest { effect: TemporaryEffectInput; }
 export interface UpdateTemporaryEffectRequest { id: string; patch: TemporaryEffectPatch; }
+export interface CreateConditionRequest { condition: ConditionInput; }
+export interface UpdateConditionRequest { id: string; patch: ConditionPatch; }
+export interface CreateEffectGroupRequest { effectGroup: EffectGroupInput; }
+export interface UpdateEffectGroupRequest { id: string; patch: EffectGroupPatch; }
+export interface CreateRuleRequest { rule: RuleInput; }
+export interface UpdateRuleRequest { id: string; patch: RulePatch; }
+export interface ToggleEntityRequest { id: string; enabled: boolean; }
 
 export interface MvuIpcDependencies {
   snapshot(request: SnapshotRequest): Promise<MvuPageSnapshot>;
   systemModel: SystemModelApi;
+  queries: MvuQueryService;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -676,6 +742,479 @@ function parseUpdateTemporaryEffectRequest(value: unknown): UpdateTemporaryEffec
   };
 }
 
+function parseQueryRequest(
+  value: unknown,
+  sortKeys: readonly string[],
+  filterKeys: readonly string[],
+): QueryRequest {
+  const record = requireRecord(value, "MVU_QUERY_REQUEST_INVALID");
+  assertKeys(record, [], ["search", "filters", "sort", "page", "cursor"], "MVU_QUERY_REQUEST_INVALID");
+  const request: QueryRequest = {};
+  if (hasOwn(record, "search")) {
+    const search = requireString(record, "search", "MVU_QUERY_SEARCH_INVALID");
+    if (search.length > QUERY_SEARCH_MAX_LENGTH) fail("MVU_QUERY_SEARCH_TOO_LONG");
+    request.search = search;
+  }
+  if (hasOwn(record, "filters")) {
+    const filters = requireRecord(record.filters, "MVU_QUERY_FILTER_INVALID");
+    if (Object.keys(filters).length > 12 || Object.keys(filters).some((key) => !filterKeys.includes(key))) {
+      fail("MVU_QUERY_FILTER_INVALID");
+    }
+    const parsedFilters: Record<string, string | boolean | number> = {};
+    for (const [key, entry] of Object.entries(filters)) {
+      if (typeof entry !== "string" && typeof entry !== "boolean" &&
+        (typeof entry !== "number" || !Number.isFinite(entry))) fail("MVU_QUERY_FILTER_INVALID");
+      if (typeof entry === "string" && entry.length > 256) fail("MVU_QUERY_FILTER_INVALID");
+      parsedFilters[key] = entry;
+    }
+    request.filters = parsedFilters;
+  }
+  if (hasOwn(record, "sort")) {
+    const sort = requireRecord(record.sort, "MVU_QUERY_SORT_INVALID");
+    assertKeys(sort, ["key", "direction"], [], "MVU_QUERY_SORT_INVALID");
+    const key = requireString(sort, "key", "MVU_QUERY_SORT_INVALID");
+    if (!sortKeys.includes(key)) fail("MVU_QUERY_SORT_INVALID");
+    request.sort = {
+      key,
+      direction: requireEnum(sort, "direction", ["asc", "desc"] as const, "MVU_QUERY_SORT_INVALID"),
+    };
+  }
+  if (hasOwn(record, "page")) {
+    const page = requireNumber(record, "page", "MVU_QUERY_PAGE_INVALID");
+    if (!Number.isSafeInteger(page) || page < 1) fail("MVU_QUERY_PAGE_INVALID");
+    request.page = page;
+  }
+  if (hasOwn(record, "cursor")) {
+    const cursor = requireString(record, "cursor", "MVU_QUERY_CURSOR_INVALID");
+    if (cursor.length > QUERY_CURSOR_MAX_LENGTH) fail("MVU_QUERY_CURSOR_TOO_LONG");
+    request.cursor = cursor;
+  }
+  if (request.page !== undefined && request.cursor !== undefined) fail("MVU_QUERY_REQUEST_INVALID");
+  return request;
+}
+
+function parseFieldsQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(
+    value,
+    ["id", "name", "order", "enabled", "scope", "minimum", "maximum"],
+    ["mode", "enabled", "scope", "bindingId"],
+  );
+  assertFilterValue(request, "mode", (entry) => entry === "picker");
+  assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  assertFilterValue(request, "scope", (entry) =>
+    entry === "character" || entry === "group" || entry === "global" || entry === "chat");
+  assertFilterValue(request, "bindingId", isBoundedFilterString);
+  return request;
+}
+
+function parseActorsQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(value, ["id", "name", "enabled"], ["enabled"]);
+  assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  return request;
+}
+
+const parseGroupsQuery = (value: unknown): QueryRequest =>
+  parseQueryRequest(value, ["id", "name"], []);
+
+function parseRulesQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(
+    value, ["id", "name", "enabled", "executionOrder", "updatedAt"],
+    ["enabled", "conditionId", "actorId", "groupId"],
+  );
+  assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  for (const key of ["conditionId", "actorId", "groupId"] as const) {
+    assertFilterValue(request, key, isBoundedFilterString);
+  }
+  return request;
+}
+
+function parseConditionsQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(value, ["id", "name", "enabled", "updatedAt"], ["enabled"]);
+  assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  return request;
+}
+
+function parseEffectGroupsQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(
+    value, ["id", "name", "enabled", "updatedAt"], ["enabled", "fieldId"],
+  );
+  assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  assertFilterValue(request, "fieldId", isBoundedFilterString);
+  return request;
+}
+const parseRecordsQuery = (value: unknown): QueryRequest => parseQueryRequest(
+  value, ["occurredAt"], [],
+);
+
+function assertFilterValue(
+  request: QueryRequest,
+  key: string,
+  predicate: (value: string | boolean | number) => boolean,
+): void {
+  const value = request.filters?.[key];
+  if (value !== undefined && !predicate(value)) fail("MVU_QUERY_FILTER_INVALID");
+}
+
+function isBoundedFilterString(value: string | boolean | number): boolean {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+
+function parseGetEntityByIdRequest(value: unknown): GetEntityByIdRequest {
+  const record = requireRecord(value, "MVU_GET_ENTITY_REQUEST_INVALID");
+  assertKeys(record, ["entityType", "id"], [], "MVU_GET_ENTITY_REQUEST_INVALID");
+  return {
+    entityType: requireEnum(
+      record,
+      "entityType",
+      ["field", "actor", "group", "rule", "condition", "effectGroup"] as const,
+      "MVU_ENTITY_TYPE_INVALID",
+    ),
+    id: requireBoundedNonEmptyString(record, "id", 256, "MVU_ENTITY_ID_INVALID"),
+  };
+}
+
+function requireBoundedNonEmptyString(
+  record: UnknownRecord,
+  key: string,
+  maximum: number,
+  code: string,
+): string {
+  const value = requireNonEmptyString(record, key, code);
+  if (value.length > maximum) fail(code);
+  return value;
+}
+
+function requireBoundedString(
+  record: UnknownRecord,
+  key: string,
+  maximum: number,
+  code: string,
+): string {
+  const value = requireString(record, key, code);
+  if (value.length > maximum) fail(code);
+  return value;
+}
+
+function parseConditionExpression(value: unknown, depth = 0): ConditionExpression {
+  if (depth > 12) fail("MVU_CONDITION_EXPRESSION_INVALID");
+  const record = requireRecord(value, "MVU_CONDITION_EXPRESSION_INVALID");
+  const kind = requireEnum(
+    record,
+    "kind",
+    ["and", "or", "not", "predicate"] as const,
+    "MVU_CONDITION_EXPRESSION_INVALID",
+  );
+  if (kind === "and" || kind === "or") {
+    assertKeys(record, ["kind", "children"], [], "MVU_CONDITION_EXPRESSION_INVALID");
+    if (!Array.isArray(record.children) || record.children.length > 100) fail("MVU_CONDITION_EXPRESSION_INVALID");
+    return { kind, children: record.children.map((child) => parseConditionExpression(child, depth + 1)) };
+  }
+  if (kind === "not") {
+    assertKeys(record, ["kind", "child"], [], "MVU_CONDITION_EXPRESSION_INVALID");
+    return { kind, child: parseConditionExpression(record.child, depth + 1) };
+  }
+  assertKeys(record, ["kind", "predicate"], [], "MVU_CONDITION_EXPRESSION_INVALID");
+  return { kind, predicate: parseConditionPredicate(record.predicate) };
+}
+
+function parseConditionPredicate(value: unknown): ConditionPredicate {
+  const record = requireRecord(value, "MVU_CONDITION_PREDICATE_INVALID");
+  const kind = requireString(record, "kind", "MVU_CONDITION_PREDICATE_INVALID");
+  switch (kind) {
+    case "recent_positive":
+      assertKeys(record, ["kind", "count"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, count: requireNumber(record, "count", "MVU_CONDITION_PREDICATE_INVALID") };
+    case "long_inactive":
+      assertKeys(record, ["kind", "hours"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, hours: requireNumber(record, "hours", "MVU_CONDITION_PREDICATE_INVALID") };
+    case "user_care":
+    case "special_day":
+      assertKeys(record, ["kind"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind };
+    case "high_frequency": {
+      assertKeys(record, ["kind", "messages"], ["windowHours", "bucketHours"], "MVU_CONDITION_PREDICATE_INVALID");
+      const result: Extract<ConditionPredicate, { kind: "high_frequency" }> = {
+        kind, messages: requireNumber(record, "messages", "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+      if (hasOwn(record, "windowHours")) result.windowHours = requireNumber(record, "windowHours", "MVU_CONDITION_PREDICATE_INVALID");
+      if (hasOwn(record, "bucketHours")) result.bucketHours = requireNumber(record, "bucketHours", "MVU_CONDITION_PREDICATE_INVALID");
+      return result;
+    }
+    case "field_comparison":
+      assertKeys(record, ["kind", "fieldId", "operator", "value"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return {
+        kind,
+        fieldId: requireBoundedNonEmptyString(record, "fieldId", 256, "MVU_CONDITION_PREDICATE_INVALID"),
+        operator: requireEnum(record, "operator", [">=", "<=", ">", "<", "=="] as const, "MVU_CONDITION_PREDICATE_INVALID"),
+        value: requireNumber(record, "value", "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+    case "message_count": {
+      assertKeys(record, ["kind", "count", "windowHours"], ["sender"], "MVU_CONDITION_PREDICATE_INVALID");
+      const result: Extract<ConditionPredicate, { kind: "message_count" }> = {
+        kind,
+        count: requireNumber(record, "count", "MVU_CONDITION_PREDICATE_INVALID"),
+        windowHours: requireNumber(record, "windowHours", "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+      if (hasOwn(record, "sender")) result.sender = requireEnum(record, "sender", ["user", "character"] as const, "MVU_CONDITION_PREDICATE_INVALID");
+      return result;
+    }
+    case "keywords": {
+      assertKeys(record, ["kind", "includeAny", "includeAll", "exclude"], ["windowHours", "caseSensitive"], "MVU_CONDITION_PREDICATE_INVALID");
+      const result: Extract<ConditionPredicate, { kind: "keywords" }> = {
+        kind,
+        includeAny: parseBoundedStringArray(record.includeAny, "MVU_CONDITION_PREDICATE_INVALID"),
+        includeAll: parseBoundedStringArray(record.includeAll, "MVU_CONDITION_PREDICATE_INVALID"),
+        exclude: parseBoundedStringArray(record.exclude, "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+      if (hasOwn(record, "windowHours")) result.windowHours = requireNumber(record, "windowHours", "MVU_CONDITION_PREDICATE_INVALID");
+      if (hasOwn(record, "caseSensitive")) result.caseSensitive = requireBoolean(record, "caseSensitive", "MVU_CONDITION_PREDICATE_INVALID");
+      return result;
+    }
+    case "sender":
+      assertKeys(record, ["kind", "senders"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, senders: parseSenderArray(record.senders) };
+    case "actor":
+      assertKeys(record, ["kind", "actorIds"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, actorIds: parseBoundedStringArray(record.actorIds, "MVU_CONDITION_PREDICATE_INVALID") };
+    case "group":
+      assertKeys(record, ["kind", "groupIds"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, groupIds: parseBoundedStringArray(record.groupIds, "MVU_CONDITION_PREDICATE_INVALID") };
+    case "concrete_date":
+      assertKeys(record, ["kind", "dates"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, dates: parseBoundedStringArray(record.dates, "MVU_CONDITION_PREDICATE_INVALID") };
+    case "repeating_date":
+      assertKeys(record, ["kind", "month", "day"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return {
+        kind,
+        month: requireNumber(record, "month", "MVU_CONDITION_PREDICATE_INVALID"),
+        day: requireNumber(record, "day", "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+    case "ai_semantic":
+      assertKeys(record, ["kind", "id", "triggerType", "requirement", "minimumConfidence"], [], "MVU_CONDITION_PREDICATE_INVALID");
+      return {
+        kind,
+        id: requireBoundedNonEmptyString(record, "id", 256, "MVU_CONDITION_PREDICATE_INVALID"),
+        triggerType: requireBoundedNonEmptyString(record, "triggerType", 256, "MVU_CONDITION_PREDICATE_INVALID"),
+        requirement: requireBoundedNonEmptyString(record, "requirement", 4_096, "MVU_CONDITION_PREDICATE_INVALID"),
+        minimumConfidence: requireNumber(record, "minimumConfidence", "MVU_CONDITION_PREDICATE_INVALID"),
+      };
+    default:
+      return fail("MVU_CONDITION_PREDICATE_INVALID");
+  }
+}
+
+function parseBoundedStringArray(value: unknown, code: string): string[] {
+  const entries = requireStringArray(value, code);
+  if (entries.length > 100 || entries.some((entry) => entry.length > 256)) fail(code);
+  return entries;
+}
+
+function parseSenderArray(value: unknown): Array<"user" | "character"> {
+  const entries = parseBoundedStringArray(value, "MVU_CONDITION_PREDICATE_INVALID");
+  if (entries.some((entry) => entry !== "user" && entry !== "character")) {
+    fail("MVU_CONDITION_PREDICATE_INVALID");
+  }
+  return entries as Array<"user" | "character">;
+}
+
+function parseConditionInput(value: unknown, patch: false): ConditionInput;
+function parseConditionInput(value: unknown, patch: true): ConditionPatch;
+function parseConditionInput(value: unknown, patch: boolean): ConditionInput | ConditionPatch {
+  const record = requireRecord(value, patch ? "MVU_CONDITION_PATCH_INVALID" : "MVU_CONDITION_INPUT_INVALID");
+  const keys = ["name", "description", "enabled", "expression"];
+  assertKeys(record, patch ? [] : keys, patch ? keys : [], patch ? "MVU_CONDITION_PATCH_INVALID" : "MVU_CONDITION_INPUT_INVALID");
+  const result: ConditionPatch = {};
+  if (hasOwn(record, "name")) result.name = requireBoundedNonEmptyString(record, "name", 256, "MVU_CONDITION_INPUT_INVALID");
+  if (hasOwn(record, "description")) result.description = requireBoundedString(record, "description", 4_096, "MVU_CONDITION_INPUT_INVALID");
+  if (hasOwn(record, "enabled")) result.enabled = requireBoolean(record, "enabled", "MVU_CONDITION_INPUT_INVALID");
+  if (hasOwn(record, "expression")) result.expression = parseConditionExpression(record.expression);
+  return result;
+}
+
+function parseEffectActorSelector(value: unknown): EffectActorSelector {
+  const record = requireRecord(value, "MVU_EFFECT_ACTOR_SELECTOR_INVALID");
+  const kind = requireEnum(record, "kind", ["all_bound", "trigger_actor", "selected"] as const, "MVU_EFFECT_ACTOR_SELECTOR_INVALID");
+  if (kind !== "selected") {
+    assertKeys(record, ["kind"], [], "MVU_EFFECT_ACTOR_SELECTOR_INVALID");
+    return { kind };
+  }
+  assertKeys(record, ["kind", "actorIds"], [], "MVU_EFFECT_ACTOR_SELECTOR_INVALID");
+  return { kind, actorIds: parseBoundedStringArray(record.actorIds, "MVU_EFFECT_ACTOR_SELECTOR_INVALID") };
+}
+
+function parseEffectOperation(value: unknown): EffectOperation {
+  const record = requireRecord(value, "MVU_EFFECT_OPERATION_INVALID");
+  const kind = requireEnum(
+    record,
+    "kind",
+    ["immediate_delta", "fixed_adjustment", "positive_multiplier", "negative_multiplier", "all_multiplier"] as const,
+    "MVU_EFFECT_OPERATION_INVALID",
+  );
+  if (kind === "immediate_delta") {
+    assertKeys(record, ["kind", "value"], [], "MVU_EFFECT_OPERATION_INVALID");
+    return { kind, value: requireNumber(record, "value", "MVU_EFFECT_OPERATION_INVALID") };
+  }
+  assertKeys(record, ["kind", "value", "sources"], [], "MVU_EFFECT_OPERATION_INVALID");
+  const sources = parseBoundedStringArray(record.sources, "MVU_EFFECT_OPERATION_INVALID");
+  if (sources.some((source) => !["manual", "natural", "per_turn", "rule", "ai"].includes(source))) {
+    fail("MVU_EFFECT_OPERATION_INVALID");
+  }
+  return {
+    kind,
+    value: requireNumber(record, "value", "MVU_EFFECT_OPERATION_INVALID"),
+    sources: sources as ChangeSource[],
+  };
+}
+
+function parseFieldEffect(value: unknown): FieldEffectDefinition {
+  const record = requireRecord(value, "MVU_FIELD_EFFECT_INVALID");
+  assertKeys(record, ["id", "fieldId", "actorSelector", "operations"], [], "MVU_FIELD_EFFECT_INVALID");
+    if (!Array.isArray(record.operations) || record.operations.length > 100) fail("MVU_FIELD_EFFECT_INVALID");
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, "MVU_FIELD_EFFECT_INVALID"),
+    fieldId: requireBoundedNonEmptyString(record, "fieldId", 256, "MVU_FIELD_EFFECT_INVALID"),
+    actorSelector: parseEffectActorSelector(record.actorSelector),
+    operations: record.operations.map(parseEffectOperation),
+  };
+}
+
+function parseEffectDuration(value: unknown): EffectDuration {
+  const record = requireRecord(value, "MVU_EFFECT_DURATION_INVALID");
+  assertKeys(record, ["expiresAt", "remainingTurns"], [], "MVU_EFFECT_DURATION_INVALID");
+  return {
+    expiresAt: requireNullableString(record, "expiresAt", "MVU_EFFECT_DURATION_INVALID"),
+    remainingTurns: requireNullableNumber(record, "remainingTurns", "MVU_EFFECT_DURATION_INVALID"),
+  };
+}
+
+function parseEffectGroupInput(value: unknown, patch: false): EffectGroupInput;
+function parseEffectGroupInput(value: unknown, patch: true): EffectGroupPatch;
+function parseEffectGroupInput(value: unknown, patch: boolean): EffectGroupInput | EffectGroupPatch {
+  const record = requireRecord(value, patch ? "MVU_EFFECT_GROUP_PATCH_INVALID" : "MVU_EFFECT_GROUP_INPUT_INVALID");
+  const required = ["name", "description", "enabled", "fieldEffects"];
+  const optional = ["defaultDuration"];
+  assertKeys(record, patch ? [] : required, patch ? [...required, ...optional] : optional,
+    patch ? "MVU_EFFECT_GROUP_PATCH_INVALID" : "MVU_EFFECT_GROUP_INPUT_INVALID");
+  const result: EffectGroupPatch = {};
+  if (hasOwn(record, "name")) result.name = requireBoundedNonEmptyString(record, "name", 256, "MVU_EFFECT_GROUP_INPUT_INVALID");
+  if (hasOwn(record, "description")) result.description = requireBoundedString(record, "description", 4_096, "MVU_EFFECT_GROUP_INPUT_INVALID");
+  if (hasOwn(record, "enabled")) result.enabled = requireBoolean(record, "enabled", "MVU_EFFECT_GROUP_INPUT_INVALID");
+  if (hasOwn(record, "fieldEffects")) {
+    if (!Array.isArray(record.fieldEffects) || record.fieldEffects.length > 100) fail("MVU_EFFECT_GROUP_INPUT_INVALID");
+    result.fieldEffects = record.fieldEffects.map(parseFieldEffect);
+  }
+  if (hasOwn(record, "defaultDuration")) result.defaultDuration = parseEffectDuration(record.defaultDuration);
+  return result;
+}
+
+function parseRuleActorSelector(value: unknown): RuleActorSelector {
+  const record = requireRecord(value, "MVU_RULE_ACTOR_SELECTOR_INVALID");
+  const kind = requireEnum(record, "kind", ["any", "current_actor", "selected", "group"] as const, "MVU_RULE_ACTOR_SELECTOR_INVALID");
+  if (kind === "any" || kind === "current_actor") {
+    assertKeys(record, ["kind"], [], "MVU_RULE_ACTOR_SELECTOR_INVALID");
+    return { kind };
+  }
+  const key = kind === "selected" ? "actorIds" : "groupIds";
+  assertKeys(record, ["kind", key], [], "MVU_RULE_ACTOR_SELECTOR_INVALID");
+  const ids = parseBoundedStringArray(record[key], "MVU_RULE_ACTOR_SELECTOR_INVALID");
+  return kind === "selected" ? { kind, actorIds: ids } : { kind, groupIds: ids };
+}
+
+function parseRuleTargetSelector(value: unknown): RuleTargetSelector {
+  const record = requireRecord(value, "MVU_RULE_TARGET_SELECTOR_INVALID");
+  const kind = requireEnum(record, "kind", ["trigger_actor", "all_bound", "selected"] as const, "MVU_RULE_TARGET_SELECTOR_INVALID");
+  if (kind !== "selected") {
+    assertKeys(record, ["kind"], [], "MVU_RULE_TARGET_SELECTOR_INVALID");
+    return { kind };
+  }
+  assertKeys(record, ["kind", "actorIds"], [], "MVU_RULE_TARGET_SELECTOR_INVALID");
+  return { kind, actorIds: parseBoundedStringArray(record.actorIds, "MVU_RULE_TARGET_SELECTOR_INVALID") };
+}
+
+function parseRuleAction(value: unknown): RuleActionV3 {
+  const record = requireRecord(value, "MVU_RULE_ACTION_INVALID");
+  const kind = requireEnum(record, "kind", ["change_field", "activate_effect_group"] as const, "MVU_RULE_ACTION_INVALID");
+  if (kind === "activate_effect_group") {
+    assertKeys(record, ["kind", "effectGroupId"], [], "MVU_RULE_ACTION_INVALID");
+    return { kind, effectGroupId: requireBoundedNonEmptyString(record, "effectGroupId", 256, "MVU_RULE_ACTION_INVALID") };
+  }
+  assertKeys(record, ["kind", "fieldId", "target", "delta", "effectGroupIds"], [], "MVU_RULE_ACTION_INVALID");
+  return {
+    kind,
+    fieldId: requireBoundedNonEmptyString(record, "fieldId", 256, "MVU_RULE_ACTION_INVALID"),
+    target: parseRuleTargetSelector(record.target),
+    delta: requireNumber(record, "delta", "MVU_RULE_ACTION_INVALID"),
+    effectGroupIds: parseBoundedStringArray(record.effectGroupIds, "MVU_RULE_ACTION_INVALID"),
+  };
+}
+
+function parseRuleInput(value: unknown, patch: false): RuleInput;
+function parseRuleInput(value: unknown, patch: true): RulePatch;
+function parseRuleInput(value: unknown, patch: boolean): RuleInput | RulePatch {
+  const record = requireRecord(value, patch ? "MVU_RULE_PATCH_INVALID" : "MVU_RULE_INPUT_INVALID");
+  const keys = ["name", "description", "enabled", "triggerActorSelector", "conditionId", "actions", "cooldownHours", "executionOrder"];
+  assertKeys(record, patch ? [] : keys, patch ? keys : [], patch ? "MVU_RULE_PATCH_INVALID" : "MVU_RULE_INPUT_INVALID");
+  const result: RulePatch = {};
+  if (hasOwn(record, "name")) result.name = requireBoundedNonEmptyString(record, "name", 256, "MVU_RULE_INPUT_INVALID");
+  if (hasOwn(record, "description")) result.description = requireBoundedString(record, "description", 4_096, "MVU_RULE_INPUT_INVALID");
+  if (hasOwn(record, "enabled")) result.enabled = requireBoolean(record, "enabled", "MVU_RULE_INPUT_INVALID");
+  if (hasOwn(record, "triggerActorSelector")) result.triggerActorSelector = parseRuleActorSelector(record.triggerActorSelector);
+  if (hasOwn(record, "conditionId")) result.conditionId = requireBoundedNonEmptyString(record, "conditionId", 256, "MVU_RULE_INPUT_INVALID");
+  if (hasOwn(record, "actions")) {
+    if (!Array.isArray(record.actions) || record.actions.length > 100) fail("MVU_RULE_INPUT_INVALID");
+    result.actions = record.actions.map(parseRuleAction);
+  }
+  if (hasOwn(record, "cooldownHours")) result.cooldownHours = requireNumber(record, "cooldownHours", "MVU_RULE_INPUT_INVALID");
+  if (hasOwn(record, "executionOrder")) result.executionOrder = requireNumber(record, "executionOrder", "MVU_RULE_INPUT_INVALID");
+  return result;
+}
+
+function parseCreateConditionRequest(value: unknown): CreateConditionRequest {
+  const record = requireRecord(value, "MVU_CREATE_CONDITION_REQUEST_INVALID");
+  assertKeys(record, ["condition"], [], "MVU_CREATE_CONDITION_REQUEST_INVALID");
+  return { condition: parseConditionInput(record.condition, false) };
+}
+
+function parseUpdateConditionRequest(value: unknown): UpdateConditionRequest {
+  const record = requireRecord(value, "MVU_UPDATE_CONDITION_REQUEST_INVALID");
+  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_CONDITION_REQUEST_INVALID");
+  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_CONDITION_ID_INVALID"), patch: parseConditionInput(record.patch, true) };
+}
+
+function parseCreateEffectGroupRequest(value: unknown): CreateEffectGroupRequest {
+  const record = requireRecord(value, "MVU_CREATE_EFFECT_GROUP_REQUEST_INVALID");
+  assertKeys(record, ["effectGroup"], [], "MVU_CREATE_EFFECT_GROUP_REQUEST_INVALID");
+  return { effectGroup: parseEffectGroupInput(record.effectGroup, false) };
+}
+
+function parseUpdateEffectGroupRequest(value: unknown): UpdateEffectGroupRequest {
+  const record = requireRecord(value, "MVU_UPDATE_EFFECT_GROUP_REQUEST_INVALID");
+  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_EFFECT_GROUP_REQUEST_INVALID");
+  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_EFFECT_GROUP_ID_INVALID"), patch: parseEffectGroupInput(record.patch, true) };
+}
+
+function parseCreateRuleRequest(value: unknown): CreateRuleRequest {
+  const record = requireRecord(value, "MVU_CREATE_RULE_REQUEST_INVALID");
+  assertKeys(record, ["rule"], [], "MVU_CREATE_RULE_REQUEST_INVALID");
+  return { rule: parseRuleInput(record.rule, false) };
+}
+
+function parseUpdateRuleRequest(value: unknown): UpdateRuleRequest {
+  const record = requireRecord(value, "MVU_UPDATE_RULE_REQUEST_INVALID");
+  assertKeys(record, ["id", "patch"], [], "MVU_UPDATE_RULE_REQUEST_INVALID");
+  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_RULE_ID_INVALID"), patch: parseRuleInput(record.patch, true) };
+}
+
+function parseToggleRequest(value: unknown, entity: "CONDITION" | "EFFECT_GROUP" | "RULE"): ToggleEntityRequest {
+  const code = `MVU_TOGGLE_${entity}_REQUEST_INVALID`;
+  const record = requireRecord(value, code);
+  assertKeys(record, ["id", "enabled"], [], code);
+  return {
+    id: requireBoundedNonEmptyString(record, "id", 256, code),
+    enabled: requireBoolean(record, "enabled", code),
+  };
+}
+
 export const MVU_REQUEST_PARSERS = {
   snapshot: parseSnapshotRequest,
   setStateValue: parseSetStateValueRequest,
@@ -697,6 +1236,32 @@ export const MVU_REQUEST_PARSERS = {
   addTemporaryEffect: parseAddTemporaryEffectRequest,
   updateTemporaryEffect: parseUpdateTemporaryEffectRequest,
   deleteTemporaryEffect: parseIdRequest,
+  queryFields: parseFieldsQuery,
+  queryActors: parseActorsQuery,
+  queryGroups: parseGroupsQuery,
+  queryRules: parseRulesQuery,
+  queryConditions: parseConditionsQuery,
+  queryEffectGroups: parseEffectGroupsQuery,
+  queryRecords: parseRecordsQuery,
+  getEntityById: parseGetEntityByIdRequest,
+  createCondition: parseCreateConditionRequest,
+  updateCondition: parseUpdateConditionRequest,
+  copyCondition: parseIdRequest,
+  toggleCondition: (value: unknown) => parseToggleRequest(value, "CONDITION"),
+  deleteCondition: parseIdRequest,
+  getConditionReferences: parseIdRequest,
+  createEffectGroup: parseCreateEffectGroupRequest,
+  updateEffectGroup: parseUpdateEffectGroupRequest,
+  copyEffectGroup: parseIdRequest,
+  toggleEffectGroup: (value: unknown) => parseToggleRequest(value, "EFFECT_GROUP"),
+  deleteEffectGroup: parseIdRequest,
+  getEffectGroupReferences: parseIdRequest,
+  createRule: parseCreateRuleRequest,
+  updateRule: parseUpdateRuleRequest,
+  copyRule: parseIdRequest,
+  toggleRule: (value: unknown) => parseToggleRequest(value, "RULE"),
+  deleteRule: parseIdRequest,
+  getRuleReferences: parseIdRequest,
 } as const;
 
 function guarded<TRequest, TResult>(
@@ -852,6 +1417,110 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
       MVU_IPC.deleteTemporaryEffect,
       guarded("deleteTemporaryEffect", MVU_REQUEST_PARSERS.deleteTemporaryEffect, (request) => runtime.service.deleteTemporaryEffect(request.id))
     ),
+    ToolPkg.ipc.on<unknown, QueryResponse<DataField>>(
+      MVU_IPC.queryFields,
+      guarded("queryFields", MVU_REQUEST_PARSERS.queryFields, (request) => deps.queries.queryFields(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<DataActor>>(
+      MVU_IPC.queryActors,
+      guarded("queryActors", MVU_REQUEST_PARSERS.queryActors, (request) => deps.queries.queryActors(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<QueryGroup>>(
+      MVU_IPC.queryGroups,
+      guarded("queryGroups", MVU_REQUEST_PARSERS.queryGroups, (request) => deps.queries.queryGroups(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<RuleDefinitionV3>>(
+      MVU_IPC.queryRules,
+      guarded("queryRules", MVU_REQUEST_PARSERS.queryRules, (request) => deps.queries.queryRules(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<ConditionDefinition>>(
+      MVU_IPC.queryConditions,
+      guarded("queryConditions", MVU_REQUEST_PARSERS.queryConditions, (request) => deps.queries.queryConditions(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<EffectGroupDefinition>>(
+      MVU_IPC.queryEffectGroups,
+      guarded("queryEffectGroups", MVU_REQUEST_PARSERS.queryEffectGroups, (request) => deps.queries.queryEffectGroups(request))
+    ),
+    ToolPkg.ipc.on<unknown, QueryResponse<DataChangeRecord>>(
+      MVU_IPC.queryRecords,
+      guarded("queryRecords", MVU_REQUEST_PARSERS.queryRecords, (request) => deps.queries.queryRecords(request))
+    ),
+    ToolPkg.ipc.on<unknown, Awaited<ReturnType<MvuQueryService["getEntityById"]>>>(
+      MVU_IPC.getEntityById,
+      guarded("getEntityById", MVU_REQUEST_PARSERS.getEntityById, (request) => deps.queries.getEntityById(request))
+    ),
+    ToolPkg.ipc.on<unknown, ConditionDefinition>(
+      MVU_IPC.createCondition,
+      guarded("createCondition", MVU_REQUEST_PARSERS.createCondition, (request) => deps.queries.createCondition(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.updateCondition,
+      guarded("updateCondition", MVU_REQUEST_PARSERS.updateCondition, (request) => deps.queries.updateCondition(request))
+    ),
+    ToolPkg.ipc.on<unknown, ConditionDefinition>(
+      MVU_IPC.copyCondition,
+      guarded("copyCondition", MVU_REQUEST_PARSERS.copyCondition, (request) => deps.queries.copyCondition(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.toggleCondition,
+      guarded("toggleCondition", MVU_REQUEST_PARSERS.toggleCondition, (request) => deps.queries.toggleCondition(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.deleteCondition,
+      guarded("deleteCondition", MVU_REQUEST_PARSERS.deleteCondition, (request) => deps.queries.deleteCondition(request))
+    ),
+    ToolPkg.ipc.on<unknown, EntityReferenceSummary[]>(
+      MVU_IPC.getConditionReferences,
+      guarded("getConditionReferences", MVU_REQUEST_PARSERS.getConditionReferences, (request) => deps.queries.getConditionReferences(request))
+    ),
+    ToolPkg.ipc.on<unknown, EffectGroupDefinition>(
+      MVU_IPC.createEffectGroup,
+      guarded("createEffectGroup", MVU_REQUEST_PARSERS.createEffectGroup, (request) => deps.queries.createEffectGroup(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.updateEffectGroup,
+      guarded("updateEffectGroup", MVU_REQUEST_PARSERS.updateEffectGroup, (request) => deps.queries.updateEffectGroup(request))
+    ),
+    ToolPkg.ipc.on<unknown, EffectGroupDefinition>(
+      MVU_IPC.copyEffectGroup,
+      guarded("copyEffectGroup", MVU_REQUEST_PARSERS.copyEffectGroup, (request) => deps.queries.copyEffectGroup(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.toggleEffectGroup,
+      guarded("toggleEffectGroup", MVU_REQUEST_PARSERS.toggleEffectGroup, (request) => deps.queries.toggleEffectGroup(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.deleteEffectGroup,
+      guarded("deleteEffectGroup", MVU_REQUEST_PARSERS.deleteEffectGroup, (request) => deps.queries.deleteEffectGroup(request))
+    ),
+    ToolPkg.ipc.on<unknown, EntityReferenceSummary[]>(
+      MVU_IPC.getEffectGroupReferences,
+      guarded("getEffectGroupReferences", MVU_REQUEST_PARSERS.getEffectGroupReferences, (request) => deps.queries.getEffectGroupReferences(request))
+    ),
+    ToolPkg.ipc.on<unknown, RuleDefinitionV3>(
+      MVU_IPC.createRule,
+      guarded("createRule", MVU_REQUEST_PARSERS.createRule, (request) => deps.queries.createRule(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.updateRule,
+      guarded("updateRule", MVU_REQUEST_PARSERS.updateRule, (request) => deps.queries.updateRule(request))
+    ),
+    ToolPkg.ipc.on<unknown, RuleDefinitionV3>(
+      MVU_IPC.copyRule,
+      guarded("copyRule", MVU_REQUEST_PARSERS.copyRule, (request) => deps.queries.copyRule(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.toggleRule,
+      guarded("toggleRule", MVU_REQUEST_PARSERS.toggleRule, (request) => deps.queries.toggleRule(request))
+    ),
+    ToolPkg.ipc.on<unknown, void>(
+      MVU_IPC.deleteRule,
+      guarded("deleteRule", MVU_REQUEST_PARSERS.deleteRule, (request) => deps.queries.deleteRule(request))
+    ),
+    ToolPkg.ipc.on<unknown, EntityReferenceSummary[]>(
+      MVU_IPC.getRuleReferences,
+      guarded("getRuleReferences", MVU_REQUEST_PARSERS.getRuleReferences, (request) => deps.queries.getRuleReferences(request))
+    ),
   ];
 
   return () => {
@@ -923,5 +1592,83 @@ export const mvuIpcClient = {
   },
   deleteTemporaryEffect(request: IdRequest): Promise<void> {
     return call<IdRequest, void>(MVU_IPC.deleteTemporaryEffect, request);
+  },
+  queryFields(request: QueryRequest): Promise<QueryResponse<DataField>> {
+    return call<QueryRequest, QueryResponse<DataField>>(MVU_IPC.queryFields, request);
+  },
+  queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
+    return call<QueryRequest, QueryResponse<DataActor>>(MVU_IPC.queryActors, request);
+  },
+  queryGroups(request: QueryRequest): Promise<QueryResponse<QueryGroup>> {
+    return call<QueryRequest, QueryResponse<QueryGroup>>(MVU_IPC.queryGroups, request);
+  },
+  queryRules(request: QueryRequest): Promise<QueryResponse<RuleDefinitionV3>> {
+    return call<QueryRequest, QueryResponse<RuleDefinitionV3>>(MVU_IPC.queryRules, request);
+  },
+  queryConditions(request: QueryRequest): Promise<QueryResponse<ConditionDefinition>> {
+    return call<QueryRequest, QueryResponse<ConditionDefinition>>(MVU_IPC.queryConditions, request);
+  },
+  queryEffectGroups(request: QueryRequest): Promise<QueryResponse<EffectGroupDefinition>> {
+    return call<QueryRequest, QueryResponse<EffectGroupDefinition>>(MVU_IPC.queryEffectGroups, request);
+  },
+  queryRecords(request: QueryRequest): Promise<QueryResponse<DataChangeRecord>> {
+    return call<QueryRequest, QueryResponse<DataChangeRecord>>(MVU_IPC.queryRecords, request);
+  },
+  getEntityById(request: GetEntityByIdRequest): ReturnType<MvuQueryService["getEntityById"]> {
+    return call<GetEntityByIdRequest, Awaited<ReturnType<MvuQueryService["getEntityById"]>>>(MVU_IPC.getEntityById, request);
+  },
+  createCondition(request: CreateConditionRequest): Promise<ConditionDefinition> {
+    return call<CreateConditionRequest, ConditionDefinition>(MVU_IPC.createCondition, request);
+  },
+  updateCondition(request: UpdateConditionRequest): Promise<void> {
+    return call<UpdateConditionRequest, void>(MVU_IPC.updateCondition, request);
+  },
+  copyCondition(request: IdRequest): Promise<ConditionDefinition> {
+    return call<IdRequest, ConditionDefinition>(MVU_IPC.copyCondition, request);
+  },
+  toggleCondition(request: ToggleEntityRequest): Promise<void> {
+    return call<ToggleEntityRequest, void>(MVU_IPC.toggleCondition, request);
+  },
+  deleteCondition(request: IdRequest): Promise<void> {
+    return call<IdRequest, void>(MVU_IPC.deleteCondition, request);
+  },
+  getConditionReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
+    return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getConditionReferences, request);
+  },
+  createEffectGroup(request: CreateEffectGroupRequest): Promise<EffectGroupDefinition> {
+    return call<CreateEffectGroupRequest, EffectGroupDefinition>(MVU_IPC.createEffectGroup, request);
+  },
+  updateEffectGroup(request: UpdateEffectGroupRequest): Promise<void> {
+    return call<UpdateEffectGroupRequest, void>(MVU_IPC.updateEffectGroup, request);
+  },
+  copyEffectGroup(request: IdRequest): Promise<EffectGroupDefinition> {
+    return call<IdRequest, EffectGroupDefinition>(MVU_IPC.copyEffectGroup, request);
+  },
+  toggleEffectGroup(request: ToggleEntityRequest): Promise<void> {
+    return call<ToggleEntityRequest, void>(MVU_IPC.toggleEffectGroup, request);
+  },
+  deleteEffectGroup(request: IdRequest): Promise<void> {
+    return call<IdRequest, void>(MVU_IPC.deleteEffectGroup, request);
+  },
+  getEffectGroupReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
+    return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getEffectGroupReferences, request);
+  },
+  createRule(request: CreateRuleRequest): Promise<RuleDefinitionV3> {
+    return call<CreateRuleRequest, RuleDefinitionV3>(MVU_IPC.createRule, request);
+  },
+  updateRule(request: UpdateRuleRequest): Promise<void> {
+    return call<UpdateRuleRequest, void>(MVU_IPC.updateRule, request);
+  },
+  copyRule(request: IdRequest): Promise<RuleDefinitionV3> {
+    return call<IdRequest, RuleDefinitionV3>(MVU_IPC.copyRule, request);
+  },
+  toggleRule(request: ToggleEntityRequest): Promise<void> {
+    return call<ToggleEntityRequest, void>(MVU_IPC.toggleRule, request);
+  },
+  deleteRule(request: IdRequest): Promise<void> {
+    return call<IdRequest, void>(MVU_IPC.deleteRule, request);
+  },
+  getRuleReferences(request: IdRequest): Promise<EntityReferenceSummary[]> {
+    return call<IdRequest, EntityReferenceSummary[]>(MVU_IPC.getRuleReferences, request);
   },
 } as const;

@@ -168,6 +168,58 @@ async function dispatch(method: string, params: JsonParams): Promise<unknown> {
       return mvuIpcClient.updateTemporaryEffect(MVU_REQUEST_PARSERS.updateTemporaryEffect(params));
     case "deleteTemporaryEffect":
       return mvuIpcClient.deleteTemporaryEffect(MVU_REQUEST_PARSERS.deleteTemporaryEffect(params));
+    case "queryFields":
+      return mvuIpcClient.queryFields(MVU_REQUEST_PARSERS.queryFields(params));
+    case "queryActors":
+      return mvuIpcClient.queryActors(MVU_REQUEST_PARSERS.queryActors(params));
+    case "queryGroups":
+      return mvuIpcClient.queryGroups(MVU_REQUEST_PARSERS.queryGroups(params));
+    case "queryRules":
+      return mvuIpcClient.queryRules(MVU_REQUEST_PARSERS.queryRules(params));
+    case "queryConditions":
+      return mvuIpcClient.queryConditions(MVU_REQUEST_PARSERS.queryConditions(params));
+    case "queryEffectGroups":
+      return mvuIpcClient.queryEffectGroups(MVU_REQUEST_PARSERS.queryEffectGroups(params));
+    case "queryRecords":
+      return mvuIpcClient.queryRecords(MVU_REQUEST_PARSERS.queryRecords(params));
+    case "getEntityById":
+      return mvuIpcClient.getEntityById(MVU_REQUEST_PARSERS.getEntityById(params));
+    case "createCondition":
+      return mvuIpcClient.createCondition(MVU_REQUEST_PARSERS.createCondition(params));
+    case "updateCondition":
+      return mvuIpcClient.updateCondition(MVU_REQUEST_PARSERS.updateCondition(params));
+    case "copyCondition":
+      return mvuIpcClient.copyCondition(MVU_REQUEST_PARSERS.copyCondition(params));
+    case "toggleCondition":
+      return mvuIpcClient.toggleCondition(MVU_REQUEST_PARSERS.toggleCondition(params));
+    case "deleteCondition":
+      return mvuIpcClient.deleteCondition(MVU_REQUEST_PARSERS.deleteCondition(params));
+    case "getConditionReferences":
+      return mvuIpcClient.getConditionReferences(MVU_REQUEST_PARSERS.getConditionReferences(params));
+    case "createEffectGroup":
+      return mvuIpcClient.createEffectGroup(MVU_REQUEST_PARSERS.createEffectGroup(params));
+    case "updateEffectGroup":
+      return mvuIpcClient.updateEffectGroup(MVU_REQUEST_PARSERS.updateEffectGroup(params));
+    case "copyEffectGroup":
+      return mvuIpcClient.copyEffectGroup(MVU_REQUEST_PARSERS.copyEffectGroup(params));
+    case "toggleEffectGroup":
+      return mvuIpcClient.toggleEffectGroup(MVU_REQUEST_PARSERS.toggleEffectGroup(params));
+    case "deleteEffectGroup":
+      return mvuIpcClient.deleteEffectGroup(MVU_REQUEST_PARSERS.deleteEffectGroup(params));
+    case "getEffectGroupReferences":
+      return mvuIpcClient.getEffectGroupReferences(MVU_REQUEST_PARSERS.getEffectGroupReferences(params));
+    case "createRule":
+      return mvuIpcClient.createRule(MVU_REQUEST_PARSERS.createRule(params));
+    case "updateRule":
+      return mvuIpcClient.updateRule(MVU_REQUEST_PARSERS.updateRule(params));
+    case "copyRule":
+      return mvuIpcClient.copyRule(MVU_REQUEST_PARSERS.copyRule(params));
+    case "toggleRule":
+      return mvuIpcClient.toggleRule(MVU_REQUEST_PARSERS.toggleRule(params));
+    case "deleteRule":
+      return mvuIpcClient.deleteRule(MVU_REQUEST_PARSERS.deleteRule(params));
+    case "getRuleReferences":
+      return mvuIpcClient.getRuleReferences(MVU_REQUEST_PARSERS.getRuleReferences(params));
     default:
       throw new Error(`MVU_BRIDGE_METHOD_UNKNOWN:${method}`);
   }

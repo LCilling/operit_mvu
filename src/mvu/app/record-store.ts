@@ -249,12 +249,12 @@ export class SegmentedRecordStore {
       if (overlapStart < overlapEnd) {
         const firstLine = overlapStart - segmentStart + 1;
         const lastLine = overlapEnd - segmentStart;
-        const content = await this.files.readText(this.segmentPath(segment.fileName));
-        const physicalLines = splitLines(content);
-        if (physicalLines.length < segment.committedLineCount) {
-          throw new Error(`MVU_V3_RECORD_SEGMENT_SHORT:${segment.fileName}`);
-        }
-        const lines = physicalLines.slice(firstLine - 1, lastLine);
+        const content = await this.files.readTextPart(
+          this.segmentPath(segment.fileName),
+          firstLine,
+          lastLine,
+        );
+        const lines = parsePartialLines(content, segment.fileName, firstLine, lastLine);
         records.push(...lines.map((line, index) =>
           parseStoredLine(line, segment.fileName, firstLine + index, segment.lastRevision).record));
       }
@@ -425,6 +425,30 @@ function splitLines(content: string): string[] {
   const lines = content.replace(/\r\n/g, "\n").split("\n");
   if (lines.at(-1) === "") lines.pop();
   return lines;
+}
+
+function parsePartialLines(
+  content: string,
+  fileName: string,
+  firstLine: number,
+  lastLine: number,
+): string[] {
+  const lines = splitLines(content);
+  if (lines.some((line) => line === "... (file content truncated) ...")) {
+    throw new Error(`MVU_V3_RECORD_PARTIAL_READ_TRUNCATED:${fileName}`);
+  }
+  const expectedCount = lastLine - firstLine + 1;
+  if (lines.length !== expectedCount) {
+    throw new Error(`MVU_V3_RECORD_SEGMENT_SHORT:${fileName}`);
+  }
+  return lines.map((line, offset) => {
+    const decorated = /^\s*(\d+)\| ([\s\S]*)$/.exec(line);
+    if (decorated === null) return line;
+    if (Number(decorated[1]) !== firstLine + offset) {
+      throw new Error(`MVU_V3_RECORD_PARTIAL_LINE_INVALID:${fileName}:${firstLine + offset}`);
+    }
+    return decorated[2];
+  });
 }
 
 function requireRevision(value: number): void {
