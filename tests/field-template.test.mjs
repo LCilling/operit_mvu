@@ -5,6 +5,7 @@ import { migrateDatasetV2ToV3 } from "../dist/mvu/app/migration-v3.js";
 import { MvuQueryService } from "../dist/mvu/app/query.js";
 import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
 import { FileMvuStore } from "../dist/mvu/app/store.js";
+import { assertMvuDatasetV3 } from "../dist/mvu/app/validation.js";
 import {
   MVU_IPC,
   MVU_REQUEST_PARSERS,
@@ -115,6 +116,36 @@ function createServiceFrom(dataset, {
   };
 }
 
+async function createRealStoreHarness(legacy, configDir, actors = []) {
+  const v2Path = `${configDir}/operit_mvu.dataset.v2.json`;
+  const v3Path = `${configDir}/operit_mvu.dataset.v3.json`;
+  const files = createFakeMvuFileApi({ [v2Path]: JSON.stringify(legacy, null, 2) });
+  const createLegacyStore = () => new FileMvuStore({
+    getConfigDir: () => configDir,
+    files,
+    createInitialDataset: () => structuredClone(legacy),
+  });
+  const createStore = () => new V3MvuStore({
+    getConfigDir: () => configDir,
+    files,
+    legacyStore: createLegacyStore(),
+    createInitialDataset: () => structuredClone(legacy),
+    now: () => NOW,
+  });
+  const createService = (store) => new MvuQueryService({
+    readV3: () => store.readV3(),
+    transactV3: (expectedRevision, next, records = []) => store.transactV3(expectedRevision, next, records),
+    queryCommittedRecords: (request) => store.queryRecords(request),
+    async listActors() { return structuredClone(actors); },
+    async listGroups() { return []; },
+    async activeContext() { return { chatId: "chat_current", actorId: "actor_t", groupId: null, actorName: "角色 T" }; },
+    migrationStatus: () => store.migrationStatus(),
+  }, { now: () => NOW });
+  const store = createStore();
+  await store.initialize();
+  return { files, v3Path, store, service: createService(store), createStore };
+}
+
 function checksumFields(fields) {
   const input = JSON.stringify(fields);
   let hash = 0x811c9dc5;
@@ -214,6 +245,126 @@ test("field template export carries values only for explicitly selected actor ta
   assert.equal(result.summary.valueCount, 1);
 });
 
+test("export at every portable field and stage boundary round-trips through the strict preview parser", async () => {
+  const data = createFixture().dataset;
+  const sourceFieldId = `f${"x".repeat(255)}`;
+  const field = {
+    ...structuredClone(data.fields[0]),
+    id: sourceFieldId,
+    name: "N".repeat(512),
+    description: "D".repeat(4_096),
+    minimum: 0,
+    maximum: 99,
+    step: 1,
+    initialValue: 0,
+    icon: "I".repeat(512),
+    themeColor: "C".repeat(512),
+    scope: "global",
+    bindingIds: [],
+    ai: { ...data.fields[0].ai, prompt: "P".repeat(4_096) },
+    stages: Array.from({ length: 100 }, (_, index) => ({
+      id: `stage_${String(index).padStart(3, "0")}`,
+      name: "S".repeat(512),
+      description: "E".repeat(4_096),
+      threshold: index,
+    })),
+  };
+  data.fields = [field];
+  data.linkRules = [];
+  data.conditions = [];
+  data.rules = [];
+  data.effectGroups = [];
+  data.activeEffects = [];
+  data.stateValues = {};
+  data.lastSettled = {};
+  data.turnCounters = {};
+  assert.doesNotThrow(() => assertMvuDatasetV3(data));
+  const source = createServiceFrom(data);
+
+  const exported = await source.service.exportFieldTemplate({ fieldIds: [sourceFieldId], targetSelections: [] });
+  const preview = await source.service.previewFieldTemplateImport({ json: exported.json });
+  assert.equal(preview.valid, true);
+  assert.equal(preview.fields[0].sourceFieldId, sourceFieldId);
+  assert.equal(preview.fields[0].config.stages, 100);
+  assert.equal(Buffer.byteLength(exported.json, "utf8") <= 1_048_576, true);
+});
+
+test("export rejects model-valid IDs, text, stages, field counts, and target counts beyond portable parser limits", async () => {
+  const isolatedDataset = (fields) => {
+    const data = createFixture().dataset;
+    data.fields = fields;
+    data.pendingBootstrapFieldIds = [];
+    data.linkRules = [];
+    data.conditions = [];
+    data.rules = [];
+    data.effectGroups = [];
+    data.activeEffects = [];
+    data.stateValues = {};
+    data.lastSettled = {};
+    data.turnCounters = {};
+    assert.doesNotThrow(() => assertMvuDatasetV3(data));
+    return data;
+  };
+  const globalField = (overrides = {}) => ({
+    ...structuredClone(createFixture().dataset.fields[0]),
+    scope: "global",
+    bindingIds: [],
+    ...overrides,
+  });
+  const overlongId = `f${"x".repeat(256)}`;
+  const idData = isolatedDataset([globalField({ id: overlongId })]);
+  const textData = isolatedDataset([globalField({ name: "N".repeat(513) })]);
+  const stageData = isolatedDataset([globalField({
+    maximum: 100,
+    stages: Array.from({ length: 101 }, (_, index) => ({
+      id: `stage_${index}`,
+      name: `Stage ${index}`,
+      description: "",
+      threshold: index,
+    })),
+  })]);
+  const fieldCountData = isolatedDataset(Array.from({ length: 101 }, (_, index) =>
+    globalField({ id: `field_limit_${index}`, name: `Field ${index}`, order: index })));
+  const actorIds = Array.from({ length: 1_001 }, (_, index) => `actor_limit_${index}`);
+  const targetData = isolatedDataset([{
+    ...globalField(),
+    scope: "character",
+    bindingIds: actorIds,
+  }]);
+  const capture = async (operation) => {
+    try {
+      await operation();
+      return "resolved";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+  const outcomes = await Promise.all([
+    capture(() => createServiceFrom(idData).service.exportFieldTemplate({ fieldIds: [overlongId], targetSelections: [] })),
+    capture(() => createServiceFrom(textData).service.exportFieldTemplate({ fieldIds: ["field_affinity"], targetSelections: [] })),
+    capture(() => createServiceFrom(stageData).service.exportFieldTemplate({ fieldIds: ["field_affinity"], targetSelections: [] })),
+    capture(() => createServiceFrom(fieldCountData).service.exportFieldTemplate({
+      fieldIds: fieldCountData.fields.map(({ id }) => id),
+      targetSelections: [],
+    })),
+    capture(() => createServiceFrom(targetData, { actors: actorIds.map((characterId) => ({
+      characterId, name: characterId, enabled: true,
+    })) }).service.exportFieldTemplate({
+      fieldIds: ["field_affinity"],
+      targetSelections: [{ fieldId: "field_affinity", targets: actorIds.map((targetId) => ({
+        targetId, enabled: true, includeValue: false,
+      })) }],
+    })),
+  ]);
+  assert.deepEqual(outcomes, [
+    "MVU_FIELD_TEMPLATE_FIELD_INVALID",
+    "MVU_FIELD_TEMPLATE_TEXT_LIMIT",
+    "MVU_FIELD_TEMPLATE_STAGE_LIMIT",
+    "MVU_FIELD_TEMPLATE_INVALID",
+    "MVU_FIELD_TEMPLATE_TARGET_LIMIT",
+  ]);
+});
+
 test("field template preview is deterministic and reports conflicts and readable mapping needs without mutation", async () => {
   const fixture = createFixture();
   const exported = await fixture.service.exportFieldTemplate({
@@ -255,6 +406,58 @@ test("field template preview is deterministic and reports conflicts and readable
   }]);
   assert.equal(fixture.transactionCount(), 0);
   assert.deepEqual(fixture.current(), before);
+});
+
+test("multi-field create-copy reserves exact source IDs before allocating deterministic collision-safe copies", async () => {
+  const sourceData = createFixture().dataset;
+  const foo = {
+    ...structuredClone(sourceData.fields[0]),
+    id: "foo",
+    name: "Foo",
+    scope: "global",
+    bindingIds: [],
+    order: 0,
+  };
+  const fooCopy = { ...structuredClone(foo), id: "foo_copy", name: "Foo copy", order: 1 };
+  sourceData.fields = [foo, fooCopy];
+  sourceData.linkRules = [];
+  sourceData.conditions = [];
+  sourceData.rules = [];
+  sourceData.effectGroups = [];
+  sourceData.activeEffects = [];
+  sourceData.stateValues = {};
+  sourceData.lastSettled = {};
+  sourceData.turnCounters = {};
+  const source = createServiceFrom(sourceData);
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["foo_copy", "foo"],
+    targetSelections: [],
+  });
+
+  const targetData = structuredClone(sourceData);
+  targetData.fields = [structuredClone(foo)];
+  const target = createServiceFrom(targetData);
+  const preview = await target.service.previewFieldTemplateImport({ json: exported.json });
+  assert.deepEqual(preview.fields.map(({ sourceFieldId, conflict, proposedCopyId }) => ({
+    sourceFieldId, conflict, proposedCopyId,
+  })), [
+    { sourceFieldId: "foo", conflict: "id", proposedCopyId: "foo_copy_2" },
+    { sourceFieldId: "foo_copy", conflict: "none", proposedCopyId: "foo_copy" },
+  ]);
+  assert.equal(target.transactionCount(), 0);
+
+  const result = await target.service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: preview.revision,
+    decisions: { fields: [
+      { sourceFieldId: "foo", mappings: [] },
+      { sourceFieldId: "foo_copy", mappings: [] },
+    ] },
+  });
+  assert.deepEqual(result.summary.created, ["foo_copy_2", "foo_copy"]);
+  assert.equal(target.transactionCount(), 1);
+  assert.deepEqual(target.current().fields.map(({ id }) => id), ["foo", "foo_copy_2", "foo_copy"]);
+  assert.equal(new Set(target.current().fields.map(({ id }) => id)).size, 3);
 });
 
 test("create-copy import maps one source actor to multiple explicitly enabled local actors in one transaction", async () => {
@@ -1074,6 +1277,22 @@ test("main IPC registrations save an explicitly selected export to the fixed Ope
   assert.match(String(expectedLogs[0][1]), /MVU_FIELD_TEMPLATE_EXPORT_FILENAME_INVALID/);
   assert.equal(writes.length, 2, "unsafe names must not reach the filesystem");
 
+  const invalidData = createFixture().dataset;
+  invalidData.fields[0].name = "N".repeat(513);
+  const invalidExporter = createServiceFrom(invalidData, {
+    actors: [{ characterId: "actor_t", name: "角色 T", enabled: true }],
+  });
+  queries.exportFieldTemplate = (value) => invalidExporter.service.exportFieldTemplate(value);
+  const portableLimitLogs = [];
+  console.error = (...args) => portableLimitLogs.push(args);
+  try {
+    await assert.rejects(handlers[MVU_IPC.exportFieldTemplate](request), /MVU_FIELD_TEMPLATE_TEXT_LIMIT/);
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(portableLimitLogs.length, 1);
+  assert.equal(writes.length, 2, "portable validation must finish before directory creation or file write");
+
   await handlers[MVU_IPC.previewFieldTemplateImport]({ json: "{}" });
   await handlers[MVU_IPC.importFieldTemplate]({
     json: "{}", expectedRevision: 7, decisions: { fields: [] },
@@ -1130,6 +1349,101 @@ test("native UI bridge dispatches all field-template operations through typed ma
     targetRuntime: "main",
     targetContextKey: "toolpkg_main:com.lcilling.operit_mvu",
   })), true);
+});
+
+test("replace clears a stale pending-bootstrap marker before V3 atomic validation and survives restart", async () => {
+  const source = createFixture();
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: false }),
+  });
+  const legacy = legacyDatasetFixture();
+  legacy.fields[0].bindingIds = [];
+  legacy.pendingBootstrapFieldIds = ["field_affinity"];
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  legacy.stateValues = {};
+  const harness = await createRealStoreHarness(legacy, "/field-template-pending-bound", [
+    { characterId: "actor_t", name: "角色 T", enabled: true },
+  ]);
+  const before = await harness.store.readV3();
+  assert.doesNotThrow(() => assertMvuDatasetV3(before.dataset));
+  const stale = structuredClone(before.dataset);
+  stale.fields.find(({ id }) => id === "field_affinity").bindingIds = ["actor_t"];
+  assert.throws(() => assertMvuDatasetV3(stale), /MVU_PENDING_BOOTSTRAP_FIELD_BOUND:field_affinity/);
+
+  harness.files.clearOperations();
+  const result = await harness.service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: before.revision,
+    decisions: { fields: [{
+      sourceFieldId: "field_affinity",
+      strategy: "replace",
+      mappings: [{
+        sourceTargetId: "actor_t",
+        targets: [{ targetId: "actor_t", enabled: true, valuePolicy: "field_initial" }],
+      }],
+    }] },
+  });
+  assert.equal(result.revision, before.revision + 1);
+  assert.equal(harness.files.operations().filter(({ operation, destination }) =>
+    operation === "replaceAtomically" && destination === harness.v3Path).length, 1);
+
+  const restarted = harness.createStore();
+  assert.equal((await restarted.initialize()).mode, "v3");
+  const durable = await restarted.readV3();
+  assert.deepEqual(durable.dataset.pendingBootstrapFieldIds, []);
+  assert.deepEqual(durable.dataset.fields.find(({ id }) => id === "field_affinity").bindingIds, ["actor_t"]);
+  assert.equal(durable.dataset.stateValues["character:actor_t"].field_affinity, 0);
+});
+
+test("replace preserves an existing pending marker for an unbound definition but never invents one for all-disabled import", async () => {
+  const sourceData = createFixture().dataset;
+  sourceData.fields[0].bindingIds = [];
+  sourceData.linkRules = [];
+  sourceData.conditions = [];
+  sourceData.rules = [];
+  sourceData.effectGroups = [];
+  sourceData.activeEffects = [];
+  sourceData.stateValues = {};
+  const source = createServiceFrom(sourceData);
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: [],
+  });
+  const makeLegacy = (pending) => {
+    const legacy = legacyDatasetFixture();
+    legacy.fields[0].bindingIds = [];
+    legacy.pendingBootstrapFieldIds = pending ? ["field_affinity"] : [];
+    legacy.autoRules = [];
+    legacy.temporaryEffects = [];
+    legacy.stateValues = {};
+    return legacy;
+  };
+  for (const [label, pending, expected] of [
+    ["existing", true, ["field_affinity"]],
+    ["all-disabled", false, []],
+  ]) {
+    const harness = await createRealStoreHarness(makeLegacy(pending), `/field-template-pending-${label}`, [
+      { characterId: "actor_t", name: "角色 T", enabled: true },
+    ]);
+    const before = await harness.store.readV3();
+    await harness.service.importFieldTemplate({
+      json: exported.json,
+      expectedRevision: before.revision,
+      decisions: { fields: [{
+        sourceFieldId: "field_affinity",
+        strategy: "replace",
+        mappings: [],
+        unboundTargets: [{ targetId: "actor_t", enabled: false, valuePolicy: "field_initial" }],
+      }] },
+    });
+    const restarted = harness.createStore();
+    await restarted.initialize();
+    const durable = await restarted.readV3();
+    assert.deepEqual(durable.dataset.pendingBootstrapFieldIds, expected, label);
+    assert.deepEqual(durable.dataset.fields.find(({ id }) => id === "field_affinity").bindingIds, [], label);
+  }
 });
 
 test("field-template import composes with the real V3 store CAS path and survives restart", async () => {

@@ -136,6 +136,7 @@ export async function createFieldTemplateExport(
   now: number,
 ): Promise<FieldTemplateExportPayload> {
   requireUniqueNonEmpty(request.fieldIds, "MVU_FIELD_TEMPLATE_FIELD_IDS_INVALID");
+  if (request.fieldIds.length > FIELD_TEMPLATE_MAX_FIELDS) throw new Error("MVU_FIELD_TEMPLATE_INVALID");
   const [snapshot, actors, groups] = await Promise.all([source.readV3(), source.listActors(), source.listGroups()]);
   const selections = new Map(request.targetSelections.map((selection) => [selection.fieldId, selection]));
   if (selections.size !== request.targetSelections.length) throw new Error("MVU_FIELD_TEMPLATE_SELECTION_DUPLICATE");
@@ -193,6 +194,7 @@ export async function createFieldTemplateExport(
   };
   const json = JSON.stringify(document, null, 2);
   if (byteLength(json) > FIELD_TEMPLATE_MAX_BYTES) throw new Error("MVU_FIELD_TEMPLATE_TOO_LARGE");
+  parseFieldTemplateDocument(json);
   return {
     fileName: buildFileName(fields, exportedAt),
     json,
@@ -211,6 +213,7 @@ export async function previewFieldTemplate(
   const document = parseFieldTemplateDocument(request.json);
   const [snapshot, actors, groups] = await Promise.all([source.readV3(), source.listActors(), source.listGroups()]);
   const occupied = new Set(snapshot.dataset.fields.map((field) => field.id));
+  const createCopyIds = planCreateCopyIds(document.fields, occupied);
   const fields = document.fields.map((entry) => {
     const existing = snapshot.dataset.fields.find((field) => field.id === entry.sourceFieldId);
     const sameScope = existing?.scope === entry.definition.scope;
@@ -219,7 +222,7 @@ export async function previewFieldTemplate(
       name: entry.definition.name,
       scope: entry.definition.scope,
       conflict: occupied.has(entry.sourceFieldId) ? "id" as const : "none" as const,
-      proposedCopyId: collisionSafeCopyId(entry.sourceFieldId, occupied),
+      proposedCopyId: createCopyIds.get(entry.sourceFieldId)!,
       updateCompatibility: existing === undefined
         ? { available: false, localScope: null, reason: "no_local_field" as const }
         : sameScope
@@ -291,14 +294,15 @@ export async function commitFieldTemplateImport(
     throw new Error("MVU_FIELD_TEMPLATE_DECISIONS_INVALID");
   }
   const draft = klona(snapshot.dataset);
-  const occupied = new Set(draft.fields.map((field) => field.id));
+  const initialFields = new Map(draft.fields.map((field) => [field.id, field]));
+  const createCopyIds = planCreateCopyIds(document.fields, new Set(initialFields.keys()));
   const summary: FieldTemplateImportResult["summary"] = {
     created: [], updated: [], replaced: [], skippedTargets: 0, valueWrites: 0,
   };
   for (const entry of document.fields) {
     const decision = decisions.get(entry.sourceFieldId);
     if (decision === undefined) throw new Error("MVU_FIELD_TEMPLATE_DECISIONS_INVALID");
-    const existing = draft.fields.find((field) => field.id === entry.sourceFieldId);
+    const existing = initialFields.get(entry.sourceFieldId);
     const strategy = decision.strategy ?? "create_copy";
     if (strategy === "update") {
       if (existing === undefined) throw new Error("MVU_FIELD_TEMPLATE_CONFLICT_REQUIRED");
@@ -319,7 +323,7 @@ export async function commitFieldTemplateImport(
     if (strategy === "replace" && existing === undefined) throw new Error("MVU_FIELD_TEMPLATE_CONFLICT_REQUIRED");
     const fieldId = strategy === "replace"
       ? entry.sourceFieldId
-      : existing === undefined ? entry.sourceFieldId : collisionSafeCopyId(entry.sourceFieldId, occupied);
+      : createCopyIds.get(entry.sourceFieldId)!;
     const bindings = resolveImportBindings(entry, decision, actors, groups, summary);
     const field: DataField = { ...klona(entry.definition), id: fieldId, bindingIds: bindings.ids };
     if (field.scope === "chat") {
@@ -327,6 +331,9 @@ export async function commitFieldTemplateImport(
       field.bindingIds = [context.chatId];
     }
     if (field.scope === "global") field.bindingIds = [];
+    if (strategy === "replace" && (field.scope === "global" || field.bindingIds.length > 0)) {
+      draft.pendingBootstrapFieldIds = draft.pendingBootstrapFieldIds.filter((pendingId) => pendingId !== fieldId);
+    }
     validateDataField(field);
     if (strategy === "replace") {
       const index = draft.fields.findIndex((candidate) => candidate.id === fieldId);
@@ -335,7 +342,6 @@ export async function commitFieldTemplateImport(
       summary.replaced.push(fieldId);
     } else {
       draft.fields.push(field);
-      occupied.add(fieldId);
       summary.created.push(fieldId);
     }
     for (const write of bindings.writes) {
@@ -629,6 +635,27 @@ function collisionSafeCopyId(sourceId: string, occupied: Set<string>): string {
     if (!occupied.has(candidate)) return candidate;
   }
   throw new Error("MVU_FIELD_TEMPLATE_ID_EXHAUSTED");
+}
+
+function planCreateCopyIds(
+  fields: readonly PortableFieldEntry[],
+  currentIds: ReadonlySet<string>,
+): Map<string, string> {
+  const ordered = [...fields].sort((left, right) => compareRaw(left.sourceFieldId, right.sourceFieldId));
+  const occupied = new Set(currentIds);
+  const planned = new Map<string, string>();
+  for (const field of ordered) {
+    if (currentIds.has(field.sourceFieldId)) continue;
+    planned.set(field.sourceFieldId, field.sourceFieldId);
+    occupied.add(field.sourceFieldId);
+  }
+  for (const field of ordered) {
+    if (!currentIds.has(field.sourceFieldId)) continue;
+    const fieldId = collisionSafeCopyId(field.sourceFieldId, occupied);
+    planned.set(field.sourceFieldId, fieldId);
+    occupied.add(fieldId);
+  }
+  return planned;
 }
 
 function buildFileName(fields: PortableFieldEntry[], exportedAt: string): string {
