@@ -2,7 +2,7 @@
 
 `operit_mvu` 的 Release 本身只有 ToolPkg；本页列出为了满足 Issue #998 和插件真机运行而在当前 OperitAI 工作树中加入的通用宿主能力。这里只记录与 `operit_mvu` 直接相关的改动，不把同一工作树中的其他功能开发计入插件依赖。
 
-当 Operit 官方版本提供下列契约后，用户不再需要安装当前修改版 APK，只需导入 `operit_mvu-2.0.1.toolpkg`。
+当 Operit 官方版本提供下列契约后，用户不再需要安装当前修改版 APK，只需导入 `operit_mvu-3.0.0.toolpkg`。
 
 ## 1. 聊天与角色上下文
 
@@ -92,5 +92,35 @@ Compose DSL WebView 增加本地 HTML 文档开始桥接、仅在当前可见页
 - `core/tools/javascript/JsComposeDslBridge.kt`
 - `ui/features/packages/market/ArtifactLocalInstallSupport.kt`
 - `ui/features/packages/screens/PackageManagerScreen.kt`
+
+## 8. Android 本地文件原子替换
+
+新增 `Tools.Files.replaceAtomically(source, destination): Promise<FileOperationData>`，供 ToolPkg 安全提交账本、配置和备份恢复结果。调用方先把完整内容写入目标文件同目录的临时普通文件，再由宿主执行一次带 `ATOMIC_MOVE + REPLACE_EXISTING` 的文件系统移动；成功后目标文件只会呈现旧版本或完整的新版本，不暴露半写入状态。
+
+该接口具有以下强制边界：
+
+- `source` 必须是 Android 本地普通文件，`source` 与 `destination` 必须位于同一已存在目录；目标文件可以尚不存在。
+- 仅支持 Android 本地文件系统；Linux 环境、SAF/`content://`、跨目录目标和不支持原子移动的文件系统必须明确失败。
+- 宿主不得在原子移动不可用时降级为普通移动、复制后删除或“先删后写”。失败时原目标文件保持不变，调用方收到失败的 `FileOperationData` 或异常，并负责保留或清理临时文件。
+- 成功结果使用 `FileOperationData.successful === true`，`operation` 为 `"atomic_replace"`；失败不得伪装为成功。
+- 接口不接受 `environment` 参数，避免调用方误以为 Linux 或 SAF 也具有相同原子保证。
+
+TypeScript 契约：
+
+```ts
+namespace Tools.Files {
+  function replaceAtomically(
+    source: string,
+    destination: string,
+  ): Promise<FileOperationData>;
+}
+```
+
+主要文件：
+
+- `core/tools/javascript/JsTools.kt`
+- `core/tools/defaultTool/standard/StandardFileSystemTools.kt`
+- `examples/types/files.d.ts`
+- `docs/doc-src/package-dev/files.md`
 
 完整接口形状和边界见 [HOST_INTERFACE_REQUIREMENTS.md](HOST_INTERFACE_REQUIREMENTS.md)。
