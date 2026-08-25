@@ -15,8 +15,18 @@ export const QUERY_SEARCH_MAX_LENGTH = 120;
 export const QUERY_CURSOR_MAX_LENGTH = 96;
 export const PICKER_BATCH_SIZE = 30;
 export const ENTITY_ID_MAX_LENGTH = 256;
+export const MVU_SNAPSHOT_MAX_BYTES = 65_536;
 const DEFAULT_CURSOR_TTL_MS = 5 * 60_000;
 const DEFAULT_CURSOR_CAPACITY = 128;
+const SNAPSHOT_ID_MAX_CODE_POINTS = 40;
+const SNAPSHOT_NAME_MAX_CODE_POINTS = 28;
+const SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS = 32;
+const SNAPSHOT_REASON_MAX_CODE_POINTS = 40;
+const SNAPSHOT_URI_MAX_CODE_POINTS = 64;
+const SNAPSHOT_CONTEXT_MAX_CODE_POINTS = 40;
+const SNAPSHOT_DATE_MAX_CODE_POINTS = 24;
+const SNAPSHOT_ICON_MAX_CODE_POINTS = 16;
+const SNAPSHOT_MIGRATION_WARNING_LIMIT = 8;
 
 const MANAGEMENT_PAGE_SIZES = {
   fields: 5,
@@ -132,6 +142,7 @@ export interface FieldPageSummary {
     groupId: string | null;
     chatId: string | null;
   } | null;
+  truncated: boolean;
 }
 
 export interface RulePageSummary {
@@ -143,6 +154,7 @@ export interface RulePageSummary {
   actionCount: number;
   executionOrder: number;
   updatedAt: string;
+  truncated: boolean;
 }
 
 export interface ConditionPageSummary {
@@ -152,6 +164,7 @@ export interface ConditionPageSummary {
   enabled: boolean;
   rootKind: ConditionExpression["kind"];
   updatedAt: string;
+  truncated: boolean;
 }
 
 export interface EffectGroupPageSummary {
@@ -161,6 +174,7 @@ export interface EffectGroupPageSummary {
   enabled: boolean;
   fieldCount: number;
   updatedAt: string;
+  truncated: boolean;
 }
 
 export interface RecordPageSummary {
@@ -176,13 +190,68 @@ export interface RecordPageSummary {
   reason: string;
   source: DataChangeRecord["source"];
   occurredAt: number;
+  truncated: boolean;
 }
+
+export interface SnapshotActorSummary {
+  characterId: string;
+  name: string;
+  avatarUri: string | null;
+  enabled: boolean;
+  truncated: boolean;
+}
+
+export interface SnapshotGroupSummary {
+  characterGroupId: string;
+  name: string;
+  avatarUri: string | null;
+  truncated: boolean;
+}
+
+export interface SnapshotScopeContext {
+  chatId: string | null;
+  actorId: string | null;
+  groupId: string | null;
+  actorName: string;
+  truncated: boolean;
+}
+
+export interface SnapshotDisplayLabels {
+  groupName: string | null;
+  chatName: string;
+}
+
+export interface SnapshotContextLabels extends SnapshotDisplayLabels {
+  truncated: boolean;
+}
+
+export type SnapshotMigrationStatus =
+  | {
+      mode: "v3";
+      source: "existing" | "migrated" | "initialized";
+      report?: {
+        migratedFields: number;
+        migratedRules: number;
+        migratedConditions: number;
+        migratedEffectGroups: number;
+        warnings: string[];
+        warningCount: number;
+        warningsTruncated: boolean;
+      };
+      cleanup?: { state: "pending"; error: { code: string; message: string } };
+      truncated: boolean;
+    }
+  | {
+      mode: "v2_compat";
+      error: { code: string; message: string };
+      truncated: boolean;
+    };
 
 export interface MvuCompactPageSnapshot {
   revision: number;
-  activeContext: StateScopeContext;
+  activeContext: SnapshotScopeContext;
   settings: MvuSettings;
-  migrationStatus: MigrationStatus;
+  migrationStatus: SnapshotMigrationStatus;
   counts: {
     fields: number;
     actors: number;
@@ -193,9 +262,10 @@ export interface MvuCompactPageSnapshot {
     records: number;
   };
   selected: {
-    actor: DataActor | null;
-    group: QueryGroup | null;
+    actor: SnapshotActorSummary | null;
+    group: SnapshotGroupSummary | null;
   };
+  contextLabels: SnapshotContextLabels;
   pages: {
     fields: QueryResponse<FieldPageSummary>;
     rules: QueryResponse<RulePageSummary>;
@@ -451,7 +521,7 @@ export class MvuQueryService {
     return klona(entity);
   }
 
-  async pageSnapshot(): Promise<MvuCompactPageSnapshot> {
+  async pageSnapshot(labels?: SnapshotDisplayLabels): Promise<MvuCompactPageSnapshot> {
     const [snapshot, actors, groups, activeContext, migrationStatus, records] = await Promise.all([
       this.source.readV3(),
       this.source.listActors(),
@@ -473,11 +543,17 @@ export class MvuQueryService {
     const effectGroups = queryCollectionFromValidated("effectGroups", dataset.effectGroups, {}, MANAGEMENT_PAGE_SIZES.effectGroups, false, {
       key: "name", direction: "asc",
     }, { name: (item) => item.name }, (item) => item.id);
-    return {
+    const selectedActor = activeContext.actorId === null
+      ? null
+      : actors.find((item) => item.characterId === activeContext.actorId) ?? null;
+    const selectedGroup = activeContext.groupId === null
+      ? null
+      : groups.find((item) => item.characterGroupId === activeContext.groupId) ?? null;
+    const result: MvuCompactPageSnapshot = {
       revision: snapshot.revision,
-      activeContext,
+      activeContext: summarizeScopeContext(activeContext),
       settings: klona(dataset.settings),
-      migrationStatus,
+      migrationStatus: summarizeMigrationStatus(migrationStatus),
       counts: {
         fields: dataset.fields.length,
         actors: actors.length,
@@ -488,13 +564,13 @@ export class MvuQueryService {
         records: records.totalCount,
       },
       selected: {
-        actor: activeContext.actorId === null
-          ? null
-          : klona(actors.find((item) => item.characterId === activeContext.actorId) ?? null),
-        group: activeContext.groupId === null
-          ? null
-          : klona(groups.find((item) => item.characterGroupId === activeContext.groupId) ?? null),
+        actor: selectedActor === null ? null : summarizeActor(selectedActor),
+        group: selectedGroup === null ? null : summarizeGroup(selectedGroup),
       },
+      contextLabels: summarizeContextLabels(labels ?? {
+        groupName: selectedGroup?.name ?? null,
+        chatName: activeContext.actorName.length > 0 ? `${activeContext.actorName} 的会话` : "当前会话",
+      }),
       pages: {
         fields: mapQueryResponse(fields, (field) => summarizeField(field, dataset, activeContext)),
         rules: mapQueryResponse(rules, summarizeRule),
@@ -503,6 +579,8 @@ export class MvuQueryService {
         records: mapQueryResponse(records, summarizeRecord),
       },
     };
+    requireSnapshotByteBound(result);
+    return result;
   }
 
   createCondition(request: RevisionedRequest & { condition: ConditionInput }): Promise<MutationResponse<ConditionDefinition>> {
@@ -999,12 +1077,13 @@ function isNonEmptyFilterString(value: FilterValue): boolean {
 
 function queryFingerprint(request: QueryRequest): string {
   const filters = Object.entries(request.filters ?? {})
-    .map(([key, value]) => [key, typeof value === "string" ? normalizeSearch(value) : value] as const)
     .sort(([left], [right]) => compareRawId(left, right));
   return JSON.stringify({
     search: normalizeSearch(request.search ?? ""),
     filters,
-    sort: request.sort ?? null,
+    sort: request.sort === undefined
+      ? null
+      : { key: request.sort.key, direction: request.sort.direction },
   });
 }
 
@@ -1073,28 +1152,42 @@ function summarizeField(
   dataset: MvuDatasetV3,
   context: StateScopeContext,
 ): FieldPageSummary {
+  const id = boundedText(field.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(field.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const description = boundedText(field.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const icon = boundedText(field.icon, SNAPSHOT_ICON_MAX_CODE_POINTS);
+  const color = boundedText(field.themeColor, SNAPSHOT_ICON_MAX_CODE_POINTS);
   const scopeKey = contextScopeKey(field, context);
   const value = scopeKey === null
     ? null
     : dataset.stateValues[scopeKey]?.[field.id] ?? field.initialValue;
   const stage = value === null ? null : stageForValue(field, value);
+  const stageId = stage === null ? null : boundedText(stage.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const stageName = stage === null ? null : boundedText(stage.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const boundedScopeKey = boundedNullableText(scopeKey, SNAPSHOT_CONTEXT_MAX_CODE_POINTS);
+  const actorId = boundedNullableText(context.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const groupId = boundedNullableText(context.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const chatId = boundedNullableText(context.chatId, SNAPSHOT_ID_MAX_CODE_POINTS);
   return {
-    id: field.id,
-    name: field.name,
-    description: field.description,
+    id: id.value,
+    name: name.value,
+    description: description.value,
     enabled: field.enabled,
     scope: field.scope,
     order: field.order,
     range: { minimum: field.minimum, maximum: field.maximum, step: field.step },
-    theme: { icon: field.icon, color: field.themeColor },
+    theme: { icon: icon.value, color: color.value },
     current: scopeKey === null || value === null || stage === null ? null : {
       value,
-      stage: { id: stage.id, name: stage.name, threshold: stage.threshold },
-      scopeKey,
-      actorId: context.actorId,
-      groupId: context.groupId,
-      chatId: context.chatId,
+      stage: { id: stageId!.value, name: stageName!.value, threshold: stage.threshold },
+      scopeKey: boundedScopeKey.value!,
+      actorId: actorId.value,
+      groupId: groupId.value,
+      chatId: chatId.value,
     },
+    truncated: anyTruncated([
+      id, name, description, icon, color, stageId, stageName, boundedScopeKey, actorId, groupId, chatId,
+    ]),
   };
 }
 
@@ -1118,55 +1211,237 @@ function stageForValue(field: DataField, value: number): DataField["stages"][num
 }
 
 function summarizeRule(rule: RuleDefinitionV3): RulePageSummary {
+  const id = boundedText(rule.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(rule.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const description = boundedText(rule.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const conditionId = boundedText(rule.conditionId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const updatedAt = boundedText(rule.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: rule.id,
-    name: rule.name,
-    description: rule.description,
+    id: id.value,
+    name: name.value,
+    description: description.value,
     enabled: rule.enabled,
-    conditionId: rule.conditionId,
+    conditionId: conditionId.value,
     actionCount: rule.actions.length,
     executionOrder: rule.executionOrder,
-    updatedAt: rule.updatedAt,
+    updatedAt: updatedAt.value,
+    truncated: anyTruncated([id, name, description, conditionId, updatedAt]),
   };
 }
 
 function summarizeCondition(condition: ConditionDefinition): ConditionPageSummary {
+  const id = boundedText(condition.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(condition.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const description = boundedText(condition.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const updatedAt = boundedText(condition.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: condition.id,
-    name: condition.name,
-    description: condition.description,
+    id: id.value,
+    name: name.value,
+    description: description.value,
     enabled: condition.enabled,
     rootKind: condition.expression.kind,
-    updatedAt: condition.updatedAt,
+    updatedAt: updatedAt.value,
+    truncated: anyTruncated([id, name, description, updatedAt]),
   };
 }
 
 function summarizeEffectGroup(effectGroup: EffectGroupDefinition): EffectGroupPageSummary {
+  const id = boundedText(effectGroup.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(effectGroup.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const description = boundedText(effectGroup.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const updatedAt = boundedText(effectGroup.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: effectGroup.id,
-    name: effectGroup.name,
-    description: effectGroup.description,
+    id: id.value,
+    name: name.value,
+    description: description.value,
     enabled: effectGroup.enabled,
     fieldCount: effectGroup.fieldEffects.length,
-    updatedAt: effectGroup.updatedAt,
+    updatedAt: updatedAt.value,
+    truncated: anyTruncated([id, name, description, updatedAt]),
   };
 }
 
 function summarizeRecord(record: DataChangeRecord): RecordPageSummary {
+  const id = boundedText(record.id, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const fieldId = boundedText(record.fieldId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const fieldName = boundedText(record.fieldName, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const actorId = boundedNullableText(record.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const actorName = boundedText(record.actorName, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const groupId = boundedNullableText(record.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const reason = boundedText(record.reason, SNAPSHOT_REASON_MAX_CODE_POINTS);
   return {
-    id: record.id,
-    fieldId: record.fieldId,
-    fieldName: record.fieldName,
-    actorId: record.actorId,
-    actorName: record.actorName,
-    groupId: record.groupId,
+    id: id.value,
+    fieldId: fieldId.value,
+    fieldName: fieldName.value,
+    actorId: actorId.value,
+    actorName: actorName.value,
+    groupId: groupId.value,
     before: record.before,
     after: record.after,
     delta: record.delta,
-    reason: record.reason,
+    reason: reason.value,
     source: record.source,
     occurredAt: record.occurredAt,
+    truncated: anyTruncated([id, fieldId, fieldName, actorId, actorName, groupId, reason]),
   };
+}
+
+interface BoundedText {
+  value: string;
+  truncated: boolean;
+}
+
+interface BoundedNullableText {
+  value: string | null;
+  truncated: boolean;
+}
+
+function boundedText(value: string, maxCodePoints: number): BoundedText {
+  let codePoints = 0;
+  let sanitized = false;
+  let result = "";
+  for (const symbol of value) {
+    if (codePoints === maxCodePoints) {
+      return { value: result, truncated: true };
+    }
+    codePoints += 1;
+    const codeUnit = symbol.charCodeAt(0);
+    if (symbol.length === 1 && codeUnit >= 0xd800 && codeUnit <= 0xdfff) {
+      result += "\ufffd";
+      sanitized = true;
+    } else {
+      result += symbol;
+    }
+  }
+  return { value: sanitized ? result : value, truncated: sanitized };
+}
+
+function boundedNullableText(value: string | null, maxCodePoints: number): BoundedNullableText {
+  if (value === null) return { value: null, truncated: false };
+  return boundedText(value, maxCodePoints);
+}
+
+function anyTruncated(values: readonly (BoundedText | BoundedNullableText | null)[]): boolean {
+  return values.some((value) => value?.truncated === true);
+}
+
+function summarizeActor(actor: DataActor): SnapshotActorSummary {
+  const characterId = boundedText(actor.characterId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(actor.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const avatarUri = boundedNullableText(actor.avatarUri ?? null, SNAPSHOT_URI_MAX_CODE_POINTS);
+  return {
+    characterId: characterId.value,
+    name: name.value,
+    avatarUri: avatarUri.value,
+    enabled: actor.enabled,
+    truncated: anyTruncated([characterId, name, avatarUri]),
+  };
+}
+
+function summarizeGroup(group: QueryGroup): SnapshotGroupSummary {
+  const characterGroupId = boundedText(group.characterGroupId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const name = boundedText(group.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const avatarUri = boundedNullableText(group.avatarUri, SNAPSHOT_URI_MAX_CODE_POINTS);
+  return {
+    characterGroupId: characterGroupId.value,
+    name: name.value,
+    avatarUri: avatarUri.value,
+    truncated: anyTruncated([characterGroupId, name, avatarUri]),
+  };
+}
+
+function summarizeScopeContext(context: StateScopeContext): SnapshotScopeContext {
+  const chatId = boundedNullableText(context.chatId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const actorId = boundedNullableText(context.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const groupId = boundedNullableText(context.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const actorName = boundedText(context.actorName, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  return {
+    chatId: chatId.value,
+    actorId: actorId.value,
+    groupId: groupId.value,
+    actorName: actorName.value,
+    truncated: anyTruncated([chatId, actorId, groupId, actorName]),
+  };
+}
+
+function summarizeContextLabels(labels: SnapshotDisplayLabels): SnapshotContextLabels {
+  const groupName = boundedNullableText(labels.groupName, SNAPSHOT_NAME_MAX_CODE_POINTS);
+  const chatName = boundedText(labels.chatName, SNAPSHOT_CONTEXT_MAX_CODE_POINTS);
+  return {
+    groupName: groupName.value,
+    chatName: chatName.value,
+    truncated: anyTruncated([groupName, chatName]),
+  };
+}
+
+function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationStatus {
+  if (status.mode === "v2_compat") {
+    const code = boundedText(status.error.code, SNAPSHOT_ID_MAX_CODE_POINTS);
+    const message = boundedText(status.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+    return {
+      mode: "v2_compat",
+      error: { code: code.value, message: message.value },
+      truncated: anyTruncated([code, message]),
+    };
+  }
+  const warnings = status.report?.warnings ?? [];
+  const boundedWarnings = warnings.slice(0, SNAPSHOT_MIGRATION_WARNING_LIMIT)
+    .map((warning) => boundedText(warning, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS));
+  const cleanupCode = status.cleanup === undefined
+    ? null
+    : boundedText(status.cleanup.error.code, SNAPSHOT_ID_MAX_CODE_POINTS);
+  const cleanupMessage = status.cleanup === undefined
+    ? null
+    : boundedText(status.cleanup.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const warningsTruncated = warnings.length > boundedWarnings.length || anyTruncated(boundedWarnings);
+  return {
+    mode: "v3",
+    source: status.source,
+    ...(status.report === undefined ? {} : {
+      report: {
+        migratedFields: status.report.migratedFields,
+        migratedRules: status.report.migratedRules,
+        migratedConditions: status.report.migratedConditions,
+        migratedEffectGroups: status.report.migratedEffectGroups,
+        warnings: boundedWarnings.map((warning) => warning.value),
+        warningCount: warnings.length,
+        warningsTruncated,
+      },
+    }),
+    ...(status.cleanup === undefined ? {} : {
+      cleanup: {
+        state: "pending" as const,
+        error: { code: cleanupCode!.value, message: cleanupMessage!.value },
+      },
+    }),
+    truncated: warningsTruncated || anyTruncated([cleanupCode, cleanupMessage]),
+  };
+}
+
+function requireSnapshotByteBound(snapshot: MvuCompactPageSnapshot): void {
+  const serialized = JSON.stringify(snapshot);
+  if (utf8ByteLength(serialized) > MVU_SNAPSHOT_MAX_BYTES) {
+    throw new Error("MVU_SNAPSHOT_SIZE_LIMIT_EXCEEDED");
+  }
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x7f) {
+      bytes += 1;
+    } else if (codeUnit <= 0x7ff) {
+      bytes += 2;
+    } else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 function pageReferences(

@@ -253,18 +253,14 @@ async function buildActiveSnapshot(request: SnapshotRequest): Promise<MvuPageSna
     const synchronized = await synchronizeHostSnapshot(hostSnapshot);
     await settleContexts(synchronized.context, synchronized.members);
     const selectedContext = activeContextFromHostSnapshot(hostSnapshot, request.actorId);
-    const snapshot = await new MvuQueryService(createQuerySource(hostSnapshot, selectedContext)).pageSnapshot();
     const contextOwnerName = hostSnapshot.activeGroup?.name ??
       hostSnapshot.activeCharacter?.name ??
       hostSnapshot.activePrompt?.name ??
       "";
-    return {
-      ...snapshot,
-      contextLabels: {
-        groupName: hostSnapshot.activeGroup?.name ?? null,
-        chatName: contextOwnerName.length > 0 ? `${contextOwnerName} 的会话` : "当前会话",
-      },
-    };
+    return new MvuQueryService(createQuerySource(hostSnapshot, selectedContext)).pageSnapshot({
+      groupName: hostSnapshot.activeGroup?.name ?? null,
+      chatName: contextOwnerName.length > 0 ? `${contextOwnerName} 的会话` : "当前会话",
+    });
   } catch (error) {
     console.error("MVU active snapshot failed", error);
     throw error;
