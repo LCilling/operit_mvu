@@ -20,7 +20,8 @@ export default function Screen(ctx: ComposeDslContext): ComposeNode {
   if (!bridgeInstalled.current) {
     bridgeInstalled.current = true;
     controller.addJavascriptInterface("NativeMvu", {
-      call: (bridgeArguments: readonly unknown[]): void => {
+      call: (...hostArguments: unknown[]): void => {
+        const bridgeArguments = normalizeBridgeArguments(hostArguments);
         let request: ReturnType<typeof parseBridgeArguments>;
         try {
           request = parseBridgeArguments(bridgeArguments);
@@ -95,6 +96,12 @@ export default function Screen(ctx: ComposeDslContext): ComposeNode {
           color: resourceError ? "#D93464" : "#626C8C",
         })
   );
+}
+
+function normalizeBridgeArguments(hostArguments: readonly unknown[]): readonly unknown[] {
+  return hostArguments.length === 1 && Array.isArray(hostArguments[0])
+    ? hostArguments[0]
+    : hostArguments;
 }
 
 function parseBridgeArguments(bridgeArguments: readonly unknown[]): {
