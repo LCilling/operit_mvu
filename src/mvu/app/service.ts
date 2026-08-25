@@ -36,6 +36,7 @@ import type {
 } from "./model";
 import {
   EFFECT_REASON_RENDERED_MAX_LENGTH,
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
   truncateEffectReasonText,
   type MvuDatasetV3,
   type RuleTargetSelector,
@@ -592,6 +593,7 @@ export class MvuService {
     effect: Omit<DataTemporaryEffect, "id">
   ): Promise<DataTemporaryEffect> {
     const created: DataTemporaryEffect = { ...klona(effect), id: makeId("effect") };
+    assertLegacyEffectReasonEdit(created);
     await this.mutate((draft) => {
       validateTemporaryEffect(created, draft.fields);
       draft.temporaryEffects.push(created);
@@ -607,6 +609,8 @@ export class MvuService {
     await this.mutate((draft) => {
       const effect = draft.temporaryEffects.find((candidate) => candidate.id === id);
       if (effect === undefined) throw new Error(`MVU_EFFECT_NOT_FOUND:${id}`);
+      const next = { ...effect, ...klona(patch) };
+      if (!sameLegacyEffectReasonTuple(effect, next)) assertLegacyEffectReasonEdit(next);
       Object.assign(effect, klona(patch));
       reconcileAutoRuleEffectImports(draft);
       validateConfiguration(draft);
@@ -1551,6 +1555,24 @@ function applyV3ImmediateChange(input: {
     input: input.input,
     recordId: input.recordId,
   });
+}
+
+function assertLegacyEffectReasonEdit(effect: Pick<
+  DataTemporaryEffect,
+  "reasonMode" | "reasonTemplate" | "reason"
+>): void {
+  if (effect.reason.length > EFFECT_REASON_SOURCE_MAX_LENGTH) {
+    throw new Error("MVU_EFFECT_REASON_TOO_LONG");
+  }
+}
+
+function sameLegacyEffectReasonTuple(
+  left: Pick<DataTemporaryEffect, "reasonMode" | "reasonTemplate" | "reason">,
+  right: Pick<DataTemporaryEffect, "reasonMode" | "reasonTemplate" | "reason">,
+): boolean {
+  return left.reasonMode === right.reasonMode &&
+    left.reasonTemplate === right.reasonTemplate &&
+    left.reason === right.reason;
 }
 
 function composeV3RuleReason(ruleName: string, effectReasons: readonly string[]): string {

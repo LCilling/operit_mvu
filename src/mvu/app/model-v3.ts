@@ -4,7 +4,6 @@ import type {
   DataLinkRule,
   MessageFact,
   MvuSettings,
-  TemporaryEffectReasonTemplate,
   TurnCounter,
 } from "./model";
 
@@ -83,10 +82,28 @@ export function truncateEffectReasonText(value: string, maximum: number): string
   return /[\uD800-\uDBFF]$/.test(truncated) ? truncated.slice(0, -1) : truncated;
 }
 
-/** Reusable reason source. Template text is retained for lossless v2 compatibility but ignored when rendered. */
+/** Product-level v3 reason templates. Legacy v2 categories remain in model.ts only. */
+export type EffectReasonTemplate =
+  | "general"
+  | "rule"
+  | "natural"
+  | "per_turn"
+  | "ai"
+  | "manual";
+
+export const V3_EFFECT_REASON_TEMPLATES: Readonly<Record<EffectReasonTemplate, string>> = {
+  general: "临时状态影响",
+  rule: "规则触发",
+  natural: "自然变化",
+  per_turn: "每轮变化",
+  ai: "AI 更新",
+  manual: "手动调整",
+};
+
+/** Reusable v3 reason source. Custom text may contain only the documented visual variables. */
 export interface EffectReasonConfig {
   mode: "template" | "custom";
-  template: TemporaryEffectReasonTemplate;
+  template: EffectReasonTemplate;
   text: string;
 }
 

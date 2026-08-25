@@ -20,6 +20,7 @@ import type {
 import {
   EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
   EFFECT_REASON_RENDERED_MAX_LENGTH,
+  V3_EFFECT_REASON_TEMPLATES,
   truncateEffectReasonText,
 } from "./model-v3";
 import { assertMvuDatasetV3, normalizeMvuDataset } from "./validation";
@@ -212,7 +213,7 @@ function reasonSnapshot(reason: EffectReasonConfig): EffectReasonSnapshot {
     template: reason.template,
     text: normalizeRenderedEffectReason(reason.mode === "custom"
       ? reason.text
-      : TEMPORARY_EFFECT_REASON_TEMPLATES[reason.template]),
+      : V3_EFFECT_REASON_TEMPLATES[reason.template]),
   };
 }
 
@@ -220,15 +221,36 @@ function migrateLegacyReasonConfig(
   effect: DataTemporaryEffect,
   warnings: string[],
 ): EffectReasonConfig {
+  if (effect.reasonMode === "template") {
+    warnings.push(
+      `MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:${effect.id}:${effect.reasonTemplate}`,
+    );
+    return {
+      mode: "custom",
+      template: "general",
+      text: TEMPORARY_EFFECT_REASON_TEMPLATES[effect.reasonTemplate],
+    };
+  }
   const text = truncateEffectReasonText(effect.reason, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH);
+  if (effect.reasonTemplate !== "general") {
+    warnings.push(
+      `MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:${effect.id}:${effect.reasonTemplate}`,
+    );
+  }
   if (text !== effect.reason) {
     warnings.push(
       `MVU_EFFECT_REASON_LEGACY_TRUNCATED:${effect.id}:${effect.reason.length}:${EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH}`,
     );
   }
+  const renderedText = normalizeRenderedEffectReason(text);
+  if (renderedText !== text) {
+    warnings.push(text.length > EFFECT_REASON_RENDERED_MAX_LENGTH
+      ? `MVU_ACTIVE_EFFECT_REASON_LEGACY_TRUNCATED:${effect.id}:${text.length}:${EFFECT_REASON_RENDERED_MAX_LENGTH}`
+      : `MVU_ACTIVE_EFFECT_REASON_LEGACY_NORMALIZED:${effect.id}`);
+  }
   return {
-    mode: effect.reasonMode,
-    template: effect.reasonTemplate,
+    mode: "custom",
+    template: "general",
     text,
   };
 }

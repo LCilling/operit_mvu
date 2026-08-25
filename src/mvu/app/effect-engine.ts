@@ -15,11 +15,11 @@ import {
   EFFECT_REASON_RENDERED_MAX_LENGTH,
   EFFECT_REASON_SOURCE_MAX_LENGTH,
   EFFECT_REASON_VARIABLE_MAX_LENGTH,
+  V3_EFFECT_REASON_TEMPLATES,
   truncateEffectReasonText,
   type ChangeSource,
 } from "./model-v3";
 import {
-  TEMPORARY_EFFECT_REASON_TEMPLATES,
   renderEffectReasonText,
   type EffectReasonVariables,
 } from "./temporary-effect";
@@ -235,7 +235,7 @@ export function resolveEffectReason(input: {
   }
   const sourceText = input.reason.mode === "custom"
     ? input.reason.text?.trim() ?? ""
-    : TEMPORARY_EFFECT_REASON_TEMPLATES[input.reason.template];
+    : V3_EFFECT_REASON_TEMPLATES[input.reason.template];
   const variables = normalizeReasonVariables(input.variables);
   const rendered = renderEffectReasonText(sourceText, variables);
   return {
@@ -251,7 +251,7 @@ export function normalizeRenderedEffectReason(value: string): string {
     .replace(/\u0000/g, "")
     .trim();
   return truncateEffectReasonText(
-    normalized.length === 0 ? TEMPORARY_EFFECT_REASON_TEMPLATES.general : normalized,
+    normalized.length === 0 ? V3_EFFECT_REASON_TEMPLATES.general : normalized,
     EFFECT_REASON_RENDERED_MAX_LENGTH,
   );
 }

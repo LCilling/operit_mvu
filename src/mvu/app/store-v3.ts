@@ -11,12 +11,14 @@ import type {
 import type {
   ConditionPredicate,
   EffectGroupDefinition,
+  EffectReasonConfig,
   MigrationResult,
   MvuDatasetV3,
   RecordManifest,
   RuleActionV3,
   RuleDefinitionV3,
 } from "./model-v3";
+import { V3_EFFECT_REASON_TEMPLATES } from "./model-v3";
 import {
   assertRecordManifest,
   createEmptyRecordManifest,
@@ -254,8 +256,11 @@ export class V3MvuStore implements MvuStore {
       const v3Path = this.v3Path(configDir);
       if (await this.files.exists(v3Path)) {
         let existing: V3MvuStoreSnapshot | undefined;
+        let normalizationWarnings: string[] = [];
         try {
-          const candidate = await this.loadV3Config();
+          const loaded = await this.loadV3ConfigWithWarnings();
+          const candidate = loaded.snapshot;
+          normalizationWarnings = loaded.warnings;
           const validation = await this.records.validateAndRepair(
             candidate.dataset.recordManifest,
             candidate.revision,
@@ -282,7 +287,13 @@ export class V3MvuStore implements MvuStore {
           // Superseded-file deletion is resumable maintenance, not migration.
           runtimeRecoveryRequired.delete(v3Path);
           await this.tryResumeSegmentCleanup(existing.dataset);
-          return this.withCleanupStatus({ mode: "v3", source: "existing" });
+          return this.withCleanupStatus({
+            mode: "v3",
+            source: "existing",
+            ...(normalizationWarnings.length === 0
+              ? {}
+              : { report: normalizationReport(existing.dataset, normalizationWarnings) }),
+          });
         }
       }
 
@@ -331,16 +342,27 @@ export class V3MvuStore implements MvuStore {
   }
 
   private async loadV3Config(): Promise<V3MvuStoreSnapshot> {
+    return (await this.loadV3ConfigWithWarnings()).snapshot;
+  }
+
+  private async loadV3ConfigWithWarnings(): Promise<{
+    snapshot: V3MvuStoreSnapshot;
+    warnings: string[];
+  }> {
     const path = this.v3Path(this.configDir());
     if (!(await this.files.exists(path))) throw new Error("MVU_V3_CONFIG_MISSING");
     const raw = await this.files.readText(path);
     const parsed = klona(JSON.parse(raw) as unknown);
+    let warnings: string[] = [];
     if (isMvuDatasetV3Candidate(parsed)) {
-      normalizeLegacyV3EffectReasonData(parsed);
+      warnings = normalizeLegacyV3EffectReasonData(parsed);
       hydrateLegacyActiveEffectSnapshots(parsed);
     }
     assertMvuDatasetV3(parsed);
-    return { revision: parsed.revision, dataset: klona(parsed) };
+    return {
+      snapshot: { revision: parsed.revision, dataset: klona(parsed) },
+      warnings,
+    };
   }
 
   private async commitLoaded(
@@ -707,7 +729,7 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
     }));
     if (targets.length === 0) continue;
     const duration = compatibilityInstanceDuration(instances);
-    const reason = definition.defaultReason ?? { mode: "template", template: "general", text: "" };
+    const reason = compatibilityReason(definition.defaultReason);
     effects.push({
       id: legacyEffectId(definition.id),
       targets: uniqueTargets(targets),
@@ -716,13 +738,30 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
       enabled: definition.enabled && instances.length > 0,
       expiresAt: duration.expiresAt === null ? null : Date.parse(duration.expiresAt),
       remainingTurns: duration.remainingTurns,
-      reasonMode: reason.mode,
-      reasonTemplate: reason.template,
-      reason: reason.text,
+      reasonMode: reason.reasonMode,
+      reasonTemplate: reason.reasonTemplate,
+      reason: reason.reason,
       createdAt: Date.parse(definition.createdAt),
     });
   }
   return effects;
+}
+
+function compatibilityReason(reason: EffectReasonConfig): Pick<
+  DataTemporaryEffect,
+  "reasonMode" | "reasonTemplate" | "reason"
+> {
+  if (reason.mode === "custom") {
+    return { reasonMode: "custom", reasonTemplate: "general", reason: reason.text };
+  }
+  if (reason.template === "general") {
+    return { reasonMode: "template", reasonTemplate: "general", reason: reason.text };
+  }
+  return {
+    reasonMode: "custom",
+    reasonTemplate: "general",
+    reason: V3_EFFECT_REASON_TEMPLATES[reason.template],
+  };
 }
 
 function compatibleEffectOperation(
@@ -1007,7 +1046,9 @@ function reconcileCompatibilityEffects(
     const groupIndex = effectGroups.findIndex((group) => group.id === currentGroup.id);
     if (groupIndex < 0) throw new Error(`MVU_V3_COMPAT_EFFECT_NOT_FOUND:${id}`);
     const patchedGroup = klona(currentGroup);
-    patchedGroup.defaultReason = klona(migratedGroup.defaultReason);
+    if (!sameEffectReasonTuple(projectedEffect, nextEffect)) {
+      patchedGroup.defaultReason = klona(migratedGroup.defaultReason);
+    }
     patchedGroup.fieldEffects = patchedGroup.fieldEffects.map((fieldEffect) => ({
       ...fieldEffect,
       operations: fieldEffect.operations.map((operation) => {
@@ -1217,6 +1258,19 @@ function validateMigrationResult(v2: MvuDataset, result: MigrationResult): void 
   }
 }
 
+function normalizationReport(
+  dataset: MvuDatasetV3,
+  warnings: string[],
+): MigrationResult["report"] {
+  return {
+    migratedFields: dataset.fields.length,
+    migratedRules: dataset.rules.length,
+    migratedConditions: dataset.conditions.length,
+    migratedEffectGroups: dataset.effectGroups.length,
+    warnings: [...warnings],
+  };
+}
+
 function legacyEffectId(effectGroupId: string): string {
   return effectGroupId.startsWith("effect_group_")
     ? effectGroupId.slice("effect_group_".length)
@@ -1268,6 +1322,12 @@ function sameEffectExceptEnabled(left: DataTemporaryEffect, right: DataTemporary
   const leftComparable = { ...left, enabled: true };
   const rightComparable = { ...right, enabled: true };
   return JSON.stringify(leftComparable) === JSON.stringify(rightComparable);
+}
+
+function sameEffectReasonTuple(left: DataTemporaryEffect, right: DataTemporaryEffect): boolean {
+  return left.reasonMode === right.reasonMode &&
+    left.reasonTemplate === right.reasonTemplate &&
+    left.reason === right.reason;
 }
 
 function sameEffectInstanceProjection(left: DataTemporaryEffect, right: DataTemporaryEffect): boolean {

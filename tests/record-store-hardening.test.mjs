@@ -481,7 +481,7 @@ test("legacy effect writes preserve reusable semantics and every active instance
     resolvedTargets: [target("U")],
     duration: { expiresAt: null, remainingTurns: 5 },
     activatedAt: iso(-30_000),
-    reason: { mode: "template", template: "positive", text: "positive" },
+    reason: { mode: "template", template: "manual", text: "手动调整" },
   }];
   const configuredCommit = await store.transactV3(before.revision, configured, []);
   const runtime = createRuntime({ store });
