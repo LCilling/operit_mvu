@@ -81,6 +81,7 @@
 
   function effectEditorPage() {
     const entity = ui.state.selectedEntityId ? ui.state.entities.get("effectGroup:" + ui.state.selectedEntityId) : null;
+    const reasonMode = ui.state.effectReasonMode === "custom" ? "custom" : "template";
     return '<form class="editor-page effect-editor"><section class="editor-section">' + c.sectionHeading("基础信息", "临时效果以组为单位复用") +
       '<div class="form-card"><label>效果组名称<input value="' + ui.escapeHtml(entity ? entity.name : "新临时效果") + '"></label><label>说明<textarea rows="2">' +
       ui.escapeHtml(entity ? entity.description : "") + "</textarea></label></div></section>" +
@@ -91,9 +92,10 @@
       '<div class="operation-row"><label>计算方式<select><option>立即增减</option><option>固定修正</option><option>正向倍率</option><option>负向倍率</option><option>通用倍率</option></select></label><label>效果数值<input type="number" value="1"></label></div>' +
       '<button type="button" class="inline-add">' + c.icon("add") + '添加计算方式</button></article><button type="button" class="button secondary full">' + c.icon("add") + "添加目标字段</button></section>" +
       '<section class="editor-section">' + c.sectionHeading("效果原因", "原因会写入变化记录，便于回看") +
-      c.segmented([{ id: "template", label: "默认模板" }, { id: "custom", label: "自定义原因" }], "template", "data-reason-mode", "原因模式") +
-      '<div class="form-card reason-settings"><label>原因模板<select><option>规则触发</option><option>自然变化修正</option><option>每轮变化修正</option><option>AI 更新修正</option><option>手动应用</option></select></label>' +
-      '<label>原因预览<output>由规则触发「新临时效果」</output></label></div></section>' +
+      c.segmented([{ id: "template", label: "默认模板" }, { id: "custom", label: "自定义原因" }], reasonMode, "data-reason-mode", "原因模式") +
+      '<div id="segment-panel-reason-mode" role="tabpanel">' + (reasonMode === "custom"
+        ? '<div class="form-card reason-settings"><label>自定义原因内容<textarea rows="3" placeholder="说明这次字段变化的原因"></textarea></label><label>原因预览<output>自定义原因将写入变化记录</output></label></div>'
+        : '<div class="form-card reason-settings"><label>原因模板<select><option>规则触发</option><option>自然变化修正</option><option>每轮变化修正</option><option>AI 更新修正</option><option>手动应用</option></select></label><label>原因预览<output>由规则触发「新临时效果」</output></label></div>') + '</div></section>' +
       '<section class="editor-section">' + c.sectionHeading("持续时间", "按小时、轮次或手动停用") + '<div class="form-card"><label>持续方式<select><option>手动停用</option><option>指定小时</option><option>指定轮次</option></select></label></div></section>' +
       '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary" disabled>保存效果</button></div></form>';
   }

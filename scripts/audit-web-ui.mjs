@@ -49,7 +49,7 @@ assert.deepEqual(requiredV3BridgeMethods.filter((method) => !bridgeMethods.has(m
 assert.match(componentSource, /aria-label="打开菜单"/, "Menu navigation needs an accessible name");
 assert.match(componentSource, /class="icon-button back-button"[^>]*aria-label="返回"/, "Back navigation needs an accessible name");
 assert.match(componentSource, /aria-current="page"/, "Bottom navigation must expose the current root");
-assert.match(componentSource, /role="tab" aria-selected=/, "Segmented controls must expose selected state");
+assert.match(componentSource, /role="tab"[^>]*aria-selected=/, "Segmented controls must expose selected state");
 assert.match(componentSource, /data-select-actor=/, "Role selection must use native buttons");
 assert.match(componentSource, /data-select-group=/, "Group selection must use native buttons");
 assert.match(statusSource, /groupMode[\s\S]*?groupSelector[\s\S]*?actorSelector/, "Group status must replace rather than stack the role row");
@@ -80,7 +80,7 @@ assert.match(indexSource, /id="backgroundPicker"[^>]*aria-label="选择背景图
 assert.match(indexSource, /id="datasetImportPicker"[^>]*aria-label="选择数据集文件"[^>]*tabindex="-1"/, "Import input needs a name and no tab stop");
 
 assert.match(runtimeSource, /document\.startViewTransition/, "Transitions must progressively use the View Transition API");
-assert.match(styleSource, /::view-transition-old\(segmented-selection\)[\s\S]*?::view-transition-new\(segmented-selection\)/,
+assert.match(styleSource, /::view-transition-old\(\.segmented-selection\)[\s\S]*?::view-transition-new\(\.segmented-selection\)/,
   "Segmented controls need outgoing and incoming motion");
 assert.match(styleSource, /\.segmented-control button\s*\{[\s\S]*?min-height:\s*38px;[\s\S]*?font-size:\s*var\(--type-body\);/,
   "Segmented controls must reduce height without reducing body text");

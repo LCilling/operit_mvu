@@ -93,10 +93,10 @@
       : kind === "turn"
         ? ["按对话轮次改变字段", "分别选择用户、角色或双方消息；控件与字段卡片保持正常间距。"]
         : ["字段之间自动联动", "联动按后端顺序计算，来源字段与目标字段不能相同。"];
-    return '<div class="change-page">' + tabs + '<section class="selected-field-panel"><span>' + c.icon(kind === "link" ? "account_tree" : "schedule") +
+    return '<div class="change-page">' + tabs + '<div id="segment-panel-change-mode" role="tabpanel"><section class="selected-field-panel"><span>' + c.icon(kind === "link" ? "account_tree" : "schedule") +
       '</span><div><strong>' + copy[0] + '</strong><p>' + copy[1] + '</p></div></section>' +
       c.emptyState("search", "选择要配置的字段", "字段较多时使用可搜索选择框，不在页面中一次展开全部字段。",
-        '<button type="button" class="button primary" data-action="open-field-picker">选择字段</button>') + "</div>";
+        '<button type="button" class="button primary" data-action="open-field-picker">选择字段</button>') + "</div></div>";
   }
 
   Object.assign(ui.pages, {

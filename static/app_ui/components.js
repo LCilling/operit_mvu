@@ -60,12 +60,23 @@
   }
 
   function segmented(items, active, attribute, label) {
-    return '<div class="segmented-control" role="tablist" aria-label="' + ui.escapeHtml(label || "切换内容") + '" style="--segments:' + items.length + '">' +
+    const group = segmentGroupId(label || "切换内容");
+    const panelId = "segment-panel-" + group;
+    return '<div class="segmented-control" role="tablist" aria-label="' + ui.escapeHtml(label || "切换内容") +
+      '" style="--segments:' + items.length + ';--segment-transition:segment-' + group + '">' +
       items.map(function (item) {
         const selected = item.id === active;
-        return '<button type="button" role="tab" aria-selected="' + selected + '" class="' + (selected ? "active" : "") + '" ' +
+        return '<button type="button" role="tab" id="segment-tab-' + group + '-' + ui.escapeHtml(item.id) + '" aria-controls="' + panelId +
+          '" aria-selected="' + selected + '" tabindex="' + (selected ? "0" : "-1") + '" class="' + (selected ? "active" : "") + '" ' +
           attribute + '="' + ui.escapeHtml(item.id) + '">' + ui.escapeHtml(item.label) + "</button>";
       }).join("") + "</div>";
+  }
+
+  function segmentGroupId(label) {
+    const known = { "状态范围": "status-scope", "变化方式": "change-mode", "原因模式": "reason-mode" };
+    if (known[label]) return known[label];
+    const value = String(label).normalize("NFKC").toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    return value || "content-mode";
   }
 
   function emptyState(symbol, title, message, action) {
@@ -125,10 +136,15 @@
   }
 
   function avatar(name, uri) {
-    if (typeof uri === "string" && uri.length > 0) {
+    if (safeAvatarUri(uri)) {
       return '<img src="' + ui.escapeHtml(uri) + '" alt="" />';
     }
     return '<span aria-hidden="true">' + ui.escapeHtml(Array.from(name || "?")[0] || "?") + "</span>";
+  }
+
+  function safeAvatarUri(uri) {
+    return typeof uri === "string" && uri.length <= 2048 &&
+      (/^(?:content:\/\/|https?:\/\/)/i.test(uri) || /^data:image\/(?:png|jpeg|webp);base64,/i.test(uri));
   }
 
   function menuRow(iconName, title, description, route, meta) {

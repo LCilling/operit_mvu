@@ -35,6 +35,7 @@
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
+    effectReasonMode: "template",
     drawerOpen: false,
     busy: false,
     fatal: null,
@@ -518,7 +519,7 @@
     const rules = [{ id: "rule-1", name: "关心回应", description: "角色收到明确关心时触发", enabled: true,
       conditionId: "condition-1", actionCount: 1, executionOrder: 1, updatedAt: new Date(now).toISOString(), truncated: false }];
     const conditions = [{ id: "condition-1", name: "主动关心", description: "识别明确的照顾与关心", enabled: true,
-      rootKind: "and", updatedAt: new Date(now).toISOString(), truncated: false }];
+      rootKind: "predicate", updatedAt: new Date(now).toISOString(), truncated: false }];
     const effects = [{ id: "effect-1", name: "安心陪伴", description: "短期提高正向变化", enabled: true,
       fieldCount: 1, updatedAt: new Date(now).toISOString(), truncated: false }];
     const pages = { fields: page([fieldSummary]), rules: page(rules), conditions: page(conditions), effectGroups: page(effects), records: page(records) };

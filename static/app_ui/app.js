@@ -7,6 +7,7 @@
   const BACKGROUND_KEY = "operit_mvu.customBackground";
   const BACKGROUND_MAX_EDGE = 1600;
   let toastTimer = 0;
+  let pendingSegmentFocusId = "";
 
   ui.render = render;
   ui.switchStatusMode = switchStatusMode;
@@ -40,6 +41,11 @@
     const next = appRoot.querySelector(".screen-scroll");
     if (next) next.scrollTop = scrollTop;
     drawCharts();
+    if (pendingSegmentFocusId) {
+      const focusTarget = document.getElementById(pendingSegmentFocusId);
+      pendingSegmentFocusId = "";
+      if (focusTarget && appRoot.contains(focusTarget)) focusTarget.focus();
+    }
   }
 
   function pageOptions(route) {
@@ -95,6 +101,12 @@
       await switchStatusMode(statusMode.dataset.statusMode);
       return;
     }
+    const reasonMode = target.closest("[data-reason-mode]");
+    if (reasonMode) {
+      ui.state.effectReasonMode = reasonMode.dataset.reasonMode === "custom" ? "custom" : "template";
+      ui.transition(render);
+      return;
+    }
     const changeRoute = target.closest("[data-change-route]");
     if (changeRoute) {
       const route = { natural: "natural-settings", turn: "turn-settings", link: "link-settings" }[changeRoute.dataset.changeRoute];
@@ -126,9 +138,11 @@
     } else if (action === "open-drawer") {
       ui.state.drawerOpen = true;
       render();
+      focusDrawerFirst();
     } else if (action === "close-drawer") {
       ui.state.drawerOpen = false;
       render();
+      focusMenuButton();
     } else if (action === "retry") {
       await retryCurrent();
     } else if (action === "choose-background") {
@@ -151,6 +165,57 @@
       await ui.navigate("field-editor");
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker") {
       showToast("搜索选择框将在下一步的大数据界面中打开");
+    }
+  }
+
+  function focusDrawerFirst() {
+    Promise.resolve().then(function () {
+      const first = appRoot.querySelector(".drawer button");
+      if (first) first.focus();
+    });
+  }
+
+  function focusMenuButton() {
+    Promise.resolve().then(function () {
+      const menu = appRoot.querySelector('[data-action="open-drawer"]');
+      if (menu) menu.focus();
+    });
+  }
+
+  function handleAppKeydown(event) {
+    const tab = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+    if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      const tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
+      const current = tabs.indexOf(tab);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 :
+        (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      event.preventDefault();
+      const nextTab = tabs[next];
+      pendingSegmentFocusId = nextTab.id;
+      nextTab.focus();
+      nextTab.click();
+      return;
+    }
+    if (!ui.state.drawerOpen) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      ui.state.drawerOpen = false;
+      render();
+      focusMenuButton();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const drawer = appRoot.querySelector(".drawer");
+    const focusable = drawer ? Array.from(drawer.querySelectorAll("button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")) : [];
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -371,8 +436,8 @@
 
   function applyBackground() {
     const stored = window.localStorage.getItem(BACKGROUND_KEY);
-    const image = stored ? 'url("' + stored.replaceAll('"', "%22") + '")' : 'url("./assets/character-state-theme.png")';
-    document.documentElement.style.setProperty("--page-background-image", image);
+    if (stored) document.documentElement.style.setProperty("--page-background-image", 'url("' + stored.replaceAll('"', "%22") + '")');
+    else document.documentElement.style.removeProperty("--page-background-image");
   }
 
   function setBusy(value) {
@@ -394,6 +459,7 @@
     });
   });
   appRoot.addEventListener("input", handleRangeInput);
+  appRoot.addEventListener("keydown", handleAppKeydown);
   window.addEventListener("resize", drawCharts);
 
   async function boot() {

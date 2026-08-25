@@ -42,6 +42,8 @@ const files = Object.fromEntries(await Promise.all(moduleNames.map(async (name) 
 const styles = await optional(path.join("static", "app_ui", "styles.css"));
 const index = await optional(path.join("static", "app_ui", "index.html"));
 const build = await optional(path.join("scripts", "build-web.mjs"));
+const container = await optional(path.join("src", "ui", "web_container", "index.ui.ts"));
+const textScaleFixture = await optional(path.join("tests", "fixtures", "ui-text-scale.html"));
 const allUi = moduleNames.map((name) => files[name]).join("\n");
 const violations = [];
 
@@ -92,6 +94,28 @@ requireMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)/,
   "reduced-motion support is required");
 requireMatch(allUi, /document\.startViewTransition/,
   "segmented and route content changes must use progressive view transitions");
+requireMatch(files["components.js"], /aria-controls=/,
+  "segmented tabs must own a labelled panel");
+requireMatch(files["components.js"], /tabindex=/,
+  "segmented tabs must use roving keyboard focus");
+rejectMatch(styles, /view-transition-name:\s*segmented-selection/,
+  "segmented controls must not share one transition identity");
+rejectMatch(index, /maximum-scale|user-scalable=no/,
+  "viewport must allow platform text and page zoom");
+rejectMatch(container, /textZoom:\s*100/,
+  "WebView must not override the host text scale");
+requireMatch(files["app.js"], /Escape[\s\S]*?Tab/,
+  "drawer must support Escape and trapped Tab focus");
+requireMatch(files["app.js"], /pendingSegmentFocusId\s*=\s*nextTab\.id/,
+  "roving tabs must retain the selected tab identity");
+requireMatch(files["app.js"], /getElementById\(pendingSegmentFocusId\)/,
+  "roving tabs must restore focus after asynchronous rendering");
+requireMatch(files["app.js"], /data-reason-mode[\s\S]*?effectReasonMode/,
+  "reason tabs must switch their owned content panel");
+requireMatch(files["components.js"], /content:[\\/]\/[\s\S]*?https\?:[\\/]\//,
+  "avatar URIs must use an explicit safe-scheme allowlist");
+rejectMatch(files["app.js"], /assets\/character-state-theme\.png/,
+  "default background must be inlined once through CSS only");
 
 requireMatch(files["runtime.js"], /validateCompactSnapshot/,
   "runtime must validate MvuPageSnapshot");
@@ -128,6 +152,10 @@ requireMatch(styles, /\.field-detail-stack\s*\{[\s\S]*?display:\s*grid;[\s\S]*?g
   "field detail cards must share one 12px stack gap");
 rejectMatch(styles, /\.field-detail-stack[\s\S]{0,1000}margin-(?:top|bottom):\s*-/,
   "field detail stack may not collapse card seams with negative margins");
+rejectMatch(styles, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/,
+  "stage collision handling must not move the shared normalized marker anchor");
+requireMatch(textScaleFixture, /Number\(value\)\s*\*\s*1\.3/,
+  "browser audit fixture must exercise a real 130% text-only scale");
 
 const expectedOrder = moduleNames.map((name) => `<script src="${name}"></script>`);
 let previousIndex = -1;
