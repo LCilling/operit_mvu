@@ -353,7 +353,7 @@ export class V3MvuStore implements MvuStore {
     }
     await this.persistConfig(configPath, committed);
     runtimeRecoveryRequired.delete(configPath);
-    if (supersededPaths.length > 0) await this.resumeSegmentCleanup(committed);
+    if (supersededPaths.length > 0) await this.tryResumeSegmentCleanup(committed);
     return { revision: committed.revision, dataset: klona(committed) };
   }
 
