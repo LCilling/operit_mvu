@@ -190,3 +190,125 @@ test("field template preview is deterministic and reports conflicts and readable
   assert.equal(fixture.transactionCount(), 0);
   assert.deepEqual(fixture.current(), before);
 });
+
+test("create-copy import maps one source actor to multiple explicitly enabled local actors in one transaction", async () => {
+  const fixture = createFixture();
+  const state = fixture.current();
+  state.stateValues["character:actor_t"] = { field_affinity: 42 };
+  let sourceState = structuredClone(state);
+  const exporter = new MvuQueryService({
+    async readV3() { return { revision: sourceState.revision, dataset: structuredClone(sourceState) }; },
+    async transactV3() { throw new Error("UNEXPECTED_EXPORT_WRITE"); },
+    async queryCommittedRecords() { return { items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }; },
+    async listActors() { return [{ characterId: "actor_t", name: "角色 T", enabled: true }]; },
+    async listGroups() { return []; },
+    async activeContext() { return { chatId: "chat_source", actorId: "actor_t", groupId: null, actorName: "角色 T" }; },
+    async migrationStatus() { return { mode: "v3", source: "existing" }; },
+  }, { now: () => NOW });
+  const exported = await exporter.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: true }),
+  });
+
+  const result = await fixture.service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: fixture.dataset.revision,
+    decisions: { fields: [{
+      sourceFieldId: "field_affinity",
+      mappings: [{
+        sourceTargetId: "actor_t",
+        targets: [
+          { targetId: "actor_t", enabled: true, valuePolicy: "template_value" },
+          { targetId: "actor_u", enabled: true, valuePolicy: "template_value" },
+        ],
+      }],
+    }] },
+  });
+
+  assert.equal(result.revision, fixture.dataset.revision + 1);
+  assert.deepEqual(result.summary, {
+    created: ["field_affinity_copy"], updated: [], replaced: [], skippedTargets: 0, valueWrites: 2,
+  });
+  assert.equal(fixture.transactionCount(), 1);
+  const imported = fixture.current().fields.find((field) => field.id === "field_affinity_copy");
+  assert.deepEqual(imported.bindingIds, ["actor_t", "actor_u"]);
+  assert.equal(fixture.current().stateValues["character:actor_t"].field_affinity_copy, 42);
+  assert.equal(fixture.current().stateValues["character:actor_u"].field_affinity_copy, 42);
+});
+
+test("stale revision and an incomplete mapping reject before the atomic store write", async () => {
+  const fixture = createFixture();
+  const exported = await fixture.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: false }),
+  });
+  const before = fixture.current();
+  const request = {
+    json: exported.json,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [] }] },
+  };
+
+  await assert.rejects(
+    fixture.service.importFieldTemplate({ ...request, expectedRevision: before.revision + 1 }),
+    /MVU_STALE_REVISION/,
+  );
+  await assert.rejects(
+    fixture.service.importFieldTemplate({ ...request, expectedRevision: before.revision }),
+    /MVU_FIELD_TEMPLATE_MAPPING_MISSING/,
+  );
+  assert.equal(fixture.transactionCount(), 0);
+  assert.deepEqual(fixture.current(), before);
+});
+
+test("update preserves local bindings and values while replace applies the explicit mapping and initial-value policy", async () => {
+  const updateFixture = createFixture();
+  const exported = await updateFixture.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: false }),
+  });
+  const local = updateFixture.current();
+  local.fields[0].name = "Local name";
+  local.fields[0].bindingIds = ["actor_u"];
+  local.stateValues["character:actor_u"] = { field_affinity: 77 };
+  let current = structuredClone(local);
+  let writes = 0;
+  const service = new MvuQueryService({
+    async readV3() { return { revision: current.revision, dataset: structuredClone(current) }; },
+    async transactV3(expectedRevision, next) { writes += 1; current = structuredClone(next); current.revision = expectedRevision + 1; return { revision: current.revision, dataset: structuredClone(current) }; },
+    async queryCommittedRecords() { return { items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }; },
+    async listActors() { return [
+      { characterId: "actor_t", name: "角色 T", enabled: true },
+      { characterId: "actor_u", name: "角色 U", enabled: true },
+    ]; },
+    async listGroups() { return []; },
+    async activeContext() { return { chatId: "chat_current", actorId: "actor_t", groupId: null, actorName: "角色 T" }; },
+    async migrationStatus() { return { mode: "v3", source: "existing" }; },
+  }, { now: () => NOW });
+
+  const updated = await service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: current.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", strategy: "update", mappings: [] }] },
+  });
+  assert.deepEqual(updated.summary.updated, ["field_affinity"]);
+  assert.equal(current.fields[0].name, "Affinity");
+  assert.deepEqual(current.fields[0].bindingIds, ["actor_u"]);
+  assert.equal(current.stateValues["character:actor_u"].field_affinity, 77);
+
+  const replaced = await service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: current.revision,
+    decisions: { fields: [{
+      sourceFieldId: "field_affinity",
+      strategy: "replace",
+      mappings: [{
+        sourceTargetId: "actor_t",
+        targets: [{ targetId: "actor_u", enabled: true, valuePolicy: "field_initial" }],
+      }],
+    }] },
+  });
+  assert.deepEqual(replaced.summary.replaced, ["field_affinity"]);
+  assert.deepEqual(current.fields[0].bindingIds, ["actor_u"]);
+  assert.equal(current.stateValues["character:actor_u"].field_affinity, 0);
+  assert.equal(writes, 2);
+});
