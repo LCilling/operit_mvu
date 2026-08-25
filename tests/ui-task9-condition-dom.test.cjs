@@ -78,6 +78,29 @@ function change(window, selector, value) {
   return element;
 }
 
+function keydown(window, target, key, options = {}) {
+  target.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...options }));
+}
+
+function setChecked(window, selector, checked) {
+  const element = window.document.querySelector(selector);
+  assert.ok(element, `missing checkbox ${selector}`);
+  element.checked = checked;
+  element.dispatchEvent(new window.Event("input", { bubbles: true }));
+  return element;
+}
+
+async function chooseFirstConditionPickerItem(window, kind, pathValue, multiple) {
+  click(window, `[data-condition-picker="${kind}"][data-condition-path="${pathValue}"]`);
+  await waitFor(() => window.document.querySelector(".entity-picker .picker-result"), `${kind} picker did not load a result`);
+  const result = window.document.querySelector(".entity-picker .picker-result");
+  const id = result.dataset.pickerId;
+  result.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  if (multiple) click(window, '[data-action="confirm-entity-picker"]');
+  await waitFor(() => !window.document.querySelector(".entity-picker"), `${kind} picker did not close`);
+  return id;
+}
+
 function submit(window, selector = '[data-form="condition-editor"]') {
   const form = window.document.querySelector(selector);
   assert.ok(form, `missing submit form ${selector}`);
@@ -87,6 +110,21 @@ function submit(window, selector = '[data-form="condition-editor"]') {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+async function openExistingConditionEditorWithReferenceFailure() {
+  const window = await createApp("condition-library");
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  window.__failConditionReferences = true;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "getConditionReferences" && window.__failConditionReferences) throw new Error("reference service unavailable");
+    return originalCall(method, params);
+  };
+  window.MvuUi.state.selectedEntityId = "condition-1";
+  window.MvuUi.resetConditionEditorDraft();
+  await window.MvuUi.navigate("condition-editor");
+  await waitFor(() => window.document.querySelector("[data-condition-shared-refs]"), "condition references panel did not render");
+  return window;
 }
 
 function resolveChromiumExecutable() {
@@ -177,6 +215,119 @@ test("condition serializer preserves every production predicate token and exact 
     }
   }
   assert.deepEqual(plain(serialize(raw)), expected);
+});
+
+test("required numeric predicate inputs reject raw empty strings instead of coercing them to zero", async (t) => {
+  const window = await createApp("condition-editor");
+  t.after(() => window.close());
+  Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+  input(window, '[name="conditionName"]', "必填数字边界");
+  click(window, '[data-action="add-condition-predicate"][data-condition-path=""]');
+  const cases = [
+    ["recent_positive", "count"],
+    ["long_inactive", "hours"],
+    ["high_frequency", "messages"],
+    ["field_comparison", "value"],
+    ["message_count", "count"],
+    ["message_count", "windowHours"],
+    ["repeating_date", "month"],
+    ["repeating_date", "day"],
+    ["ai_semantic", "minimumConfidence"],
+  ];
+  for (const [kind, property] of cases) {
+    change(window, '[data-condition-predicate-kind][data-condition-path="0"]', kind);
+    if (kind === "field_comparison") {
+      window.MvuUi.state.conditionEditorDraft.expression.children[0].predicate.fieldId = "affinity";
+      window.MvuUi.render();
+    }
+    const selector = `[data-condition-prop="${property}"][data-condition-path="0"]`;
+    const control = window.document.querySelector(selector);
+    assert.equal(control.required, true, `${kind}.${property} must use native required semantics`);
+    input(window, selector, "");
+    submit(window);
+    assert.match(window.document.querySelector("[data-condition-editor-error]").textContent, /必填|不能为空/, `${kind}.${property} accepted an empty string`);
+    assert.equal(window.MvuUi.state.demoLastRequests.createCondition, undefined, `${kind}.${property} reached native mutation`);
+  }
+});
+
+test("calendar validation rejects rolled concrete dates and impossible repeating month days", async (t) => {
+  const window = await createApp("condition-editor");
+  t.after(() => window.close());
+  Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+  input(window, '[name="conditionName"]', "日期边界");
+  click(window, '[data-action="add-condition-predicate"][data-condition-path=""]');
+
+  change(window, '[data-condition-predicate-kind][data-condition-path="0"]', "concrete_date");
+  input(window, '[data-condition-prop="dates"][data-condition-path="0"]', "2026-02-31");
+  submit(window);
+  assert.match(window.document.querySelector("[data-condition-editor-error]").textContent, /具体日期.*无效|有效的具体日期/);
+
+  change(window, '[data-condition-predicate-kind][data-condition-path="0"]', "repeating_date");
+  assert.match(window.document.querySelector('[data-condition-node][data-condition-path="0"]').textContent, /每年公历月日|2 月允许 29 日/);
+  input(window, '[data-condition-prop="month"][data-condition-path="0"]', "2");
+  input(window, '[data-condition-prop="day"][data-condition-path="0"]', "30");
+  submit(window);
+  assert.match(window.document.querySelector("[data-condition-editor-error]").textContent, /重复日期.*无效|2 月.*29/);
+  assert.equal(window.MvuUi.state.demoLastRequests.createCondition, undefined);
+});
+
+test("Demo rejects 101 actor group and date entries atomically at the production array boundary", async (t) => {
+  const predicates = [
+    { kind: "actor", actorIds: Array(101).fill("actor-boundary-id") },
+    { kind: "group", groupIds: Array(101).fill("group-boundary-id") },
+    { kind: "concrete_date", dates: Array(101).fill("2026-08-26") },
+  ];
+  for (const predicate of predicates) {
+    const window = await createApp("condition-library");
+    t.after(() => window.close());
+    const revision = window.MvuUi.state.demoStore.revision;
+    await assert.rejects(window.MvuUi.native.call("createCondition", {
+      expectedRevision: revision,
+      condition: {
+        name: "101 项边界",
+        description: "",
+        enabled: true,
+        expression: { kind: "predicate", predicate },
+      },
+    }), /MVU_CONDITION_PREDICATE_INVALID/);
+    assert.equal(window.MvuUi.state.demoStore.revision, revision, `${predicate.kind} rejection changed revision`);
+  }
+});
+
+test("failed shared-reference read declares unknown impact and never claims zero references", async (t) => {
+  const window = await openExistingConditionEditorWithReferenceFailure();
+  t.after(() => window.close());
+  const panel = window.document.querySelector("[data-condition-shared-refs]");
+  assert.match(panel.textContent, /影响范围未知/);
+  assert.doesNotMatch(panel.textContent, /当前没有规则引用/);
+});
+
+test("failed shared-reference read blocks saving until a successful retry", async (t) => {
+  const window = await openExistingConditionEditorWithReferenceFailure();
+  t.after(() => window.close());
+  let updateCalls = 0;
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "updateCondition") updateCalls += 1;
+    return originalCall(method, params);
+  };
+  submit(window);
+  assert.equal(updateCalls, 0, "save reached native while affected rules were unknown");
+  assert.match(window.document.querySelector("[data-condition-editor-error]").textContent, /影响范围未知|重试.*引用/);
+  assert.ok(window.document.querySelector('[data-action="retry-condition-references"]'), "reference failure needs a persistent retry action");
+});
+
+test("successful shared-reference retry clears unknown impact and permits the preserved draft to save", async (t) => {
+  const window = await openExistingConditionEditorWithReferenceFailure();
+  t.after(() => window.close());
+  input(window, '[name="conditionDescription"]', "引用恢复后的草稿");
+  window.__failConditionReferences = false;
+  click(window, '[data-action="retry-condition-references"]');
+  await waitFor(() => /编辑前已检查/.test(window.document.querySelector("[data-condition-shared-refs]").textContent), "reference retry did not become authoritative");
+  assert.doesNotMatch(window.document.querySelector("[data-condition-shared-refs]").textContent, /影响范围未知/);
+  submit(window);
+  await waitFor(() => window.MvuUi.state.route === "condition-library", "preserved draft did not save after reference retry");
+  assert.equal(window.MvuUi.state.demoLastRequests.updateCondition.patch.description, "引用恢复后的草稿");
 });
 
 test("referenced condition delete is blocked with readable affected rules and guidance", async (t) => {
@@ -356,6 +507,106 @@ test("field actor and group pickers are searchable bounded and keep readable sel
   ]);
 });
 
+test("condition actor and group pickers hard-stop at 100 selections with a visible count and reason", async (t) => {
+  const window = await createApp("condition-editor");
+  t.after(() => window.close());
+  Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+  for (const kind of ["actor", "group"]) {
+    const ids = Array.from({ length: 100 }, (_value, index) => `${kind}-selected-${String(index).padStart(3, "0")}`);
+    window.MvuUi.state.conditionEditorDraft.expression = {
+      kind: "predicate",
+      predicate: kind === "actor" ? { kind, actorIds: ids } : { kind, groupIds: ids },
+    };
+    window.MvuUi.render();
+    click(window, `[data-condition-picker="${kind}"][data-condition-path=""]`);
+    await waitFor(() => window.document.querySelector(".entity-picker .picker-result"), `${kind} picker did not load`);
+    const candidate = window.document.querySelector(".entity-picker .picker-result");
+    candidate.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    assert.equal(window.MvuUi.state.entityPicker.selectedIds.size, 100, `${kind} picker allowed item 101`);
+    assert.match(window.document.querySelector(".entity-picker").textContent, /已选择 100|确认选择（100）/);
+    assert.match(window.document.querySelector(".entity-picker").textContent, /最多选择 100 项/);
+    click(window, '[data-action="close-entity-picker"]');
+  }
+});
+
+test("hydrated off-cursor actor and group selections keep name plus ID and accessible removal labels", async (t) => {
+  const window = await createApp("condition-library");
+  t.after(() => window.close());
+  const source = window.MvuUi.state.demoStore.conditions.find((condition) => condition.id === "demo-condition-20");
+  source.expression = {
+    kind: "and",
+    children: [
+      { kind: "predicate", predicate: { kind: "actor", actorIds: ["picker-actor-095", "picker-actor-096"] } },
+      { kind: "predicate", predicate: { kind: "group", groupIds: ["picker-group-095", "picker-group-096"] } },
+    ],
+  };
+  window.MvuUi.state.entities.clear();
+  window.MvuUi.state.selectedEntityId = source.id;
+  window.MvuUi.resetConditionEditorDraft();
+  await window.MvuUi.navigate("condition-editor");
+
+  for (const [kind, pathValue, labels] of [
+    ["actor", "0", ["游标角色 095 · picker-actor-095", "游标角色 096 · picker-actor-096"]],
+    ["group", "1", ["游标群组 095 · picker-group-095", "游标群组 096 · picker-group-096"]],
+  ]) {
+    click(window, `[data-condition-picker="${kind}"][data-condition-path="${pathValue}"]`);
+    await waitFor(() => window.document.querySelector(".entity-picker .picker-pinned-item"), `${kind} hydrated selection was not pinned`);
+    const picker = window.document.querySelector(".entity-picker");
+    for (const label of labels) {
+      assert.match(picker.textContent, new RegExp(label));
+      assert.ok(Array.from(picker.querySelectorAll(".picker-pinned-item button")).some((button) => button.getAttribute("aria-label").includes(label)), `${label} lacks an accessible removal label`);
+    }
+    click(window, '[data-action="confirm-entity-picker"]');
+    const summary = window.document.querySelector(`[data-condition-picker="${kind}"][data-condition-path="${pathValue}"]`).textContent;
+    assert.match(summary, new RegExp(labels[0]));
+    assert.doesNotMatch(summary, new RegExp(`${labels[0].split(" · ")[1]} · ${labels[0].split(" · ")[1]}`), `${kind} display ID leaked into the authoritative name cache`);
+  }
+});
+
+test("condition tree rerenders restore focus to the same logical control", async (t) => {
+  const window = await createApp("condition-editor");
+  t.after(() => window.close());
+  Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+  click(window, '[data-action="add-condition-predicate"][data-condition-path=""]');
+  const kindControl = window.document.querySelector('[data-condition-predicate-kind][data-condition-path="0"]');
+  kindControl.focus();
+  change(window, '[data-condition-predicate-kind][data-condition-path="0"]', "message_count");
+  await Promise.resolve();
+  const restoredKind = window.document.querySelector('[data-condition-predicate-kind][data-condition-path="0"]');
+  assert.ok(window.document.activeElement === restoredKind, "predicate type focus was lost after its card rerendered");
+
+  const addButton = window.document.querySelector('[data-action="add-condition-predicate"][data-condition-path=""]');
+  addButton.focus();
+  click(window, '[data-action="add-condition-predicate"][data-condition-path=""]');
+  await Promise.resolve();
+  assert.ok(window.document.activeElement === window.document.querySelector('[data-action="add-condition-predicate"][data-condition-path=""]'), "group toolbar focus was lost after adding a node");
+});
+
+test("condition reference dialog owns initial focus traps Tab closes on Escape and restores its opener", async (t) => {
+  const window = await createApp("condition-library");
+  t.after(() => window.close());
+  input(window, "[data-list-search-route='condition-library']", "主动关心");
+  await waitFor(() => window.document.querySelector("[data-condition-row='condition-1']"), "condition row did not render");
+  const opener = window.document.querySelector("[data-condition-row='condition-1'] [data-action='delete-condition']");
+  opener.focus();
+  opener.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await waitFor(() => window.document.querySelector(".condition-reference-dialog"), "reference dialog did not open");
+  await Promise.resolve();
+  const dialog = window.document.querySelector(".condition-reference-dialog");
+  const focusable = Array.from(dialog.querySelectorAll("button:not([disabled]), input:not([disabled])"));
+  assert.ok(window.document.activeElement === focusable[0], "reference dialog did not receive initial focus");
+  focusable.at(-1).focus();
+  keydown(window, focusable.at(-1), "Tab");
+  assert.ok(window.document.activeElement === focusable[0], "Tab escaped past the end of the dialog");
+  focusable[0].focus();
+  keydown(window, focusable[0], "Tab", { shiftKey: true });
+  assert.ok(window.document.activeElement === focusable.at(-1), "Shift+Tab escaped before the dialog");
+  keydown(window, focusable.at(-1), "Escape");
+  await Promise.resolve();
+  assert.equal(window.document.querySelector(".condition-reference-dialog"), null);
+  assert.ok(window.document.activeElement === window.document.querySelector("[data-condition-row='condition-1'] [data-action='delete-condition']"), "dialog close did not restore the delete opener");
+});
+
 test("condition save failure preserves draft and duplicate submit cannot repeat a committed mutation after refresh failure", async (t) => {
   const window = await createApp("condition-editor");
   t.after(() => window.close());
@@ -527,6 +778,28 @@ test("committed list mutation shows refresh-only recovery and cannot be accident
   assert.equal(window.MvuUi.state.snapshot.revision, 8);
 });
 
+test("stale list mutation loads the authoritative revision and leaves a persistent recovery entry", async (t) => {
+  const window = await createApp("condition-library");
+  t.after(() => window.close());
+  input(window, "[data-list-search-route='condition-library']", "演示条件 20");
+  await waitFor(() => window.document.querySelector("[data-condition-row='demo-condition-20']"), "condition search did not finish");
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let toggleCalls = 0;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "toggleCondition") toggleCalls += 1;
+    return originalCall(method, params);
+  };
+  window.MvuUi.state.demoStore.revision += 1;
+  click(window, "[data-condition-row='demo-condition-20'] [data-action='toggle-condition']");
+  await waitFor(() => window.document.querySelector("[data-condition-list-recovery]"), "stale list mutation did not leave recovery guidance");
+  const recovery = window.document.querySelector("[data-condition-list-recovery]");
+  assert.match(recovery.textContent, /修订冲突|最新修订|权威/);
+  assert.equal(window.MvuUi.state.snapshot.revision, window.MvuUi.state.demoStore.revision, "authoritative revision was not loaded");
+  assert.ok(recovery.querySelector('[data-action="reload-condition-library"]'), "stale state needs a persistent recovery action");
+  click(window, "[data-condition-row='demo-condition-20'] [data-action='toggle-condition']");
+  assert.equal(toggleCalls, 1, "stale mutation repeated while recovery was pending");
+});
+
 test("condition editor CSS stays compact and overflow-safe at 320px and reduced motion", async () => {
   const styles = await readFile(path.join(root, "static", "app_ui", "styles.css"), "utf8");
   assert.match(styles, /\.condition-editor\s*\{[^}]*min-width:\s*0;[^}]*overflow-x:\s*hidden;/s);
@@ -566,6 +839,95 @@ test("every production predicate is exposed as a real editable DOM card, not onl
     window.MvuUi.render();
     assert.ok(document.querySelector(`[data-condition-predicate-kind][data-condition-path="0"] option[value="${kind}"][selected]`));
     for (const selector of selectors) assert.ok(document.querySelector(`[data-condition-node][data-condition-path="0"] ${selector}`), `${kind} is missing ${selector}`);
+  }
+});
+
+test("all 14 predicate cards round-trip DOM input through save payload and authoritative reload", async (t) => {
+  const scenarios = [
+    ["recent_positive", async (window) => {
+      input(window, '[data-condition-prop="count"][data-condition-path="0"]', "3");
+      return { kind: "recent_positive", count: 3 };
+    }],
+    ["long_inactive", async (window) => {
+      input(window, '[data-condition-prop="hours"][data-condition-path="0"]', "12.5");
+      return { kind: "long_inactive", hours: 12.5 };
+    }],
+    ["user_care", async () => ({ kind: "user_care" })],
+    ["special_day", async () => ({ kind: "special_day" })],
+    ["high_frequency", async (window) => {
+      input(window, '[data-condition-prop="messages"][data-condition-path="0"]', "8");
+      input(window, '[data-condition-prop="windowHours"][data-condition-path="0"]', "6.5");
+      input(window, '[data-condition-prop="bucketHours"][data-condition-path="0"]', "1.25");
+      return { kind: "high_frequency", messages: 8, windowHours: 6.5, bucketHours: 1.25 };
+    }],
+    ["field_comparison", async (window) => {
+      const fieldId = await chooseFirstConditionPickerItem(window, "field", "0", false);
+      change(window, '[data-condition-prop="operator"][data-condition-path="0"]', "<");
+      input(window, '[data-condition-prop="value"][data-condition-path="0"]', "-3.5");
+      return { kind: "field_comparison", fieldId, operator: "<", value: -3.5 };
+    }],
+    ["message_count", async (window) => {
+      input(window, '[data-condition-prop="count"][data-condition-path="0"]', "7");
+      input(window, '[data-condition-prop="windowHours"][data-condition-path="0"]', "2.5");
+      change(window, '[data-condition-prop="sender"][data-condition-path="0"]', "character");
+      return { kind: "message_count", count: 7, windowHours: 2.5, sender: "character" };
+    }],
+    ["keywords", async (window) => {
+      input(window, '[data-condition-prop="includeAny"][data-condition-path="0"]', "关心，照顾");
+      input(window, '[data-condition-prop="includeAll"][data-condition-path="0"]', "真诚");
+      input(window, '[data-condition-prop="exclude"][data-condition-path="0"]', "讽刺");
+      input(window, '[data-condition-prop="windowHours"][data-condition-path="0"]', "4.5");
+      setChecked(window, '[data-condition-prop="caseSensitive"][data-condition-path="0"]', true);
+      return { kind: "keywords", includeAny: ["关心", "照顾"], includeAll: ["真诚"], exclude: ["讽刺"], windowHours: 4.5, caseSensitive: true };
+    }],
+    ["sender", async (window) => {
+      setChecked(window, '[data-condition-sender="character"][data-condition-path="0"]', true);
+      return { kind: "sender", senders: ["user", "character"] };
+    }],
+    ["actor", async (window) => ({ kind: "actor", actorIds: [await chooseFirstConditionPickerItem(window, "actor", "0", true)] })],
+    ["group", async (window) => ({ kind: "group", groupIds: [await chooseFirstConditionPickerItem(window, "group", "0", true)] })],
+    ["concrete_date", async (window) => {
+      input(window, '[data-condition-prop="dates"][data-condition-path="0"]', "2024-02-29，2026-08-26");
+      return { kind: "concrete_date", dates: ["2024-02-29", "2026-08-26"] };
+    }],
+    ["repeating_date", async (window) => {
+      input(window, '[data-condition-prop="month"][data-condition-path="0"]', "2");
+      input(window, '[data-condition-prop="day"][data-condition-path="0"]', "29");
+      return { kind: "repeating_date", month: 2, day: 29 };
+    }],
+    ["ai_semantic", async (window) => {
+      input(window, '[data-condition-prop="triggerType"][data-condition-path="0"]', "自定义边界事件");
+      input(window, '[data-condition-prop="requirement"][data-condition-path="0"]', "观察到明确且可验证的关系转折。");
+      input(window, '[data-condition-prop="minimumConfidence"][data-condition-path="0"]', "0.87");
+      return {
+        kind: "ai_semantic",
+        id: window.document.querySelector('[data-condition-ai-id][data-condition-path="0"]').textContent.trim(),
+        triggerType: "自定义边界事件",
+        requirement: "观察到明确且可验证的关系转折。",
+        minimumConfidence: 0.87,
+      };
+    }],
+  ];
+
+  for (const [kind, applyInputs] of scenarios) {
+    const window = await createApp("condition-editor");
+    t.after(() => window.close());
+    Object.defineProperty(window.document, "startViewTransition", { configurable: true, value: undefined });
+    const name = `往返 ${kind}`;
+    input(window, '[name="conditionName"]', name);
+    click(window, '[data-action="add-condition-predicate"][data-condition-path=""]');
+    if (kind !== "recent_positive") change(window, '[data-condition-predicate-kind][data-condition-path="0"]', kind);
+    const expected = await applyInputs(window);
+    submit(window);
+    await waitFor(() => window.MvuUi.state.route === "condition-library", `${kind} did not save`);
+    assert.deepEqual(plain(window.MvuUi.state.demoLastRequests.createCondition.condition.expression.children[0].predicate), expected, `${kind} save payload drifted`);
+    const created = window.MvuUi.state.demoStore.conditions.find((condition) => condition.name === name);
+    assert.ok(created, `${kind} was not committed`);
+    window.MvuUi.state.entities.delete("condition:" + created.id);
+    window.MvuUi.state.selectedEntityId = created.id;
+    window.MvuUi.resetConditionEditorDraft();
+    await window.MvuUi.navigate("condition-editor");
+    assert.deepEqual(plain(window.MvuUi.state.conditionEditorDraft.expression.children[0].predicate), expected, `${kind} authoritative reload drifted`);
   }
 });
 
@@ -627,4 +989,62 @@ test("real Chromium has no horizontal overflow at 320px and 130% text with a dep
     await page.close();
   }
   t.diagnostic(`320px condition editor pressure evidence: ${JSON.stringify(evidence)}`);
+});
+
+test("real Chromium opened condition picker has zero footer and internal overflow at 320px and 130% text", async (t) => {
+  const server = await startStaticServer();
+  const address = server.address();
+  const browser = await chromium.launch({ headless: true, executablePath: resolveChromiumExecutable() });
+  t.after(async () => {
+    await browser.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const origin = `http://127.0.0.1:${address.port}`;
+  const evidence = [];
+  for (const scale of [100, 130]) {
+    const page = await browser.newPage({ viewport: { width: 320, height: 1000 } });
+    const file = scale === 130 ? "/tests/fixtures/ui-text-scale.html" : "/dist/app.html";
+    await page.goto(`${origin}${file}?demo=1&route=condition-editor`, { waitUntil: "networkidle" });
+    if (scale === 130) await page.waitForFunction(() => document.documentElement.dataset.fontScaleReady === "130");
+    await page.locator('[data-action="add-condition-predicate"][data-condition-path=""]').click();
+    await page.locator('[data-condition-predicate-kind][data-condition-path="0"]').selectOption("actor");
+    await page.locator('[data-condition-picker="actor"][data-condition-path="0"]').click();
+    await page.locator(".entity-picker .picker-result").first().waitFor();
+    await page.locator(".entity-picker .picker-result").first().click();
+    await page.locator(".entity-picker .picker-pinned-item").waitFor();
+    const metrics = await page.evaluate(() => {
+      const selectors = [
+        ".picker-layer", ".entity-picker", ".entity-picker > header", ".picker-search",
+        "[data-picker-filter-region]", ".picker-filters", "[data-picker-pinned-region]", ".picker-pinned",
+        ".picker-pinned > div", ".picker-pinned-item",
+        ".picker-results", "[data-picker-footer]", "[data-picker-footer] > span",
+        "[data-picker-footer] > div", "[data-picker-footer] button",
+      ];
+      const containers = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector), (element, index) => ({
+        selector: `${selector}:${index}`,
+        overflow: element.scrollWidth - element.clientWidth,
+        left: element.getBoundingClientRect().left,
+        right: element.getBoundingClientRect().right,
+        overflowX: getComputedStyle(element).overflowX,
+      })));
+      return {
+        viewport: innerWidth,
+        documentOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        appOverflow: document.getElementById("appRoot").scrollWidth - document.getElementById("appRoot").clientWidth,
+        pickerOverflowX: getComputedStyle(document.querySelector(".entity-picker")).overflowX,
+        footerOverflowX: getComputedStyle(document.querySelector("[data-picker-footer]")).overflowX,
+        containers,
+      };
+    });
+    assert.notEqual(metrics.pickerOverflowX, "hidden", "picker must not conceal pressure with overflow hidden");
+    assert.notEqual(metrics.footerOverflowX, "hidden", "picker footer must not conceal pressure with overflow hidden");
+    assert.ok(metrics.documentOverflow <= 0 && metrics.appOverflow <= 0, JSON.stringify(metrics));
+    for (const container of metrics.containers) {
+      assert.ok(container.overflow <= 0, JSON.stringify(container));
+      assert.ok(container.left >= -0.5 && container.right <= 320.5, JSON.stringify(container));
+    }
+    evidence.push({ scale, ...metrics });
+    await page.close();
+  }
+  t.diagnostic(`320px opened condition picker pressure evidence: ${JSON.stringify(evidence)}`);
 });

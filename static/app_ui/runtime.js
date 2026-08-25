@@ -224,6 +224,26 @@
     }
   }
 
+  function requireBoundedConditionStrings(value, code, allowEmpty) {
+    requireStringArray(value, code, allowEmpty);
+    if (value.length > 100 || value.some(function (entry) { return entry.length > 256; })) throw new Error(code);
+  }
+
+  function repeatingMonthMaximum(month) {
+    return [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] || 0;
+  }
+
+  function validConcreteConditionDate(value) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value));
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const maximum = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] || 0;
+    return day >= 1 && day <= maximum;
+  }
+
   function requireFinite(value, code) {
     if (!finiteNumber(value)) throw new Error(code);
   }
@@ -562,7 +582,7 @@
     if (kind === "field_comparison") {
       requireString(predicate.fieldId, "MVU_CONDITION_PREDICATE_INVALID");
       requireFinite(predicate.value, "MVU_CONDITION_PREDICATE_INVALID");
-      if (![">=", "<=", ">", "<", "=="].includes(predicate.operator)) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
+      if (!predicate.fieldId || predicate.fieldId.length > 256 || ![">=", "<=", ">", "<", "=="].includes(predicate.operator)) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
       return;
     }
     if (kind === "message_count") {
@@ -573,11 +593,13 @@
       return;
     }
     if (kind === "keywords") {
-      requireStringArray(predicate.includeAny, "MVU_CONDITION_PREDICATE_INVALID", true);
-      requireStringArray(predicate.includeAll, "MVU_CONDITION_PREDICATE_INVALID", true);
-      requireStringArray(predicate.exclude, "MVU_CONDITION_PREDICATE_INVALID", true);
+      requireBoundedConditionStrings(predicate.includeAny, "MVU_CONDITION_PREDICATE_INVALID", true);
+      requireBoundedConditionStrings(predicate.includeAll, "MVU_CONDITION_PREDICATE_INVALID", true);
+      requireBoundedConditionStrings(predicate.exclude, "MVU_CONDITION_PREDICATE_INVALID", true);
       if (predicate.windowHours !== undefined) requireFinite(predicate.windowHours, "MVU_CONDITION_PREDICATE_INVALID");
       if (predicate.caseSensitive !== undefined) requireBoolean(predicate.caseSensitive, "MVU_CONDITION_PREDICATE_INVALID");
+      if (predicate.includeAny.length + predicate.includeAll.length + predicate.exclude.length > 100 ||
+          predicate.windowHours !== undefined && predicate.windowHours < 0) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
       return;
     }
     if (kind === "sender") {
@@ -587,12 +609,16 @@
       }
       return;
     }
-    if (kind === "actor") return requireStringArray(predicate.actorIds, "MVU_CONDITION_PREDICATE_INVALID", false);
-    if (kind === "group") return requireStringArray(predicate.groupIds, "MVU_CONDITION_PREDICATE_INVALID", false);
-    if (kind === "concrete_date") return requireStringArray(predicate.dates, "MVU_CONDITION_PREDICATE_INVALID", false);
+    if (kind === "actor") return requireBoundedConditionStrings(predicate.actorIds, "MVU_CONDITION_PREDICATE_INVALID", false);
+    if (kind === "group") return requireBoundedConditionStrings(predicate.groupIds, "MVU_CONDITION_PREDICATE_INVALID", false);
+    if (kind === "concrete_date") {
+      requireBoundedConditionStrings(predicate.dates, "MVU_CONDITION_PREDICATE_INVALID", false);
+      if (predicate.dates.some(function (date) { return !validConcreteConditionDate(date); })) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
+      return;
+    }
     if (kind === "repeating_date") {
       if (!Number.isInteger(predicate.month) || predicate.month < 1 || predicate.month > 12 ||
-          !Number.isInteger(predicate.day) || predicate.day < 1 || predicate.day > 31) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
+          !Number.isInteger(predicate.day) || predicate.day < 1 || predicate.day > repeatingMonthMaximum(predicate.month)) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
       return;
     }
     if (kind === "ai_semantic") {
@@ -600,7 +626,9 @@
       requireString(predicate.triggerType, "MVU_CONDITION_PREDICATE_INVALID");
       requireString(predicate.requirement, "MVU_CONDITION_PREDICATE_INVALID");
       requireFinite(predicate.minimumConfidence, "MVU_CONDITION_PREDICATE_INVALID");
-      if (predicate.minimumConfidence < 0 || predicate.minimumConfidence > 1) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(predicate.id) || predicate.id.length > 256 || !predicate.triggerType.trim() ||
+          predicate.triggerType.length > 256 || !predicate.requirement.trim() || predicate.requirement.length > 4096 ||
+          predicate.minimumConfidence < 0 || predicate.minimumConfidence > 1) throw new Error("MVU_CONDITION_PREDICATE_INVALID");
       return;
     }
     throw new Error("MVU_CONDITION_PREDICATE_INVALID");
@@ -898,6 +926,7 @@
       definition,
       title: options.title || "选择项目",
       mode: options.mode === "multiple" ? "multiple" : "single",
+      maxSelection: Number.isSafeInteger(options.maxSelection) && options.maxSelection > 0 ? options.maxSelection : null,
       search: "",
       filters: pickerFilters,
       lockedFilterKeys: new Set(Array.isArray(options.lockedFilterKeys) ? options.lockedFilterKeys : []),
@@ -1136,7 +1165,19 @@
     if (picker.selectedIds.has(id)) {
       picker.selectedIds.delete(id);
       picker.selectedItems.delete(id);
+      if (picker.selectionLimitReached) {
+        picker.selectionLimitReached = false;
+        picker.error = "";
+        picker.errorRetryable = true;
+      }
     } else {
+      if (picker.maxSelection !== null && picker.selectedIds.size >= picker.maxSelection) {
+        picker.selectionLimitReached = true;
+        picker.error = "最多选择 " + picker.maxSelection + " 项；请先取消一个已选项再继续。";
+        picker.errorRetryable = false;
+        renderIfReady();
+        return;
+      }
       picker.selectedIds.add(id);
       if (item) picker.selectedItems.set(id, item);
     }

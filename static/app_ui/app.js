@@ -9,6 +9,7 @@
   const BACKGROUND_MAX_EDGE = 1600;
   let toastTimer = 0;
   let pendingSegmentFocusId = "";
+  let pendingConditionFocus = null;
   const listSearchTimers = new Map();
 
   ui.render = render;
@@ -59,6 +60,7 @@
       pendingSegmentFocusId = "";
       if (focusTarget && appRoot.contains(focusTarget)) focusTarget.focus();
     }
+    restorePendingConditionFocus();
     if (ui.state.entityPicker) {
       Promise.resolve().then(function () {
         if (!ui.state.entityPicker) return;
@@ -373,7 +375,7 @@
     } else if (action === "finish-field-template-import") {
       closeFieldTemplateFlow();
     } else if (action === "delete-condition") {
-      await openConditionDelete(element.dataset.conditionId);
+      await openConditionDelete(element.dataset.conditionId, element);
     } else if (action === "confirm-condition-delete") {
       await confirmConditionDelete(element.dataset.conditionId);
     } else if (action === "toggle-condition") {
@@ -402,11 +404,12 @@
       await reloadConditionAfterCommittedSave();
     } else if (action === "reload-condition-library") {
       await reloadConditionLibrary();
+    } else if (action === "retry-condition-references") {
+      await retryConditionEditorReferences();
     } else if (action === "page-condition-references") {
       await pageConditionReferences(Number(element.dataset.referencePageNumber));
     } else if (action === "close-condition-dialog") {
-      ui.state.conditionDeleteDialog = null;
-      render();
+      closeConditionDialog();
     } else if (action === "open-status-actor-picker" || action === "open-status-group-picker") {
       await openStatusPicker(action, element);
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
@@ -439,6 +442,8 @@
       expression: entity ? plainClone(entity.expression) : { kind: "and", children: [] },
       error: "",
       references: null,
+      referenceError: "",
+      referenceLoading: Boolean(entity),
       referencePage: 1,
       referenceSearch: "",
       submitting: false,
@@ -448,15 +453,37 @@
     };
     ui.state.conditionEditorDraft = draft;
     if (entity) {
-      try {
-        const response = await ui.native.call("getConditionReferences", { id: entity.id, page: 1 });
-        draft.references = validateConditionReferenceResponse(response);
-      } catch (error) {
-        draft.referenceError = "引用读取失败：" + conditionErrorMessage(error);
-      }
+      await loadConditionEditorReferences(draft, false);
       await hydrateConditionExpressionLabels(draft.expression);
     }
     return draft;
+  }
+
+  async function loadConditionEditorReferences(draft, shouldRender) {
+    if (!draft || !draft.id || (draft.referenceLoading && shouldRender)) return;
+    draft.referenceLoading = true;
+    draft.referenceError = "";
+    if (shouldRender) render();
+    try {
+      const response = await ui.native.call("getConditionReferences", { id: draft.id, page: 1 });
+      if (ui.state.conditionEditorDraft !== draft) return;
+      draft.references = validateConditionReferenceResponse(response);
+    } catch (error) {
+      if (ui.state.conditionEditorDraft !== draft) return;
+      draft.references = null;
+      draft.referenceError = "引用读取失败：" + conditionErrorMessage(error);
+    } finally {
+      if (ui.state.conditionEditorDraft === draft) {
+        draft.referenceLoading = false;
+        if (shouldRender) render();
+      }
+    }
+  }
+
+  async function retryConditionEditorReferences() {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft || !draft.id || draft.referenceLoading) return;
+    await loadConditionEditorReferences(draft, true);
   }
 
   function plainClone(value) {
@@ -582,11 +609,52 @@
 
   function renderConditionDraftChange(pathValue) {
     const draft = ui.state.conditionEditorDraft;
+    captureConditionFocus(pathValue);
     if (draft) draft.transitionPath = String(pathValue || "");
     void ui.transition(render);
     window.setTimeout(function () {
       if (draft) draft.transitionPath = "__settled__";
     }, 220);
+  }
+
+  function captureConditionFocus(fallbackPath) {
+    const active = document.activeElement;
+    if (!(active instanceof Element) || !active.closest(".condition-tree")) {
+      pendingConditionFocus = null;
+      return;
+    }
+    pendingConditionFocus = {
+      path: active.dataset.conditionPath,
+      fallbackPath: String(fallbackPath || ""),
+      action: active.dataset.action,
+      property: active.dataset.conditionProp,
+      sender: active.dataset.conditionSender,
+      picker: active.dataset.conditionPicker,
+      predicateKind: active.matches("[data-condition-predicate-kind]"),
+    };
+  }
+
+  function restorePendingConditionFocus() {
+    const descriptor = pendingConditionFocus;
+    pendingConditionFocus = null;
+    if (!descriptor) return;
+    const candidates = Array.from(appRoot.querySelectorAll(".condition-tree [data-condition-path]"));
+    let target = candidates.find(function (candidate) {
+      if (candidate.dataset.conditionPath !== descriptor.path) return false;
+      if (descriptor.predicateKind) return candidate.matches("[data-condition-predicate-kind]");
+      if (descriptor.action !== undefined) return candidate.dataset.action === descriptor.action;
+      if (descriptor.property !== undefined) return candidate.dataset.conditionProp === descriptor.property;
+      if (descriptor.sender !== undefined) return candidate.dataset.conditionSender === descriptor.sender;
+      if (descriptor.picker !== undefined) return candidate.dataset.conditionPicker === descriptor.picker;
+      return false;
+    });
+    if (!target) {
+      const fallbackNode = Array.from(appRoot.querySelectorAll("[data-condition-node]")).find(function (node) {
+        return node.dataset.conditionPath === descriptor.fallbackPath;
+      });
+      target = fallbackNode && fallbackNode.querySelector("button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled])");
+    }
+    if (target && typeof target.focus === "function") target.focus();
   }
 
   function captureConditionEditorControl(target) {
@@ -629,7 +697,12 @@
     items.forEach(function (item) {
       const entityType = pickerKind === "field" ? "field" : pickerKind;
       const idKey = pickerKind === "actor" ? "characterId" : pickerKind === "group" ? "characterGroupId" : "id";
-      if (item && item[idKey]) ui.state.entities.set(entityType + ":" + item[idKey], item);
+      if (item && item[idKey]) {
+        const cached = { ...item };
+        if (typeof cached.__conditionSourceName === "string") cached.name = cached.__conditionSourceName;
+        delete cached.__conditionSourceName;
+        ui.state.entities.set(entityType + ":" + item[idKey], cached);
+      }
     });
     draft.error = "";
   }
@@ -637,6 +710,11 @@
   async function saveConditionEditor() {
     const draft = ui.state.conditionEditorDraft;
     if (!draft || draft.submitting || draft.mutationCommitted) return;
+    if (draft.id && (!draft.references || draft.referenceError || draft.referenceLoading)) {
+      draft.error = "影响范围未知，保存已阻止。请重试引用检查，确认受影响规则后再保存。";
+      render();
+      return;
+    }
     let condition;
     try {
       condition = buildConditionInput(draft);
@@ -721,6 +799,7 @@
       if (predicate.bucketHours !== undefined) finite(predicate.bucketHours, "统计桶", Number.EPSILON, false);
     } else if (predicate.kind === "field_comparison") {
       if (!predicate.fieldId) throw new Error("请选择比较字段");
+      if (predicate.fieldId.length > 256) throw new Error("字段 ID 不能超过 256 个字符");
       finite(predicate.value, "字段比较值", -Number.MAX_VALUE, false);
     } else if (predicate.kind === "message_count") {
       finite(predicate.count, "消息数", 0, true); finite(predicate.windowHours, "消息窗口", 0, false);
@@ -730,13 +809,14 @@
       if (words.length > 100 || words.some(function (word) { return !word || word.length > 256; })) throw new Error("关键词总数或长度超出限制");
       if (predicate.windowHours !== undefined) finite(predicate.windowHours, "关键词窗口", 0, false);
     } else if (predicate.kind === "sender" && predicate.senders.length === 0) throw new Error("至少选择一个发送者");
-    else if (predicate.kind === "actor" && predicate.actorIds.length === 0) throw new Error("至少选择一个角色");
-    else if (predicate.kind === "group" && predicate.groupIds.length === 0) throw new Error("至少选择一个群组");
+    else if (predicate.kind === "actor") validateBoundedConditionStrings(predicate.actorIds, "角色", true);
+    else if (predicate.kind === "group") validateBoundedConditionStrings(predicate.groupIds, "群组", true);
     else if (predicate.kind === "concrete_date") {
-      if (!predicate.dates.length || predicate.dates.some(function (date) { return !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date + "T00:00:00Z")); })) throw new Error("请输入有效的具体日期");
+      validateBoundedConditionStrings(predicate.dates, "具体日期", true);
+      if (predicate.dates.some(function (date) { return !isValidConcreteDate(date); })) throw new Error("具体日期无效，请输入真实日历日期");
     } else if (predicate.kind === "repeating_date") {
       finite(predicate.month, "月份", 1, true); finite(predicate.day, "日期", 1, true);
-      if (predicate.month > 12 || predicate.day > 31) throw new Error("重复日期无效");
+      if (predicate.month > 12 || predicate.day > daysInRepeatingMonth(predicate.month)) throw new Error("重复日期无效；2 月最多 29 日，其他月份按实际最大日填写");
     } else if (predicate.kind === "ai_semantic") {
       if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(predicate.id) || predicate.id.length > 256 || aiIds.has(predicate.id)) throw new Error("AI 判断 ID 无效或重复");
       aiIds.add(predicate.id);
@@ -745,6 +825,29 @@
       finite(predicate.minimumConfidence, "最低置信度", 0, false);
       if (predicate.minimumConfidence > 1) throw new Error("最低置信度必须在 0–1 之间");
     }
+  }
+
+  function validateBoundedConditionStrings(values, label, requireOne) {
+    if (!Array.isArray(values) || (requireOne && values.length === 0)) throw new Error("至少选择或填写一个" + label);
+    if (values.length > 100) throw new Error(label + "最多 100 项");
+    if (values.some(function (value) { return typeof value !== "string" || !value || value.length > 256; })) {
+      throw new Error(label + "的每一项必须为 1–256 个字符");
+    }
+  }
+
+  function daysInRepeatingMonth(month) {
+    return [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] || 0;
+  }
+
+  function isValidConcreteDate(value) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value));
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const maximum = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] || 0;
+    return day >= 1 && day <= maximum;
   }
 
   function validateConditionMutationResponse(response, withEntity) {
@@ -776,6 +879,23 @@
           loading: false,
           error: "变更已经提交，但列表刷新失败。请只重新载入，不要重复操作。",
         };
+        render();
+      } else if (/MVU_STALE_REVISION/.test(error instanceof Error ? error.message : String(error))) {
+        const recovery = {
+          kind: "stale",
+          revision: null,
+          loading: false,
+          error: "检测到修订冲突，正在读取最新权威修订。当前操作未提交，请核对列表后再决定是否重试。",
+        };
+        ui.state.conditionListRecovery = recovery;
+        try {
+          await ui.loadSnapshot();
+          await ui.loadRouteData("condition-library");
+          recovery.revision = ui.state.snapshot.revision;
+          recovery.error = "检测到修订冲突，已载入最新权威修订 " + recovery.revision + "。当前操作未提交，请核对列表后再重试。";
+        } catch (refreshError) {
+          recovery.error = "检测到修订冲突，但最新权威修订读取失败。当前操作未提交，请使用下方入口重试载入。";
+        }
         render();
       } else {
         showToast("条件操作失败：" + conditionErrorMessage(error));
@@ -874,11 +994,16 @@
     }));
   }
 
-  async function openConditionDelete(id) {
+  async function openConditionDelete(id, opener) {
     const condition = await ui.getEntity("condition", id);
-    const dialog = { id, name: condition.name, loading: true, error: "", references: [], page: 1, search: "", totalCount: 0, hasMore: false };
+    const dialog = {
+      id, name: condition.name, loading: true, error: "", references: [], page: 1, search: "", totalCount: 0, hasMore: false,
+      restoreFocus: opener || document.activeElement || null,
+      restoreFocusDescriptor: { action: "delete-condition", conditionId: id },
+    };
     ui.state.conditionDeleteDialog = dialog;
     render();
+    focusConditionDialog();
     try {
       const response = await ui.native.call("getConditionReferences", { id, page: 1 });
       validateConditionReferenceResponse(response);
@@ -893,6 +1018,29 @@
       dialog.error = "引用检查失败：" + (error instanceof Error ? error.message : String(error));
     }
     render();
+    focusConditionDialog();
+  }
+
+  function focusConditionDialog() {
+    Promise.resolve().then(function () {
+      const first = appRoot.querySelector(".condition-reference-dialog button:not([disabled]), .condition-reference-dialog input:not([disabled])");
+      if (first) first.focus();
+    });
+  }
+
+  function closeConditionDialog() {
+    const dialog = ui.state.conditionDeleteDialog;
+    if (!dialog) return;
+    ui.state.conditionDeleteDialog = null;
+    render();
+    Promise.resolve().then(function () {
+      const descriptor = dialog.restoreFocusDescriptor;
+      const current = descriptor && Array.from(appRoot.querySelectorAll("[data-action='delete-condition']")).find(function (candidate) {
+        return candidate.dataset.conditionId === descriptor.conditionId;
+      });
+      const target = current || dialog.restoreFocus;
+      if (target && typeof target.focus === "function") target.focus();
+    });
   }
 
   async function pageConditionReferences(page) {
@@ -951,23 +1099,23 @@
   function serializeConditionPredicate(predicate) {
     const kind = predicate.kind;
     if (kind === "user_care" || kind === "special_day") return { kind };
-    if (kind === "recent_positive") return { kind, count: Number(predicate.count) };
-    if (kind === "long_inactive") return { kind, hours: Number(predicate.hours) };
+    if (kind === "recent_positive") return { kind, count: parseRequiredFinite(predicate.count, "最近正向次数") };
+    if (kind === "long_inactive") return { kind, hours: parseRequiredFinite(predicate.hours, "不活跃小时") };
     if (kind === "high_frequency") {
-      const result = { kind, messages: Number(predicate.messages) };
-      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = Number(predicate.windowHours);
-      if (predicate.bucketHours !== undefined && predicate.bucketHours !== "") result.bucketHours = Number(predicate.bucketHours);
+      const result = { kind, messages: parseRequiredFinite(predicate.messages, "高频消息数") };
+      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = parseRequiredFinite(predicate.windowHours, "统计窗口");
+      if (predicate.bucketHours !== undefined && predicate.bucketHours !== "") result.bucketHours = parseRequiredFinite(predicate.bucketHours, "统计桶");
       return result;
     }
-    if (kind === "field_comparison") return { kind, fieldId: predicate.fieldId, operator: predicate.operator, value: Number(predicate.value) };
+    if (kind === "field_comparison") return { kind, fieldId: predicate.fieldId, operator: predicate.operator, value: parseRequiredFinite(predicate.value, "字段比较值") };
     if (kind === "message_count") {
-      const result = { kind, count: Number(predicate.count), windowHours: Number(predicate.windowHours) };
+      const result = { kind, count: parseRequiredFinite(predicate.count, "消息数"), windowHours: parseRequiredFinite(predicate.windowHours, "消息窗口") };
       if (predicate.sender !== undefined && predicate.sender !== "") result.sender = predicate.sender;
       return result;
     }
     if (kind === "keywords") {
       const result = { kind, includeAny: predicate.includeAny.slice(), includeAll: predicate.includeAll.slice(), exclude: predicate.exclude.slice() };
-      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = Number(predicate.windowHours);
+      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = parseRequiredFinite(predicate.windowHours, "关键词窗口");
       if (predicate.caseSensitive !== undefined) result.caseSensitive = Boolean(predicate.caseSensitive);
       return result;
     }
@@ -975,12 +1123,21 @@
     if (kind === "actor") return { kind, actorIds: predicate.actorIds.slice() };
     if (kind === "group") return { kind, groupIds: predicate.groupIds.slice() };
     if (kind === "concrete_date") return { kind, dates: predicate.dates.slice() };
-    if (kind === "repeating_date") return { kind, month: Number(predicate.month), day: Number(predicate.day) };
+    if (kind === "repeating_date") return { kind, month: parseRequiredFinite(predicate.month, "月份"), day: parseRequiredFinite(predicate.day, "日期") };
     if (kind === "ai_semantic") return {
       kind, id: predicate.id, triggerType: predicate.triggerType, requirement: predicate.requirement,
-      minimumConfidence: Number(predicate.minimumConfidence),
+      minimumConfidence: parseRequiredFinite(predicate.minimumConfidence, "最低置信度"),
     };
     throw new Error("不支持的条件类型：" + String(kind || ""));
+  }
+
+  function parseRequiredFinite(value, label) {
+    if (value === null || value === undefined || (typeof value === "string" && value.trim() === "")) {
+      throw new Error(label + "为必填数值，不能为空");
+    }
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed)) throw new Error(label + "数值无效");
+    return parsed;
   }
 
   async function openStatusPicker(action, element) {
@@ -1026,11 +1183,13 @@
       initialIds = [];
     }
     const previous = ui.state.editorSelections[key] || { ids: initialIds, items: [] };
+    const selectedItems = conditionPickerSelectedItems(element.dataset.conditionPicker, previous.ids, previous.items);
     await ui.openEntityPicker({
       ...definition,
       mode: element.dataset.pickerMode || definition.mode,
       selectedIds: previous.ids,
-      selectedItems: previous.items,
+      selectedItems,
+      maxSelection: element.dataset.conditionPicker === "actor" || element.dataset.conditionPicker === "group" ? 100 : undefined,
       opener: element,
       onCommit(ids, items) {
         ui.state.editorSelections[key] = { ids, items };
@@ -1045,6 +1204,25 @@
           }
         }
       },
+    });
+  }
+
+  function conditionPickerSelectedItems(kind, ids, existingItems) {
+    if (!kind) return Array.isArray(existingItems) ? existingItems : [];
+    const idKey = kind === "actor" ? "characterId" : kind === "group" ? "characterGroupId" : "id";
+    const prior = new Map((Array.isArray(existingItems) ? existingItems : []).map(function (item) {
+      return [item && item[idKey], item];
+    }));
+    return ids.map(function (id) {
+      const hydrated = ui.state.entities.get(kind + ":" + id);
+      const item = hydrated || prior.get(id);
+      const name = item && typeof item.__conditionSourceName === "string" ? item.__conditionSourceName
+        : item && typeof item.name === "string" && item.name ? item.name : id;
+      const result = item ? { ...item } : { [idKey]: id };
+      result[idKey] = id;
+      result.name = kind === "actor" || kind === "group" ? name + (name === id ? "" : " · " + id) : name;
+      if (kind === "actor" || kind === "group") result.__conditionSourceName = name;
+      return result;
     });
   }
 
@@ -1084,6 +1262,18 @@
       }
       if (event.key === "Tab" && picker) {
         trapFocus(picker, event);
+        return;
+      }
+    }
+    if (ui.state.conditionDeleteDialog) {
+      const conditionDialog = appRoot.querySelector(".condition-reference-dialog");
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeConditionDialog();
+        return;
+      }
+      if (event.key === "Tab" && conditionDialog) {
+        trapFocus(conditionDialog, event);
         return;
       }
     }

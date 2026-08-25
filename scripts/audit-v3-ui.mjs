@@ -265,6 +265,26 @@ for (const marker of ["ai-stable-id", 'data-condition-prop="triggerType"', 'data
 for (const marker of ["saveConditionEditor", "createCondition", "updateCondition", "expectedRevision", "mutationCommitted", "loadSnapshot"]) {
   requireMatch(files["app.js"], new RegExp(marker), `condition save flow must retain ${marker}`);
 }
+requireMatch(files["pages-rules.js"], /function numberField[\s\S]*?opts\.optional\s*\?\s*""\s*:\s*" required"/,
+  "required condition numbers must retain native required semantics");
+requireMatch(files["app.js"], /function parseRequiredFinite[\s\S]*?value\.trim\(\)\s*===\s*""[\s\S]*?Number\.isFinite/,
+  "condition numeric parsing must reject raw empty strings before finite conversion");
+requireMatch(files["app.js"] + files["runtime.js"], /isValidConcreteDate|validConcreteConditionDate[\s\S]*?leap[\s\S]*?maximum/,
+  "condition dates must use calendar-aware day limits instead of Date.parse rollover");
+requireMatch(files["pages-rules.js"], /按每年公历月日匹配；2 月允许 29 日/,
+  "repeating dates must visibly define leap-day behavior");
+requireMatch(files["runtime.js"], /requireBoundedConditionStrings[\s\S]*?value\.length\s*>\s*100[\s\S]*?entry\.length\s*>\s*256/,
+  "demo condition arrays must match the IPC 100-item and 256-character bounds");
+requireMatch(files["pages-rules.js"] + files["app.js"], /影响范围未知[\s\S]*?retry-condition-references[\s\S]*?保存已阻止/,
+  "failed shared-reference reads must stay unknown, retryable, and save-blocking");
+requireMatch(files["app.js"] + files["runtime.js"], /conditionPickerSelectedItems[\s\S]*?maxSelection:[\s\S]*?100[\s\S]*?最多选择 ["']?\s*\+\s*picker\.maxSelection/,
+  "condition actor/group pickers must hydrate selected labels and hard-stop at 100 items");
+requireMatch(files["app.js"], /captureConditionFocus[\s\S]*?restorePendingConditionFocus/,
+  "condition tree rerenders must restore the logical focused control");
+requireMatch(files["app.js"], /conditionDeleteDialog[\s\S]*?event\.key === "Escape"[\s\S]*?event\.key === "Tab"[\s\S]*?trapFocus/,
+  "condition reference dialog must support Escape and trapped Tab focus");
+requireMatch(files["app.js"] + files["pages-rules.js"], /kind:\s*"stale"[\s\S]*?最新权威修订[\s\S]*?重新核对列表/,
+  "stale condition list mutations must retain authoritative persistent recovery");
 for (const method of ["getEntityById", "copyCondition", "toggleCondition", "deleteCondition", "getConditionReferences"]) {
   requireMatch(files["app.js"] + files["runtime.js"], new RegExp(`["']${method}["']`),
     `condition UI/runtime must call real ${method} IPC`);
@@ -277,6 +297,8 @@ requireMatch(styles, /\.condition-editor\s*\{[^}]*overflow-x:\s*hidden[\s\S]*?\.
   "condition editor cards must remain compact, overflow-safe and use targeted 180–220ms motion");
 requireMatch(styles, /@media\s*\(max-width:\s*350px\)[\s\S]*?\.condition-row-main[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+22px/,
   "condition rows must collapse safely at the 320px pressure width");
+requireMatch(styles, /\.entity-picker\s*\{[^}]*overflow:\s*visible[\s\S]*?@media\s*\(max-width:\s*350px\)[\s\S]*?\.entity-picker\s*>\s*footer\s*\{[^}]*flex-direction:\s*column[\s\S]*?footer\s*>\s*span\s*\{[^}]*white-space:\s*normal/,
+  "condition picker pressure must wrap its footer without hidden horizontal overflow");
 requireMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.condition-node-card[\s\S]*?transition:\s*none\s*!important/,
   "condition card motion must become immediate when reduced motion is requested");
 requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,

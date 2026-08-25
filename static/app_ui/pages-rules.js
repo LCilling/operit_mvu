@@ -39,9 +39,9 @@
       c.emptyState("inbox", "还没有条件库", "创建后会显示在这里。");
     const recovery = ui.state.conditionListRecovery;
     const recoveryPanel = recovery ? '<section class="condition-list-recovery" data-condition-list-recovery role="alert"><span>' + c.icon("sync_problem") +
-      '</span><div><strong>条件操作已经提交</strong><p>' + ui.escapeHtml(recovery.error || "列表刷新失败，请重新载入权威数据。") +
+      '</span><div><strong>' + (recovery.kind === "stale" ? "检测到修订冲突" : "条件操作已经提交") + '</strong><p>' + ui.escapeHtml(recovery.error || "列表刷新失败，请重新载入权威数据。") +
       '</p></div><button type="button" class="button secondary" data-action="reload-condition-library"' + (recovery.loading ? " disabled" : "") +
-      '>' + (recovery.loading ? "正在载入" : "只重新载入") + "</button></section>" : "";
+      '>' + (recovery.loading ? "正在载入" : recovery.kind === "stale" ? "重新核对列表" : "只重新载入") + "</button></section>" : "";
     return '<div class="library-page">' + c.sectionHeading("条件库", "可复用、可查看引用的触发条件",
       '<button type="button" class="text-action" data-new-entity="condition">' + c.icon("add") + "新增条件</button>") +
       '<label class="search-field full">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) +
@@ -196,13 +196,15 @@
   function renderSharedConditionReferences(draft) {
     if (!draft.id) return "";
     const response = draft.references;
-    const error = draft.referenceError ? '<p class="inline-error" role="alert">' + ui.escapeHtml(draft.referenceError) + "</p>" : "";
+    const unknown = Boolean(draft.referenceError || (!response && !draft.referenceLoading));
+    const error = unknown ? '<div class="condition-reference-unknown" role="alert"><p class="inline-error">影响范围未知。' +
+      ui.escapeHtml(draft.referenceError || "尚未完成引用检查") + '</p><button type="button" class="button secondary" data-action="retry-condition-references">重试引用检查</button></div>' : "";
     const items = response && Array.isArray(response.items) ? response.items : [];
-    const list = items.length ? '<ul>' + items.map(function (reference) {
+    const list = unknown ? "" : items.length ? '<ul>' + items.map(function (reference) {
       return '<li><strong>' + ui.escapeHtml(reference.name) + '</strong><small>' + ui.escapeHtml(reference.id) + "</small></li>";
     }).join("") + "</ul>" : '<p class="support-copy">当前没有规则引用，保存只影响此条件本身。</p>';
     return '<section class="editor-section condition-shared-refs" data-condition-shared-refs>' +
-      c.sectionHeading("受影响的规则", response ? "编辑前已检查：共 " + response.totalCount + " 条规则引用" : "正在检查共享引用") +
+      c.sectionHeading("受影响的规则", unknown ? "影响范围未知，请重试后再保存" : response ? "编辑前已检查：共 " + response.totalCount + " 条规则引用" : "正在检查共享引用") +
       '<div class="condition-reference-panel">' + error + list + (response && response.hasMore
         ? '<p class="support-copy">引用较多，可在删除检查中分页搜索查看。</p>' : "") + "</div></section>";
   }
@@ -269,7 +271,7 @@
     const opts = options || {};
     return '<label>' + label + '<input type="number" data-condition-prop="' + property + '" data-condition-path="' + pathValue + '"' +
       (opts.optional ? ' data-condition-optional="true"' : "") + (opts.min !== undefined ? ' min="' + opts.min + '"' : "") +
-      (opts.max !== undefined ? ' max="' + opts.max + '"' : "") + (opts.step ? ' step="' + opts.step + '"' : "") + ' value="' +
+      (opts.max !== undefined ? ' max="' + opts.max + '"' : "") + (opts.step ? ' step="' + opts.step + '"' : "") + (opts.optional ? "" : " required") + ' value="' +
       ui.escapeHtml(value === undefined ? "" : value) + '"></label>';
   }
 
@@ -301,7 +303,8 @@
     if (predicate.kind === "group") return conditionPicker("group", pathValue, predicate.groupIds);
     if (predicate.kind === "concrete_date") return keywordField("具体日期（YYYY-MM-DD）", "dates", predicate.dates, pathValue);
     if (predicate.kind === "repeating_date") return '<div class="predicate-grid">' + numberField("月份", "month", predicate.month, pathValue, { min: 1, max: 12, step: 1 }) +
-      numberField("日期", "day", predicate.day, pathValue, { min: 1, max: 31, step: 1 }) + "</div>";
+      numberField("日期", "day", predicate.day, pathValue, { min: 1, max: 31, step: 1 }) +
+      '</div><p class="predicate-note">按每年公历月日匹配；2 月允许 29 日，仅在闰年实际触发。</p>';
     if (predicate.kind === "ai_semantic") return '<div class="ai-predicate-fields"><p class="ai-stable-id">稳定判断 ID <code data-condition-ai-id data-condition-path="' + pathValue + '">' +
       ui.escapeHtml(predicate.id) + '</code></p><label>触发类型<input list="ai-trigger-suggestions" data-condition-prop="triggerType" data-condition-path="' + pathValue + '" maxlength="256" value="' +
       ui.escapeHtml(predicate.triggerType) + '"><datalist id="ai-trigger-suggestions"><option value="情绪变化"><option value="行为意图"><option value="关系事件"><option value="场景事件"></datalist></label>' +
