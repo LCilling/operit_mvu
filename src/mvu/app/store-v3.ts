@@ -1,5 +1,6 @@
 import { klona } from "../port/util";
 import { migrateDatasetV2ToV3 } from "./migration-v3";
+import { hydrateLegacyActiveEffectSnapshots } from "./effect-engine";
 import type {
   AutoRuleCondition,
   DataAutoRule,
@@ -35,6 +36,13 @@ const COMPATIBILITY_RECORD_LIMIT = 500;
 const MAX_SEGMENT_CLEANUP_COUNT = 1_024;
 const runtimePathTails = new Map<string, Promise<void>>();
 const runtimeRecoveryRequired = new Set<string>();
+
+function isMvuDatasetV3Candidate(value: unknown): value is Pick<MvuDatasetV3, "effectGroups" | "activeEffects"> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<MvuDatasetV3>;
+  return candidate.formatVersion === 3 && Array.isArray(candidate.effectGroups) &&
+    Array.isArray(candidate.activeEffects);
+}
 
 export interface V3MvuStoreSnapshot {
   revision: number;
@@ -301,6 +309,7 @@ export class V3MvuStore implements MvuStore {
     if (!(await this.files.exists(path))) throw new Error("MVU_V3_CONFIG_MISSING");
     const raw = await this.files.readText(path);
     const parsed = JSON.parse(raw) as unknown;
+    if (isMvuDatasetV3Candidate(parsed)) hydrateLegacyActiveEffectSnapshots(parsed);
     assertMvuDatasetV3(parsed);
     return { revision: parsed.revision, dataset: klona(parsed) };
   }
@@ -337,6 +346,7 @@ export class V3MvuStore implements MvuStore {
     const committed = klona(next);
     committed.revision = commitRevision;
     committed.recordManifest = staged.manifest;
+    hydrateLegacyActiveEffectSnapshots(committed);
     assertMvuDatasetV3(committed);
     if (supersededPaths.length > 0) {
       const publishedPaths = new Set(committed.recordManifest.segments.map((segment) =>

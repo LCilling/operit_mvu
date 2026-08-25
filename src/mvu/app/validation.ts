@@ -943,6 +943,29 @@ function assertActiveEffectInstanceShape(
     typeof value.reason.text !== "string" || value.reason.text.trim().length === 0) {
     fail("MVU_V3_ACTIVE_EFFECT_REASON_INVALID");
   }
+  if (value.definitionSnapshot !== undefined) {
+    const snapshot = value.definitionSnapshot;
+    if (!isRecord(snapshot) || !hasExactKeys(snapshot, ["name", "description", "updatedAt", "fieldEffects"]) ||
+      typeof snapshot.name !== "string" || snapshot.name.trim().length === 0 ||
+      typeof snapshot.description !== "string" || !isIsoTimestamp(snapshot.updatedAt) ||
+      !Array.isArray(snapshot.fieldEffects) || snapshot.fieldEffects.length === 0) {
+      fail("MVU_V3_ACTIVE_EFFECT_DEFINITION_SNAPSHOT_INVALID");
+    }
+    const snapshotFieldEffects = snapshot.fieldEffects as EffectGroupDefinition["fieldEffects"];
+    assertEffectGroupDefinitionShape({
+      id: value.definitionId,
+      name: snapshot.name,
+      description: snapshot.description,
+      enabled: true,
+      fieldEffects: snapshotFieldEffects,
+      createdAt: snapshot.updatedAt,
+      updatedAt: snapshot.updatedAt,
+    }, fields);
+    if (value.resolvedTargets.some((target) =>
+      !snapshotFieldEffects.some((fieldEffect) => fieldEffect.fieldId === target.fieldId))) {
+      fail("MVU_V3_ACTIVE_EFFECT_DEFINITION_SNAPSHOT_INVALID");
+    }
+  }
 }
 
 function assertEffectDurationShape(value: unknown): asserts value is EffectDuration {

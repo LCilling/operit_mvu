@@ -17,6 +17,7 @@ import type {
   RuleDefinitionV3,
 } from "./model-v3";
 import { assertMvuDatasetV3, normalizeMvuDataset } from "./validation";
+import { hydrateLegacyActiveEffectSnapshots } from "./effect-engine";
 
 const HOURS_IN_MILLISECONDS = 3_600_000;
 const ALL_CHANGE_SOURCES = ["manual", "natural", "per_turn", "rule", "ai"] as const;
@@ -62,6 +63,7 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
     messageFacts,
     hourlyMessageBuckets,
   };
+  hydrateLegacyActiveEffectSnapshots(dataset);
   assertMvuDatasetV3(dataset);
 
   return {

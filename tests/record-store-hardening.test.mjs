@@ -480,9 +480,9 @@ test("legacy effect writes preserve reusable semantics and every active instance
     activatedAt: iso(-30_000),
     reason: { mode: "template", template: "positive", text: "positive" },
   }];
-  await store.transactV3(before.revision, configured, []);
+  const configuredCommit = await store.transactV3(before.revision, configured, []);
   const runtime = createRuntime({ store });
-  const instancesBefore = structuredClone(configured.activeEffects);
+  const instancesBefore = structuredClone(configuredCommit.dataset.activeEffects);
 
   await runtime.service.updateTemporaryEffect("multi", { value: 3 });
 
