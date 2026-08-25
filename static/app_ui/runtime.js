@@ -62,6 +62,7 @@
     entities: new Map(),
     bindingLabels: new Map(),
     ruleLabels: new Map(),
+    conditionMeta: new Map(),
     chartModels: new Map(),
     detailRecords: null,
     listViews: {
@@ -76,6 +77,9 @@
     fieldEditorDraft: null,
     fieldTemplateFlow: null,
     fieldTemplateImportOpener: null,
+    conditionEditorDraft: null,
+    conditionDeleteDialog: null,
+    conditionListRecovery: null,
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -96,7 +100,16 @@
     },
     demoCursorSequence: 0,
     demoCursors: new Map(),
-    demoStore: { revision: 7, fields: null, fieldSequence: 0, stateValues: {} },
+    demoStore: {
+      revision: 7,
+      fields: null,
+      conditions: null,
+      rules: null,
+      fieldSequence: 0,
+      conditionSequence: 0,
+      aiSequence: 0,
+      stateValues: {},
+    },
     demoLastRequests: {},
     demoLastFieldTemplateJson: "",
     demoNextFailureMethod: "",
@@ -216,12 +229,95 @@
   }
 
   function validateNativeMutationRequest(method, params) {
+    if (["createCondition", "updateCondition", "copyCondition", "toggleCondition", "deleteCondition"].includes(method)) {
+      validateConditionMutationRequest(method, params);
+    }
     if (method === "createEffectGroup" && isRecord(params.effectGroup)) {
       validateEffectReasonConfig(params.effectGroup.defaultReason, 512);
     }
     if (method === "updateEffectGroup" && isRecord(params.patch) && params.patch.defaultReason !== undefined) {
       validateEffectReasonConfig(params.patch.defaultReason, 512);
     }
+  }
+
+  function assertRuntimeKeys(value, required, optional, code) {
+    if (!isRecord(value)) throw new Error(code);
+    const allowed = new Set(required.concat(optional || []));
+    if (required.some(function (key) { return !Object.prototype.hasOwnProperty.call(value, key); }) ||
+        Object.keys(value).some(function (key) { return !allowed.has(key); })) throw new Error(code);
+  }
+
+  function validateConditionMutationRequest(method, params) {
+    const code = "MVU_CONDITION_MUTATION_REQUEST_INVALID";
+    if (method === "createCondition") {
+      assertRuntimeKeys(params, ["expectedRevision", "condition"], [], code);
+      validateConditionMutationInput(params.condition, false);
+    } else if (method === "updateCondition") {
+      assertRuntimeKeys(params, ["id", "expectedRevision", "patch"], [], code);
+      requireString(params.id, code);
+      validateConditionMutationInput(params.patch, true);
+    } else if (method === "toggleCondition") {
+      assertRuntimeKeys(params, ["id", "enabled", "expectedRevision"], [], code);
+      requireString(params.id, code); requireBoolean(params.enabled, code);
+    } else {
+      assertRuntimeKeys(params, ["id", "expectedRevision"], [], code);
+      requireString(params.id, code);
+    }
+    if (!nonNegativeInteger(params.expectedRevision)) throw new Error(code);
+  }
+
+  function validateConditionMutationInput(input, patch) {
+    const code = "MVU_CONDITION_INPUT_INVALID";
+    assertRuntimeKeys(input, patch ? [] : ["name", "description", "enabled", "expression"],
+      patch ? ["name", "description", "enabled", "expression"] : [], code);
+    if (Object.prototype.hasOwnProperty.call(input, "name")) {
+      requireString(input.name, code);
+      if (!input.name.trim() || input.name.length > 256) throw new Error(code);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "description")) {
+      requireString(input.description, code);
+      if (input.description.length > 4096) throw new Error(code);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "enabled")) requireBoolean(input.enabled, code);
+    if (Object.prototype.hasOwnProperty.call(input, "expression")) validateExactConditionExpression(input.expression, 0, { nodes: 0 });
+  }
+
+  function validateExactConditionExpression(expression, depth, tracker) {
+    const code = "MVU_CONDITION_EXPRESSION_INVALID";
+    if (depth > 12 || ++tracker.nodes > 100 || !isRecord(expression)) throw new Error(code);
+    if (expression.kind === "and" || expression.kind === "or") {
+      assertRuntimeKeys(expression, ["kind", "children"], [], code);
+      if (!Array.isArray(expression.children) || expression.children.length === 0 || expression.children.length > 100) throw new Error(code);
+      expression.children.forEach(function (child) { validateExactConditionExpression(child, depth + 1, tracker); });
+      return;
+    }
+    if (expression.kind === "not") {
+      assertRuntimeKeys(expression, ["kind", "child"], [], code);
+      validateExactConditionExpression(expression.child, depth + 1, tracker);
+      return;
+    }
+    if (expression.kind !== "predicate") throw new Error(code);
+    assertRuntimeKeys(expression, ["kind", "predicate"], [], code);
+    validateExactConditionPredicate(expression.predicate);
+  }
+
+  function validateExactConditionPredicate(predicate) {
+    const code = "MVU_CONDITION_PREDICATE_INVALID";
+    if (!isRecord(predicate) || typeof predicate.kind !== "string") throw new Error(code);
+    const required = {
+      recent_positive: ["kind", "count"], long_inactive: ["kind", "hours"], user_care: ["kind"], special_day: ["kind"],
+      high_frequency: ["kind", "messages"], field_comparison: ["kind", "fieldId", "operator", "value"],
+      message_count: ["kind", "count", "windowHours"], keywords: ["kind", "includeAny", "includeAll", "exclude"],
+      sender: ["kind", "senders"], actor: ["kind", "actorIds"], group: ["kind", "groupIds"],
+      concrete_date: ["kind", "dates"], repeating_date: ["kind", "month", "day"],
+      ai_semantic: ["kind", "id", "triggerType", "requirement", "minimumConfidence"],
+    }[predicate.kind];
+    if (!required) throw new Error(code);
+    const optional = predicate.kind === "high_frequency" ? ["windowHours", "bucketHours"]
+      : predicate.kind === "message_count" ? ["sender"]
+        : predicate.kind === "keywords" ? ["windowHours", "caseSensitive"] : [];
+    assertRuntimeKeys(predicate, required, optional, code);
+    validateConditionPredicate(predicate);
   }
 
   function validateQueryResponse(value, methodOrLabel, request, cursorState) {
@@ -1108,6 +1204,9 @@
       response.items.forEach(function (field) { state.bindingLabels.set(field.id, field.bindingDisplay); });
     }
     if (policy.key === "rules") await hydrateRuleLabels(response.items);
+    if (policy.key === "conditions" && typeof window.MvuUi.hydrateConditionRows === "function") {
+      await window.MvuUi.hydrateConditionRows(response.items);
+    }
     return response;
   }
 
@@ -1239,6 +1338,10 @@
       };
       if (entityRoutes[routeId] && state.selectedEntityId) {
         await getEntity(entityRoutes[routeId], state.selectedEntityId);
+      }
+      if (routeId === "condition-editor" && typeof window.MvuUi.prepareConditionEditor === "function") {
+        const condition = state.selectedEntityId ? state.entities.get("condition:" + state.selectedEntityId) : null;
+        await window.MvuUi.prepareConditionEditor(condition || null);
       }
     } catch (error) {
       state.routeError = {
@@ -1414,11 +1517,107 @@
         return item[idKey] === params.id;
       }));
     }
+    if (method === "getConditionReferences") {
+      const condition = demo.conditionEntities.find(function (item) { return item.id === params.id; });
+      if (!condition) return Promise.reject(new Error("MVU_CONDITION_NOT_FOUND:" + params.id));
+      const references = demo.ruleEntities.filter(function (rule) { return rule.conditionId === params.id; }).map(function (rule) {
+        return { entityType: "rule", id: rule.id, name: rule.name, relation: "referenced_by" };
+      }).sort(function (left, right) { return left.name.localeCompare(right.name) || left.id.localeCompare(right.id); });
+      return Promise.resolve(demoQuery(references, { page: params.page || 1 }, 10, "id", false));
+    }
+    if (["createCondition", "updateCondition", "copyCondition", "toggleCondition", "deleteCondition"].includes(method)) {
+      return Promise.resolve(demoMutateCondition(method, params, demo));
+    }
     if (method === "exportFieldTemplate") return Promise.resolve(demoExportFieldTemplate(demo, params));
     if (method === "previewFieldTemplateImport") return Promise.resolve(demoPreviewFieldTemplate(demo, params.json));
     if (method === "importFieldTemplate") return Promise.resolve(demoImportFieldTemplate(demo, params));
     if (method === "exportDataset") return Promise.resolve({ formatVersion: 3, demo: true });
     return Promise.resolve(null);
+  }
+
+  function demoMutateCondition(method, params, demo) {
+    if (!Number.isSafeInteger(params.expectedRevision) || params.expectedRevision !== state.demoStore.revision) {
+      throw new Error("MVU_STALE_REVISION:" + params.expectedRevision + ":" + state.demoStore.revision);
+    }
+    const draft = JSON.parse(JSON.stringify(state.demoStore.conditions));
+    const now = new Date().toISOString();
+    let entity = null;
+    if (method === "createCondition") {
+      const occupied = new Set(draft.map(function (condition) { return condition.id; }));
+      let id;
+      do {
+        state.demoStore.conditionSequence += 1;
+        id = "condition_demo_created_" + state.demoStore.conditionSequence;
+      } while (occupied.has(id));
+      entity = { ...JSON.parse(JSON.stringify(params.condition)), id, createdAt: now, updatedAt: now };
+      validateCondition(entity);
+      demoValidateConditionReferences(entity.expression, demo);
+      draft.push(entity);
+    } else {
+      const index = draft.findIndex(function (condition) { return condition.id === params.id; });
+      if (index < 0) throw new Error("MVU_CONDITION_NOT_FOUND:" + params.id);
+      if (method === "updateCondition") {
+        entity = { ...draft[index], ...JSON.parse(JSON.stringify(params.patch || {})), id: params.id, updatedAt: now };
+        validateCondition(entity);
+        demoValidateConditionReferences(entity.expression, demo);
+        draft[index] = entity;
+      } else if (method === "toggleCondition") {
+        entity = { ...draft[index], enabled: params.enabled, updatedAt: now };
+        validateCondition(entity);
+        draft[index] = entity;
+      } else if (method === "copyCondition") {
+        const occupied = new Set(draft.map(function (condition) { return condition.id; }));
+        let id;
+        do {
+          state.demoStore.conditionSequence += 1;
+          id = "condition_demo_copy_" + state.demoStore.conditionSequence;
+        } while (occupied.has(id));
+        entity = { ...JSON.parse(JSON.stringify(draft[index])), id, name: draft[index].name + " 副本", createdAt: now, updatedAt: now };
+        entity.expression = demoCopyConditionExpression(entity.expression);
+        validateCondition(entity);
+        draft.push(entity);
+      } else if (method === "deleteCondition") {
+        if (state.demoStore.rules.some(function (rule) { return rule.conditionId === params.id; })) {
+          throw new Error("MVU_CONDITION_REFERENCED");
+        }
+        draft.splice(index, 1);
+      }
+    }
+    state.demoStore.conditions = draft;
+    state.demoStore.revision += 1;
+    if (method === "deleteCondition") return { revision: state.demoStore.revision };
+    return { revision: state.demoStore.revision, entity: JSON.parse(JSON.stringify(entity)) };
+  }
+
+  function demoCopyConditionExpression(expression) {
+    const result = JSON.parse(JSON.stringify(expression));
+    (function visit(node) {
+      if (node.kind === "predicate" && node.predicate.kind === "ai_semantic") {
+        state.demoStore.aiSequence += 1;
+        node.predicate.id = "ai_demo_copy_" + state.demoStore.aiSequence;
+      } else if (node.kind === "not") visit(node.child);
+      else if (node.kind === "and" || node.kind === "or") node.children.forEach(visit);
+    }(result));
+    return result;
+  }
+
+  function demoValidateConditionReferences(expression, demo) {
+    const fields = new Set(demo.fields.concat(demo.pickerFields).map(function (field) { return field.id; }));
+    const actors = new Set(demo.actors.concat(demo.pickerActors).map(function (actor) { return actor.characterId; }));
+    const groups = new Set(demo.groups.concat(demo.pickerGroups).map(function (group) { return group.characterGroupId; }));
+    const aiIds = new Set();
+    (function visit(node) {
+      if (node.kind === "and" || node.kind === "or") return node.children.forEach(visit);
+      if (node.kind === "not") return visit(node.child);
+      const predicate = node.predicate;
+      if (predicate.kind === "field_comparison" && !fields.has(predicate.fieldId)) throw new Error("MVU_CONDITION_FIELD_NOT_FOUND:" + predicate.fieldId);
+      if (predicate.kind === "actor" && predicate.actorIds.some(function (id) { return !actors.has(id); })) throw new Error("MVU_CONDITION_ACTOR_NOT_FOUND");
+      if (predicate.kind === "group" && predicate.groupIds.some(function (id) { return !groups.has(id); })) throw new Error("MVU_CONDITION_GROUP_NOT_FOUND");
+      if (predicate.kind === "ai_semantic") {
+        if (aiIds.has(predicate.id)) throw new Error("MVU_V3_CONDITION_AI_ID_DUPLICATE");
+        aiIds.add(predicate.id);
+      }
+    }(expression));
   }
 
   function demoExportFieldTemplate(demo, request) {
@@ -1990,8 +2189,10 @@
     const initialFields = [field].concat(demoFields);
     if (!state.demoStore.fields) state.demoStore.fields = JSON.parse(JSON.stringify(initialFields));
     const allFields = state.demoStore.fields.map(projectFieldForDemo);
-    const allRuleEntities = ruleEntities.concat(demoRuleEntities);
-    const allConditionEntities = conditionEntities.concat(demoConditionEntities);
+    if (!state.demoStore.rules) state.demoStore.rules = JSON.parse(JSON.stringify(ruleEntities.concat(demoRuleEntities)));
+    if (!state.demoStore.conditions) state.demoStore.conditions = JSON.parse(JSON.stringify(conditionEntities.concat(demoConditionEntities)));
+    const allRuleEntities = state.demoStore.rules.map(function (rule) { return JSON.parse(JSON.stringify(rule)); });
+    const allConditionEntities = state.demoStore.conditions.map(function (condition) { return JSON.parse(JSON.stringify(condition)); });
     const allEffectEntities = effectEntities.concat(demoEffectEntities);
     const allRecords = records.concat(demoRecords);
     const pickerFields = Array.from({ length: 96 }, function (_value, index) {

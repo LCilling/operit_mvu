@@ -241,6 +241,44 @@ requireMatch(files["app.js"] + files["pages-config.js"], /loading:\s*true[\s\S]*
   "field-template loading state must stay separate from inline error state");
 requireMatch(files["pages-rules.js"], /rule-summary[\s\S]*?触发角色[\s\S]*?触发条件[\s\S]*?触发结果[\s\S]*?>查看<[\s\S]*?>修改</,
   "compact rule rows must show actor, condition and action summaries with view/edit actions");
+const conditionPredicateTokens = [
+  "recent_positive", "long_inactive", "user_care", "special_day", "high_frequency", "field_comparison",
+  "message_count", "keywords", "sender", "actor", "group", "concrete_date", "repeating_date", "ai_semantic",
+];
+for (const token of conditionPredicateTokens) {
+  requireMatch(files["pages-rules.js"], new RegExp(`["']${token}["']`),
+    `condition editor must expose production predicate token ${token}`);
+}
+requireMatch(files["pages-rules.js"], /conditionLibraryPage[\s\S]*?显示 [\s\S]*?共 [\s\S]*?data-new-entity="condition"[\s\S]*?data-condition-row[\s\S]*?data-open-entity="condition"[\s\S]*?toggle-condition[\s\S]*?data-condition-more/,
+  "condition library must retain ten-row metadata plus visible create/view/toggle/more controls");
+requireMatch(files["pages-rules.js"], /data-condition-expression-summary[\s\S]*?condition-reference-status/,
+  "condition rows must show readable expression and reference status summaries");
+for (const marker of ["condition-reference-dialog", "data-condition-reference-search", "data-condition-reference-meta", 'data-reference-page="previous"', 'data-reference-page="next"']) {
+  requireMatch(files["pages-rules.js"], new RegExp(marker), `condition reference dialog must expose ${marker}`);
+}
+for (const action of ["add-condition-predicate", 'data-condition-group-kind="and"', 'data-condition-group-kind="or"', 'data-condition-group-kind="not"', "change-condition-group", "remove-condition-node"]) {
+  requireMatch(files["pages-rules.js"], new RegExp(action), `recursive condition cards must expose ${action}`);
+}
+for (const marker of ["ai-stable-id", 'data-condition-prop="triggerType"', 'data-condition-prop="requirement"', 'minimumConfidence']) {
+  requireMatch(files["pages-rules.js"], new RegExp(marker), `AI semantic cards must expose ${marker}`);
+}
+for (const marker of ["saveConditionEditor", "createCondition", "updateCondition", "expectedRevision", "mutationCommitted", "loadSnapshot"]) {
+  requireMatch(files["app.js"], new RegExp(marker), `condition save flow must retain ${marker}`);
+}
+for (const method of ["getEntityById", "copyCondition", "toggleCondition", "deleteCondition", "getConditionReferences"]) {
+  requireMatch(files["app.js"] + files["runtime.js"], new RegExp(`["']${method}["']`),
+    `condition UI/runtime must call real ${method} IPC`);
+}
+requireMatch(files["runtime.js"], /validateConditionMutationRequest[\s\S]*?validateExactConditionExpression[\s\S]*?depth\s*>\s*12[\s\S]*?tracker\.nodes\s*>\s*100/,
+  "demo condition mutations must strictly validate recursive depth and total node bounds");
+requireMatch(files["runtime.js"], /demoMutateCondition[\s\S]*?MVU_STALE_REVISION[\s\S]*?MVU_CONDITION_REFERENCED[\s\S]*?demoValidateConditionReferences/,
+  "demo condition CRUD must preserve atomic revisions and reject referenced deletes or invalid references");
+requireMatch(styles, /\.condition-editor\s*\{[^}]*overflow-x:\s*hidden[\s\S]*?\.condition-node-card\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*transition:[^}]*(?:180|200|220)ms/,
+  "condition editor cards must remain compact, overflow-safe and use targeted 180–220ms motion");
+requireMatch(styles, /@media\s*\(max-width:\s*350px\)[\s\S]*?\.condition-row-main[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+22px/,
+  "condition rows must collapse safely at the 320px pressure width");
+requireMatch(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.condition-node-card[\s\S]*?transition:\s*none\s*!important/,
+  "condition card motion must become immediate when reduced motion is requested");
 requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,
   "condition DTO validation must recurse with a hard depth bound");
 requireMatch(files["runtime.js"], /loadDirectory\(state\.snapshot\s*&&\s*state\.snapshot\.activeContext\.groupId\)/,
