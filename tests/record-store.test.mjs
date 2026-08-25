@@ -91,6 +91,23 @@ function lineCount(content) {
   return lines.length;
 }
 
+async function createLegacyUnindexedV3(files, segmentCount = 6) {
+  const seed = v3Store(files);
+  await seed.initialize();
+  const before = await seed.readV3();
+  const next = structuredClone(before.dataset);
+  const firstTargetIndex = (segmentCount - 1) * 500;
+  const source = Array.from({ length: segmentCount * 500 }, (_, index) => changeRecord(index, index < firstTargetIndex
+    ? { fieldId: "field_other", scopeKey: "character:U", actorId: "U", actorName: "U" }
+    : {}));
+  await seed.transactV3(before.revision, next, source);
+  const legacy = JSON.parse(files.snapshot()[V3_PATH]);
+  for (const segment of legacy.recordManifest.segments) delete segment.filterCounts;
+  await files.writeText(V3_PATH, JSON.stringify(legacy, null, 2));
+  files.clearOperations();
+  return { legacy, firstTargetIndex };
+}
+
 test("indexed field-scope record pages keep exact totals with bounded segment reads", async () => {
   const files = createFakeMvuFileApi();
   const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
@@ -116,6 +133,142 @@ test("indexed field-scope record pages keep exact totals with bounded segment re
   assert.equal(reads.length, 1);
   assert.equal(reads[0].startLine, 1);
   assert.equal(reads[0].endLine, 500);
+});
+
+test("startup backfills a legacy v3 record index once and filtered queries read only the needed segment", async () => {
+  const files = createFakeMvuFileApi();
+  const { legacy } = await createLegacyUnindexedV3(files);
+  const store = v3Store(files);
+
+  const status = await store.initialize();
+
+  assert.equal(status.mode, "v3");
+  assert.equal(status.source, "existing");
+  assert.equal(status.indexing, undefined);
+  const persisted = JSON.parse(files.snapshot()[V3_PATH]);
+  assert.equal(persisted.revision, legacy.revision);
+  assert.equal(persisted.recordManifest.segments.every((segment) => segment.filterCounts !== undefined), true);
+  assert.equal(files.operations().filter(({ operation, destination }) =>
+    operation === "replaceAtomically" && destination === V3_PATH).length, 1);
+
+  files.clearOperations();
+  const result = await store.queryRecords({
+    offset: 0,
+    limit: 10,
+    direction: "desc",
+    fieldId: "field_affinity",
+    scopeKey: "character:T",
+  });
+
+  assert.equal(result.totalCount, 500);
+  assert.deepEqual(result.items.map(({ id }) => id), [
+    "record_2999", "record_2998", "record_2997", "record_2996", "record_2995",
+    "record_2994", "record_2993", "record_2992", "record_2991", "record_2990",
+  ]);
+  const recordReads = files.operations().filter(({ operation, path }) =>
+    operation.startsWith("readText") && path.startsWith(RECORD_DIRECTORY));
+  assert.equal(recordReads.length, 1);
+  assert.equal(recordReads[0].operation, "readTextPart");
+  assert.equal(recordReads[0].path, `${RECORD_DIRECTORY}/segment-000006.jsonl`);
+
+  files.clearOperations();
+  const restarted = v3Store(files);
+  assert.equal((await restarted.initialize()).mode, "v3");
+  assert.equal(files.operations().filter(({ operation, destination }) =>
+    operation === "replaceAtomically" && destination === V3_PATH).length, 0);
+});
+
+test("failed legacy index publication keeps v3 authoritative and filtered queries fail closed until restart retries", async () => {
+  const files = createFakeMvuFileApi();
+  const { legacy } = await createLegacyUnindexedV3(files, 3);
+  files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
+  const pendingStore = v3Store(files);
+
+  const pending = await pendingStore.initialize();
+
+  assert.equal(pending.mode, "v3");
+  assert.equal(pending.source, "existing");
+  assert.equal(pending.indexing?.state, "pending");
+  assert.match(pending.indexing?.error.message ?? "", /FAKE_REPLACEATOMICALLY_FAILED/);
+  assert.equal((await pendingStore.readV3()).revision, legacy.revision);
+  files.clearOperations();
+  await assert.rejects(
+    pendingStore.queryRecords({
+      offset: 0,
+      limit: 10,
+      direction: "desc",
+      fieldId: "field_affinity",
+      scopeKey: "character:T",
+    }),
+    /MVU_V3_RECORD_INDEX_UNAVAILABLE/,
+  );
+  assert.equal(files.operations().some(({ operation, path }) =>
+    operation.startsWith("readText") && path.startsWith(RECORD_DIRECTORY)), false);
+
+  const restarted = v3Store(files);
+  const recovered = await restarted.initialize();
+  assert.equal(recovered.mode, "v3");
+  assert.equal(recovered.indexing, undefined);
+  assert.equal(JSON.parse(files.snapshot()[V3_PATH]).recordManifest.segments.every((segment) =>
+    segment.filterCounts !== undefined), true);
+});
+
+test("legacy index backfill CAS never overwrites a changed durable v3 config", async () => {
+  const backing = createFakeMvuFileApi();
+  await createLegacyUnindexedV3(backing, 2);
+  let configReads = 0;
+  const files = {
+    ...backing,
+    async readText(path) {
+      if (path === V3_PATH) {
+        configReads += 1;
+        if (configReads === 2) {
+          const external = JSON.parse(backing.snapshot()[V3_PATH]);
+          external.settings.aiEnabled = false;
+          await backing.writeText(V3_PATH, JSON.stringify(external, null, 2));
+        }
+      }
+      return backing.readText(path);
+    },
+  };
+  const store = v3Store(files);
+
+  const status = await store.initialize();
+
+  assert.equal(status.mode, "v3");
+  assert.equal(status.indexing?.error.code, "MVU_V3_RECORD_INDEX_BACKFILL_STALE");
+  const durable = JSON.parse(backing.snapshot()[V3_PATH]);
+  assert.equal(durable.settings.aiEnabled, false);
+  assert.equal(durable.recordManifest.segments.some((segment) => segment.filterCounts === undefined), true);
+});
+
+test("legacy index backfill preserves a pending Task5 cleanup journal and resumes deletion", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const before = await store.read();
+  const replacement = structuredClone(before.dataset);
+  replacement.records = Array.from({ length: 501 }, (_, index) => changeRecord(index + 1_000));
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  await store.transact(before.revision, replacement);
+  const config = JSON.parse(files.snapshot()[V3_PATH]);
+  const journal = JSON.parse(files.snapshot()[V3_CLEANUP_PATH]);
+  for (const segment of config.recordManifest.segments) delete segment.filterCounts;
+  for (const segment of journal.expectedRecordManifest.segments) delete segment.filterCounts;
+  await files.writeText(V3_PATH, JSON.stringify(config, null, 2));
+  await files.writeText(V3_CLEANUP_PATH, JSON.stringify(journal, null, 2));
+
+  const restarted = v3Store(files, legacy);
+  const status = await restarted.initialize();
+
+  assert.equal(status.mode, "v3");
+  assert.equal(status.indexing, undefined);
+  assert.equal(status.cleanup, undefined);
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], undefined);
+  assert.equal((await restarted.queryRecords({ offset: 0, limit: 1 })).totalCount, 501);
 });
 
 function installProductionHost(t, files, hostSnapshot, modelCalls, registrations, fileCalls) {

@@ -33,6 +33,11 @@ export interface StagedRecordWrite {
   touchedSegmentPaths: string[];
 }
 
+export interface RecordValidationResult {
+  manifest: RecordManifest;
+  indexBackfilled: boolean;
+}
+
 interface StoredRecordLine {
   commitRevision: number;
   record: DataChangeRecord;
@@ -136,10 +141,16 @@ export class SegmentedRecordStore {
     );
   }
 
-  async validateAndRepair(manifest: RecordManifest, committedRevision: number): Promise<void> {
+  async validateAndRepair(
+    manifest: RecordManifest,
+    committedRevision: number,
+  ): Promise<RecordValidationResult> {
     assertRecordManifest(manifest);
     requireRevision(committedRevision);
-    for (const segment of manifest.segments) {
+    const repairedManifest = cloneManifest(manifest);
+    let indexBackfilled = false;
+    for (let position = 0; position < manifest.segments.length; position += 1) {
+      const segment = manifest.segments[position];
       const path = this.segmentPath(segment.fileName);
       if (!(await this.files.exists(path))) {
         throw new Error(`MVU_V3_RECORD_SEGMENT_MISSING:${segment.fileName}`);
@@ -152,7 +163,11 @@ export class SegmentedRecordStore {
       const committedLines = lines.slice(0, segment.committedLineCount);
       const parsed = committedLines.map((line, index) =>
         parseStoredLine(line, segment.fileName, index + 1, committedRevision));
-      validateSegmentMetadata(segment, parsed);
+      const filterCounts = validateSegmentMetadata(segment, parsed);
+      if (segment.filterCounts === undefined) {
+        repairedManifest.segments[position].filterCounts = filterCounts;
+        indexBackfilled = true;
+      }
       if (lines.length > segment.committedLineCount) {
         const temporaryPath = `${path}.repair.tmp.${nextRecordOperationId()}`;
         await publishOwnedTemporaryFile(
@@ -184,6 +199,8 @@ export class SegmentedRecordStore {
     for (const orphanPath of orphanPaths) {
       await this.files.deleteFile(orphanPath);
     }
+    assertRecordManifest(repairedManifest);
+    return { manifest: repairedManifest, indexBackfilled };
   }
 
   async queryRecords(manifest: RecordManifest, request: RecordQueryRequest): Promise<RecordQueryResult> {
@@ -240,17 +257,13 @@ export class SegmentedRecordStore {
     direction: "asc" | "desc",
   ): Promise<RecordQueryResult> {
     const key = recordFilterKey(fieldId, scopeKey);
-    const cached = new Map<number, DataChangeRecord[]>();
+    if (manifest.segments.some((segment) => segment.filterCounts === undefined)) {
+      throw new Error("MVU_V3_RECORD_INDEX_UNAVAILABLE");
+    }
     const matchingCounts: number[] = [];
     for (let index = 0; index < manifest.segments.length; index += 1) {
       const segment = manifest.segments[index];
-      if (segment.filterCounts !== undefined) {
-        matchingCounts.push(segment.filterCounts[key] ?? 0);
-        continue;
-      }
-      const rows = await this.readSegmentRecords(segment);
-      cached.set(index, rows);
-      matchingCounts.push(rows.filter((record) => record.fieldId === fieldId && record.scopeKey === scopeKey).length);
+      matchingCounts.push(segment.filterCounts![key] ?? 0);
     }
     const totalCount = matchingCounts.reduce((sum, count) => sum + count, 0);
     let skip = request.offset ?? 0;
@@ -265,7 +278,7 @@ export class SegmentedRecordStore {
         skip -= count;
         continue;
       }
-      let matches = (cached.get(index) ?? await this.readSegmentRecords(manifest.segments[index]))
+      let matches = (await this.readSegmentRecords(manifest.segments[index]))
         .filter((record) => record.fieldId === fieldId && record.scopeKey === scopeKey);
       if (direction === "desc") matches = matches.reverse();
       const available = matches.slice(skip, skip + remaining);
@@ -470,7 +483,7 @@ function recordFilterKey(fieldId: string, scopeKey: string): string {
 function validateSegmentMetadata(
   metadata: RecordSegmentMetadata,
   lines: readonly StoredRecordLine[],
-): void {
+): Record<string, number> {
   const occurredAt = lines.map((line) => line.record.occurredAt);
   const revisions = lines.map((line) => line.commitRevision);
   if (lines.length !== metadata.committedLineCount ||
@@ -485,17 +498,18 @@ function validateSegmentMetadata(
       throw new Error(`MVU_V3_RECORD_SEGMENT_REVISION_ORDER:${metadata.fileName}`);
     }
   }
+  const actual: Record<string, number> = {};
+  for (const line of lines) {
+    const key = recordFilterKey(line.record.fieldId, line.record.scopeKey);
+    actual[key] = (actual[key] ?? 0) + 1;
+  }
   if (metadata.filterCounts !== undefined) {
-    const actual: Record<string, number> = {};
-    for (const line of lines) {
-      const key = recordFilterKey(line.record.fieldId, line.record.scopeKey);
-      actual[key] = (actual[key] ?? 0) + 1;
-    }
     if (Object.keys(actual).length !== Object.keys(metadata.filterCounts).length ||
       Object.entries(actual).some(([key, count]) => metadata.filterCounts?.[key] !== count)) {
       throw new Error(`MVU_V3_RECORD_SEGMENT_FILTER_METADATA_MISMATCH:${metadata.fileName}`);
     }
   }
+  return actual;
 }
 
 function parseStoredLine(

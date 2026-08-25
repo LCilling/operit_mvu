@@ -65,6 +65,7 @@ export type MigrationStatus =
       source: "existing" | "migrated" | "initialized";
       report?: MigrationResult["report"];
       cleanup?: CleanupPendingStatus;
+      indexing?: CleanupPendingStatus;
     }
   | { mode: "v2_compat"; error: MigrationError };
 
@@ -115,6 +116,7 @@ export class V3MvuStore implements MvuStore {
   private initialization: Promise<MigrationStatus> | undefined;
   private retryInFlight: Promise<MigrationStatus> | undefined;
   private cleanupError: MigrationError | undefined;
+  private indexingError: MigrationError | undefined;
 
   constructor(options: V3MvuStoreOptions) {
     this.getConfigDir = options.getConfigDir;
@@ -184,6 +186,9 @@ export class V3MvuStore implements MvuStore {
   async queryRecords(request: RecordQueryRequest): Promise<RecordQueryResult> {
     const status = await this.initialize();
     if (status.mode !== "v3") throw new V3UnavailableError(status);
+    if (request.fieldId !== undefined && status.indexing !== undefined) {
+      throw new Error("MVU_V3_RECORD_INDEX_UNAVAILABLE");
+    }
     return this.enqueuePath(async () => {
       const snapshot = await this.loadV3Config();
       return this.records.queryRecords(snapshot.dataset.recordManifest, request);
@@ -247,7 +252,23 @@ export class V3MvuStore implements MvuStore {
         let existing: V3MvuStoreSnapshot | undefined;
         try {
           const candidate = await this.loadV3Config();
-          await this.records.validateAndRepair(candidate.dataset.recordManifest, candidate.revision);
+          const validation = await this.records.validateAndRepair(
+            candidate.dataset.recordManifest,
+            candidate.revision,
+          );
+          if (validation.indexBackfilled) {
+            try {
+              await this.persistRecordIndexBackfill(v3Path, candidate, validation.manifest);
+              candidate.dataset.recordManifest = validation.manifest;
+              this.indexingError = undefined;
+            } catch (error) {
+              // A fully validated v3 config remains authoritative even when
+              // its maintenance-only index publication is interrupted.
+              this.indexingError = structuredMigrationError(error);
+            }
+          } else {
+            this.indexingError = undefined;
+          }
           existing = candidate;
         } catch (error) {
           if (!forceRebuild) throw error;
@@ -291,6 +312,7 @@ export class V3MvuStore implements MvuStore {
       await this.persistConfig(v3Path, committed);
       runtimeRecoveryRequired.delete(v3Path);
       this.cleanupError = undefined;
+      this.indexingError = undefined;
       return {
         mode: "v3",
         source: hasV2 ? "migrated" : "initialized",
@@ -411,6 +433,22 @@ export class V3MvuStore implements MvuStore {
     );
   }
 
+  private async persistRecordIndexBackfill(
+    path: string,
+    candidate: V3MvuStoreSnapshot,
+    indexedManifest: RecordManifest,
+  ): Promise<void> {
+    const durable = await this.loadV3Config();
+    if (durable.revision !== candidate.revision ||
+      JSON.stringify(durable.dataset) !== JSON.stringify(candidate.dataset)) {
+      throw new Error("MVU_V3_RECORD_INDEX_BACKFILL_STALE");
+    }
+    const indexed = klona(candidate.dataset);
+    indexed.recordManifest = klona(indexedManifest);
+    assertMvuDatasetV3(indexed);
+    await this.persistConfig(path, indexed);
+  }
+
   private async persistCleanupJournal(journal: SegmentCleanupJournal): Promise<void> {
     const path = this.cleanupPath(this.configDir());
     const temporaryPath = `${path}.tmp.${nextTransactionId()}`;
@@ -428,7 +466,7 @@ export class V3MvuStore implements MvuStore {
     const parsed = JSON.parse(await this.files.readText(journalPath)) as unknown;
     assertSegmentCleanupJournal(parsed, this.records.directoryPath());
     const exactPublication = parsed.expectedRevision === committed.revision &&
-      JSON.stringify(parsed.expectedRecordManifest) === JSON.stringify(committed.recordManifest);
+      recordManifestsMatchWithIndexBackfill(parsed.expectedRecordManifest, committed.recordManifest);
     const descendantPublication = committed.revision > parsed.expectedRevision &&
       isRecordManifestDescendant(parsed.expectedRecordManifest, committed.recordManifest);
     if (!exactPublication && !descendantPublication) {
@@ -471,6 +509,9 @@ export class V3MvuStore implements MvuStore {
     if (status.report !== undefined) decorated.report = status.report;
     if (this.cleanupError !== undefined) {
       decorated.cleanup = { state: "pending", error: { ...this.cleanupError } };
+    }
+    if (this.indexingError !== undefined) {
+      decorated.indexing = { state: "pending", error: { ...this.indexingError } };
     }
     return decorated;
   }
@@ -573,7 +614,7 @@ function isRecordManifestDescendant(
     if (position < lastExpectedPosition ||
       ancestor.committedLineCount === RECORDS_PER_SEGMENT ||
       ancestor.committedLineCount === descendant.committedLineCount) {
-      if (JSON.stringify(ancestor) !== JSON.stringify(descendant)) return false;
+      if (!recordSegmentsMatchWithIndexBackfill(ancestor, descendant)) return false;
       continue;
     }
     if (descendant.committedLineCount < ancestor.committedLineCount ||
@@ -589,6 +630,26 @@ function isRecordManifestDescendant(
     return false;
   }
   return true;
+}
+
+function recordManifestsMatchWithIndexBackfill(
+  expected: RecordManifest,
+  current: RecordManifest,
+): boolean {
+  return expected.recordCount === current.recordCount &&
+    expected.nextSegmentIndex === current.nextSegmentIndex &&
+    expected.segments.length === current.segments.length &&
+    expected.segments.every((segment, index) =>
+      recordSegmentsMatchWithIndexBackfill(segment, current.segments[index]));
+}
+
+function recordSegmentsMatchWithIndexBackfill(
+  expected: RecordManifest["segments"][number],
+  current: RecordManifest["segments"][number],
+): boolean {
+  if (expected.filterCounts !== undefined) return JSON.stringify(expected) === JSON.stringify(current);
+  const { filterCounts: _currentIndex, ...currentWithoutIndex } = current;
+  return JSON.stringify(expected) === JSON.stringify(currentWithoutIndex);
 }
 
 function compatibilitySnapshot(dataset: MvuDatasetV3, records: readonly DataChangeRecord[]): MvuStoreSnapshot {

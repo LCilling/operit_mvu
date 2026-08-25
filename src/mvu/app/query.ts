@@ -239,6 +239,7 @@ export type SnapshotMigrationStatus =
         warningsTruncated: boolean;
       };
       cleanup?: { state: "pending"; error: { code: string; message: string } };
+      indexing?: { state: "pending"; error: { code: string; message: string } };
       truncated: boolean;
     }
   | {
@@ -1414,6 +1415,12 @@ function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationSta
   const cleanupMessage = status.cleanup === undefined
     ? null
     : boundedText(status.cleanup.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
+  const indexingCode = status.indexing === undefined
+    ? null
+    : status.indexing.error.code;
+  const indexingMessage = status.indexing === undefined
+    ? null
+    : boundedText(status.indexing.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
   const warningsTruncated = warnings.length > boundedWarnings.length || anyTruncated(boundedWarnings);
   return {
     mode: "v3",
@@ -1435,7 +1442,13 @@ function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationSta
         error: { code: cleanupCode!, message: cleanupMessage!.value },
       },
     }),
-    truncated: warningsTruncated || cleanupMessage?.truncated === true,
+    ...(status.indexing === undefined ? {} : {
+      indexing: {
+        state: "pending" as const,
+        error: { code: indexingCode!, message: indexingMessage!.value },
+      },
+    }),
+    truncated: warningsTruncated || cleanupMessage?.truncated === true || indexingMessage?.truncated === true,
   };
 }
 

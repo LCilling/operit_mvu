@@ -757,6 +757,7 @@ test("compact snapshot preserves exact identity reference timestamp and color va
   const themeColor = "color(display-p3 0.1 0.2 0.3 / 0.75)";
   const iconProtocol = "custom_protocol_icon_v1_with_suffix";
   const migrationCode = `MVU_${"P".repeat(64)}`;
+  const indexingCode = "MVU_RECORD_INDEX_RETRY";
   const dataset = makeDataset();
   dataset.activeEffects = [];
   dataset.fields = [
@@ -830,6 +831,7 @@ test("compact snapshot preserves exact identity reference timestamp and color va
         mode: "v3",
         source: "existing",
         cleanup: { state: "pending", error: { code: migrationCode, message: "repair pending" } },
+        indexing: { state: "pending", error: { code: indexingCode, message: "index publication pending" } },
       };
     },
   };
@@ -863,6 +865,7 @@ test("compact snapshot preserves exact identity reference timestamp and color va
   assert.equal(snapshot.activeContext.chatId, chatId);
   assert.equal(snapshot.revision, dataset.revision);
   assert.equal(snapshot.migrationStatus.cleanup.error.code, migrationCode);
+  assert.equal(snapshot.migrationStatus.indexing.error.code, indexingCode);
   assert.equal(Number.isFinite(Date.parse(snapshot.pages.rules.items[0].updatedAt)), true);
 
   const roundTrip = await service.getEntityById({ entityType: "field", id: fieldSummary.id });
