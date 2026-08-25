@@ -119,3 +119,8 @@ Task 7: implementation complete (`2c2ccb1`; seven modules, four roots, compact s
 Task 7: local 393×852 visual pass clean after one interaction fix — group selector 1 / actor selector 0 in group mode; four bottom items; static nav; 11.99px card gaps; action/nav overlap 0; transparent back target.
 Task 7: verification clean (`pnpm run build:web`, `pnpm run check`, 134/134, `git diff --check`; Impeccable detector `[]`).
 Task 7: complete pending independent review; Task 8 owns live search/pagination/pickers and Task 9 owns complete editor mutations.
+Task 7: review fix A complete (`4129d58`; runtime import/export contracts, group projections/member filtering, app-owned navigation, per-kind DTO validators).
+Task 7: review fix B complete (`139d4d2`; range validation/preview, exact stage projection, context-before-page filtering, indexed field+scope record queries).
+Task 7: review fix C complete (`d37e64e`; scalable viewport, no forced text zoom, drawer focus trap/restore, roving segmented tabs, avatar/background hardening, 130% fixture).
+Task 7: remediation verification clean (`pnpm run check`, 149/149; `pnpm run build:web`, 9,150,635 bytes; `git diff --check`; Impeccable detector `[]`). Browser matrix 320/360/393/430 plus 130%: horizontal/action overflow 0, action/nav overlap 0, stage/trend gap 11.99px, normalized stage error 0–0.01px.
+Task 7: modified APK/MuMu host acceptance remains Task 11; release target remains 3.0.0 and was not modified here.
