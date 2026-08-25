@@ -142,14 +142,31 @@ Evidence is untracked under `D:\ProjectFile\operit_mvu\.worktrees\mvu-v3-complet
 - `detail-320-130.png` and `detail-430-100.png`
 - `result.json`
 
-The final evidence folder has 11 files with manifest SHA-256 `51266be73fb2380ed8620fb8187689477c3a2c40bb009557c66a45b497cb6361` (sorted `relative-path|length|file-sha256` records).
+The final evidence folder has 11 files: 10 PNG screenshots plus `result.json`. Aggregate evidence hashes are intentionally not recorded because rerunning the bounded smoke refreshes `result.json`; the committed verification contract is the executable smoke script and its 8/8 output.
 
 One final Impeccable detector invocation scanned all changed production UI targets plus the text-scale fixture. It reported one `overused-font` finding for `Roboto`. That heuristic conflicts directly with the approved OperitAI host authority in `D:\ProjectFile\OperitAI\app\src\main\java\com\ai\assistance\operit\ui\theme\Type.kt` (`FontFamily.Default`), so the existing design authority wins: the required Android-default stack is retained, Material Symbols remains icon-only, and there were no other detector findings.
 
 ### Artifact preservation and residuals
 
-- Every one of the 15 pre-existing files in `artifacts/task-8-browser-smoke` still matches the baseline per-file SHA-256 recorded before this round. Its aggregate sorted manifest SHA-256 is `8721de91cab97af41039bdace2b4c1c962c68323c1effbec922009770f0c4a52`.
+- The 15 pre-existing files in `artifacts/task-8-browser-smoke` remained untouched; the refreshed smoke writes only to the separate `artifacts/task-8-remediation-r2` directory.
 - Only `artifacts/task-8-remediation-r2` received new evidence. No artifact path is staged or committed.
 - No local Task 8 server/process remains running.
 - No known Task 8 production, test, DOM, or browser regression remains. The sole detector item is the intentional host-font requirement described above.
 - Modified APK/MuMu and real-host acceptance remain the existing Task 11 gate.
+
+## Independent review fix round 3 — 2026-08-25
+
+The re-review found that `pnpm run test:dom` regenerated `dist/app.html` but the test harness then loaded `static/app_ui/*.js` directly. This allowed a build omission, reordering, or source/build divergence to escape the repository gate.
+
+TDD RED added a built-artifact mutation fixture that removes `components.js` and separately swaps `runtime.js` with `components.js`. Against the old harness, `pnpm run test:dom` failed 1/4 with `Missing expected rejection`, while the three existing live-DOM behavior tests remained green.
+
+Code/test commit `bd96694` removes the source-file list and fallback. The Happy DOM harness now reads the freshly generated `dist/app.html`, requires the exact seven `data-source` scripts in emitted order, installs the built markup, and evaluates those extracted inline script bodies in that same order. Either mutation fails closed with `MVU_BUILT_SCRIPT_ORDER_INVALID`; the three existing next-page focus/scroll, group status-picker, and picker-cache behavior tests are retained.
+
+Fresh verification after the fix:
+
+- `pnpm run test:dom`: PASS, 4/4 (one omission/order mutation test plus three behavior tests); fresh build 9,248,481 bytes.
+- `pnpm run check`: PASS; audits, typecheck, temporary-effects audit, 192/192 Node tests, and the separately reported DOM gate 4/4 all pass.
+- `pnpm run build`: PASS; `dist/app.html` is 9,248,481 UTF-8 bytes.
+- `git diff --check` and the staged code/test diff check: PASS.
+
+No production UI behavior changed in this round. `artifacts/` remains untracked and was neither staged nor modified. Task 9 was not started; modified APK/MuMu and real-host acceptance remain Task 11.
