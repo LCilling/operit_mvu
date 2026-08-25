@@ -16,16 +16,13 @@ export const QUERY_CURSOR_MAX_LENGTH = 96;
 export const PICKER_BATCH_SIZE = 30;
 export const ENTITY_ID_MAX_LENGTH = 256;
 export const MVU_SNAPSHOT_MAX_BYTES = 65_536;
+export const MVU_SNAPSHOT_URI_MAX_BYTES = 2_048;
 const DEFAULT_CURSOR_TTL_MS = 5 * 60_000;
 const DEFAULT_CURSOR_CAPACITY = 128;
-const SNAPSHOT_ID_MAX_CODE_POINTS = 40;
 const SNAPSHOT_NAME_MAX_CODE_POINTS = 28;
 const SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS = 32;
 const SNAPSHOT_REASON_MAX_CODE_POINTS = 40;
-const SNAPSHOT_URI_MAX_CODE_POINTS = 64;
 const SNAPSHOT_CONTEXT_MAX_CODE_POINTS = 40;
-const SNAPSHOT_DATE_MAX_CODE_POINTS = 24;
-const SNAPSHOT_ICON_MAX_CODE_POINTS = 16;
 const SNAPSHOT_MIGRATION_WARNING_LIMIT = 8;
 
 const MANAGEMENT_PAGE_SIZES = {
@@ -197,6 +194,7 @@ export interface SnapshotActorSummary {
   characterId: string;
   name: string;
   avatarUri: string | null;
+  avatarUriUnavailable: boolean;
   enabled: boolean;
   truncated: boolean;
 }
@@ -205,6 +203,7 @@ export interface SnapshotGroupSummary {
   characterGroupId: string;
   name: string;
   avatarUri: string | null;
+  avatarUriUnavailable: boolean;
   truncated: boolean;
 }
 
@@ -249,6 +248,7 @@ export type SnapshotMigrationStatus =
 
 export interface MvuCompactPageSnapshot {
   revision: number;
+  snapshotTruncated: boolean;
   activeContext: SnapshotScopeContext;
   settings: MvuSettings;
   migrationStatus: SnapshotMigrationStatus;
@@ -266,6 +266,13 @@ export interface MvuCompactPageSnapshot {
     group: SnapshotGroupSummary | null;
   };
   contextLabels: SnapshotContextLabels;
+  returnedCount: {
+    fields: number;
+    rules: number;
+    conditions: number;
+    effectGroups: number;
+    records: number;
+  };
   pages: {
     fields: QueryResponse<FieldPageSummary>;
     rules: QueryResponse<RulePageSummary>;
@@ -551,6 +558,7 @@ export class MvuQueryService {
       : groups.find((item) => item.characterGroupId === activeContext.groupId) ?? null;
     const result: MvuCompactPageSnapshot = {
       revision: snapshot.revision,
+      snapshotTruncated: false,
       activeContext: summarizeScopeContext(activeContext),
       settings: klona(dataset.settings),
       migrationStatus: summarizeMigrationStatus(migrationStatus),
@@ -571,6 +579,13 @@ export class MvuQueryService {
         groupName: selectedGroup?.name ?? null,
         chatName: activeContext.actorName.length > 0 ? `${activeContext.actorName} 的会话` : "当前会话",
       }),
+      returnedCount: {
+        fields: fields.items.length,
+        rules: rules.items.length,
+        conditions: conditions.items.length,
+        effectGroups: effectGroups.items.length,
+        records: records.items.length,
+      },
       pages: {
         fields: mapQueryResponse(fields, (field) => summarizeField(field, dataset, activeContext)),
         rules: mapQueryResponse(rules, summarizeRule),
@@ -579,6 +594,7 @@ export class MvuQueryService {
         records: mapQueryResponse(records, summarizeRecord),
       },
     };
+    fitSnapshotToByteBound(result);
     requireSnapshotByteBound(result);
     return result;
   }
@@ -1152,42 +1168,32 @@ function summarizeField(
   dataset: MvuDatasetV3,
   context: StateScopeContext,
 ): FieldPageSummary {
-  const id = boundedText(field.id, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(field.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
   const description = boundedText(field.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
-  const icon = boundedText(field.icon, SNAPSHOT_ICON_MAX_CODE_POINTS);
-  const color = boundedText(field.themeColor, SNAPSHOT_ICON_MAX_CODE_POINTS);
   const scopeKey = contextScopeKey(field, context);
   const value = scopeKey === null
     ? null
     : dataset.stateValues[scopeKey]?.[field.id] ?? field.initialValue;
   const stage = value === null ? null : stageForValue(field, value);
-  const stageId = stage === null ? null : boundedText(stage.id, SNAPSHOT_ID_MAX_CODE_POINTS);
   const stageName = stage === null ? null : boundedText(stage.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
-  const boundedScopeKey = boundedNullableText(scopeKey, SNAPSHOT_CONTEXT_MAX_CODE_POINTS);
-  const actorId = boundedNullableText(context.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const groupId = boundedNullableText(context.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const chatId = boundedNullableText(context.chatId, SNAPSHOT_ID_MAX_CODE_POINTS);
   return {
-    id: id.value,
+    id: field.id,
     name: name.value,
     description: description.value,
     enabled: field.enabled,
     scope: field.scope,
     order: field.order,
     range: { minimum: field.minimum, maximum: field.maximum, step: field.step },
-    theme: { icon: icon.value, color: color.value },
+    theme: { icon: field.icon, color: field.themeColor },
     current: scopeKey === null || value === null || stage === null ? null : {
       value,
-      stage: { id: stageId!.value, name: stageName!.value, threshold: stage.threshold },
-      scopeKey: boundedScopeKey.value!,
-      actorId: actorId.value,
-      groupId: groupId.value,
-      chatId: chatId.value,
+      stage: { id: stage.id, name: stageName!.value, threshold: stage.threshold },
+      scopeKey,
+      actorId: context.actorId,
+      groupId: context.groupId,
+      chatId: context.chatId,
     },
-    truncated: anyTruncated([
-      id, name, description, icon, color, stageId, stageName, boundedScopeKey, actorId, groupId, chatId,
-    ]),
+    truncated: anyTruncated([name, description, stageName]),
   };
 }
 
@@ -1211,78 +1217,67 @@ function stageForValue(field: DataField, value: number): DataField["stages"][num
 }
 
 function summarizeRule(rule: RuleDefinitionV3): RulePageSummary {
-  const id = boundedText(rule.id, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(rule.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
   const description = boundedText(rule.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
-  const conditionId = boundedText(rule.conditionId, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const updatedAt = boundedText(rule.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: id.value,
+    id: rule.id,
     name: name.value,
     description: description.value,
     enabled: rule.enabled,
-    conditionId: conditionId.value,
+    conditionId: rule.conditionId,
     actionCount: rule.actions.length,
     executionOrder: rule.executionOrder,
-    updatedAt: updatedAt.value,
-    truncated: anyTruncated([id, name, description, conditionId, updatedAt]),
+    updatedAt: rule.updatedAt,
+    truncated: anyTruncated([name, description]),
   };
 }
 
 function summarizeCondition(condition: ConditionDefinition): ConditionPageSummary {
-  const id = boundedText(condition.id, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(condition.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
   const description = boundedText(condition.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
-  const updatedAt = boundedText(condition.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: id.value,
+    id: condition.id,
     name: name.value,
     description: description.value,
     enabled: condition.enabled,
     rootKind: condition.expression.kind,
-    updatedAt: updatedAt.value,
-    truncated: anyTruncated([id, name, description, updatedAt]),
+    updatedAt: condition.updatedAt,
+    truncated: anyTruncated([name, description]),
   };
 }
 
 function summarizeEffectGroup(effectGroup: EffectGroupDefinition): EffectGroupPageSummary {
-  const id = boundedText(effectGroup.id, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(effectGroup.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
   const description = boundedText(effectGroup.description, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
-  const updatedAt = boundedText(effectGroup.updatedAt, SNAPSHOT_DATE_MAX_CODE_POINTS);
   return {
-    id: id.value,
+    id: effectGroup.id,
     name: name.value,
     description: description.value,
     enabled: effectGroup.enabled,
     fieldCount: effectGroup.fieldEffects.length,
-    updatedAt: updatedAt.value,
-    truncated: anyTruncated([id, name, description, updatedAt]),
+    updatedAt: effectGroup.updatedAt,
+    truncated: anyTruncated([name, description]),
   };
 }
 
 function summarizeRecord(record: DataChangeRecord): RecordPageSummary {
-  const id = boundedText(record.id, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const fieldId = boundedText(record.fieldId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const fieldName = boundedText(record.fieldName, SNAPSHOT_NAME_MAX_CODE_POINTS);
-  const actorId = boundedNullableText(record.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const actorName = boundedText(record.actorName, SNAPSHOT_NAME_MAX_CODE_POINTS);
-  const groupId = boundedNullableText(record.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const reason = boundedText(record.reason, SNAPSHOT_REASON_MAX_CODE_POINTS);
   return {
-    id: id.value,
-    fieldId: fieldId.value,
+    id: record.id,
+    fieldId: record.fieldId,
     fieldName: fieldName.value,
-    actorId: actorId.value,
+    actorId: record.actorId,
     actorName: actorName.value,
-    groupId: groupId.value,
+    groupId: record.groupId,
     before: record.before,
     after: record.after,
     delta: record.delta,
     reason: reason.value,
     source: record.source,
     occurredAt: record.occurredAt,
-    truncated: anyTruncated([id, fieldId, fieldName, actorId, actorName, groupId, reason]),
+    truncated: anyTruncated([fieldName, actorName, reason]),
   };
 }
 
@@ -1294,6 +1289,11 @@ interface BoundedText {
 interface BoundedNullableText {
   value: string | null;
   truncated: boolean;
+}
+
+interface BoundedUri {
+  value: string | null;
+  unavailable: boolean;
 }
 
 function boundedText(value: string, maxCodePoints: number): BoundedText {
@@ -1321,46 +1321,51 @@ function boundedNullableText(value: string | null, maxCodePoints: number): Bound
   return boundedText(value, maxCodePoints);
 }
 
+function boundedUri(value: string | null | undefined): BoundedUri {
+  if (value === null || value === undefined) return { value: null, unavailable: false };
+  if (utf8ByteLength(value) > MVU_SNAPSHOT_URI_MAX_BYTES) {
+    return { value: null, unavailable: true };
+  }
+  return { value, unavailable: false };
+}
+
 function anyTruncated(values: readonly (BoundedText | BoundedNullableText | null)[]): boolean {
   return values.some((value) => value?.truncated === true);
 }
 
 function summarizeActor(actor: DataActor): SnapshotActorSummary {
-  const characterId = boundedText(actor.characterId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(actor.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
-  const avatarUri = boundedNullableText(actor.avatarUri ?? null, SNAPSHOT_URI_MAX_CODE_POINTS);
+  const avatarUri = boundedUri(actor.avatarUri);
   return {
-    characterId: characterId.value,
+    characterId: actor.characterId,
     name: name.value,
     avatarUri: avatarUri.value,
+    avatarUriUnavailable: avatarUri.unavailable,
     enabled: actor.enabled,
-    truncated: anyTruncated([characterId, name, avatarUri]),
+    truncated: name.truncated,
   };
 }
 
 function summarizeGroup(group: QueryGroup): SnapshotGroupSummary {
-  const characterGroupId = boundedText(group.characterGroupId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const name = boundedText(group.name, SNAPSHOT_NAME_MAX_CODE_POINTS);
-  const avatarUri = boundedNullableText(group.avatarUri, SNAPSHOT_URI_MAX_CODE_POINTS);
+  const avatarUri = boundedUri(group.avatarUri);
   return {
-    characterGroupId: characterGroupId.value,
+    characterGroupId: group.characterGroupId,
     name: name.value,
     avatarUri: avatarUri.value,
-    truncated: anyTruncated([characterGroupId, name, avatarUri]),
+    avatarUriUnavailable: avatarUri.unavailable,
+    truncated: name.truncated,
   };
 }
 
 function summarizeScopeContext(context: StateScopeContext): SnapshotScopeContext {
-  const chatId = boundedNullableText(context.chatId, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const actorId = boundedNullableText(context.actorId, SNAPSHOT_ID_MAX_CODE_POINTS);
-  const groupId = boundedNullableText(context.groupId, SNAPSHOT_ID_MAX_CODE_POINTS);
   const actorName = boundedText(context.actorName, SNAPSHOT_NAME_MAX_CODE_POINTS);
   return {
-    chatId: chatId.value,
-    actorId: actorId.value,
-    groupId: groupId.value,
+    chatId: context.chatId,
+    actorId: context.actorId,
+    groupId: context.groupId,
     actorName: actorName.value,
-    truncated: anyTruncated([chatId, actorId, groupId, actorName]),
+    truncated: actorName.truncated,
   };
 }
 
@@ -1376,12 +1381,11 @@ function summarizeContextLabels(labels: SnapshotDisplayLabels): SnapshotContextL
 
 function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationStatus {
   if (status.mode === "v2_compat") {
-    const code = boundedText(status.error.code, SNAPSHOT_ID_MAX_CODE_POINTS);
     const message = boundedText(status.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
     return {
       mode: "v2_compat",
-      error: { code: code.value, message: message.value },
-      truncated: anyTruncated([code, message]),
+      error: { code: status.error.code, message: message.value },
+      truncated: message.truncated,
     };
   }
   const warnings = status.report?.warnings ?? [];
@@ -1389,7 +1393,7 @@ function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationSta
     .map((warning) => boundedText(warning, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS));
   const cleanupCode = status.cleanup === undefined
     ? null
-    : boundedText(status.cleanup.error.code, SNAPSHOT_ID_MAX_CODE_POINTS);
+    : status.cleanup.error.code;
   const cleanupMessage = status.cleanup === undefined
     ? null
     : boundedText(status.cleanup.error.message, SNAPSHOT_DESCRIPTION_MAX_CODE_POINTS);
@@ -1411,18 +1415,44 @@ function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationSta
     ...(status.cleanup === undefined ? {} : {
       cleanup: {
         state: "pending" as const,
-        error: { code: cleanupCode!.value, message: cleanupMessage!.value },
+        error: { code: cleanupCode!, message: cleanupMessage!.value },
       },
     }),
-    truncated: warningsTruncated || anyTruncated([cleanupCode, cleanupMessage]),
+    truncated: warningsTruncated || cleanupMessage?.truncated === true,
   };
 }
 
+type SnapshotPageName = keyof MvuCompactPageSnapshot["pages"];
+
+const SNAPSHOT_TRIM_ORDER: readonly SnapshotPageName[] = [
+  "records",
+  "effectGroups",
+  "conditions",
+  "rules",
+  "fields",
+];
+
+function fitSnapshotToByteBound(snapshot: MvuCompactPageSnapshot): void {
+  while (snapshotByteLength(snapshot) > MVU_SNAPSHOT_MAX_BYTES) {
+    const pageName = SNAPSHOT_TRIM_ORDER.find((candidate) => snapshot.pages[candidate].items.length > 0);
+    if (pageName === undefined) throw new Error("MVU_SNAPSHOT_SIZE_LIMIT_EXCEEDED");
+    const page = snapshot.pages[pageName] as QueryResponse<unknown>;
+    page.items.pop();
+    page.loadedCount = page.items.length;
+    page.hasMore = page.items.length < page.totalCount;
+    snapshot.returnedCount[pageName] = page.items.length;
+    snapshot.snapshotTruncated = true;
+  }
+}
+
 function requireSnapshotByteBound(snapshot: MvuCompactPageSnapshot): void {
-  const serialized = JSON.stringify(snapshot);
-  if (utf8ByteLength(serialized) > MVU_SNAPSHOT_MAX_BYTES) {
+  if (snapshotByteLength(snapshot) > MVU_SNAPSHOT_MAX_BYTES) {
     throw new Error("MVU_SNAPSHOT_SIZE_LIMIT_EXCEEDED");
   }
+}
+
+function snapshotByteLength(snapshot: MvuCompactPageSnapshot): number {
+  return utf8ByteLength(JSON.stringify(snapshot));
 }
 
 function utf8ByteLength(value: string): number {
