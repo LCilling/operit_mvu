@@ -73,6 +73,9 @@
     },
     entityPicker: null,
     editorSelections: {},
+    fieldEditorDraft: null,
+    fieldTemplateFlow: null,
+    fieldTemplateImportOpener: null,
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -93,6 +96,10 @@
     },
     demoCursorSequence: 0,
     demoCursors: new Map(),
+    demoStore: { revision: 7, fields: null, fieldSequence: 0 },
+    demoLastRequests: {},
+    demoLastFieldTemplateJson: "",
+    demoNextFailureMethod: "",
   };
 
   const native = createNativeBridge();
@@ -121,6 +128,8 @@
     confirmEntityPicker,
     updateListView,
     getEntity,
+    ensureFieldEditorDraft,
+    resetFieldEditorDraft,
     validateCompactSnapshot,
     validateQueryResponse,
     escapeHtml,
@@ -500,8 +509,22 @@
     if (!Array.isArray(effect.fieldEffects) || effect.fieldEffects.length === 0) throw new Error("MVU_EFFECT_GROUP_INVALID");
     requireString(effect.createdAt, "MVU_EFFECT_GROUP_INVALID");
     requireString(effect.updatedAt, "MVU_EFFECT_GROUP_INVALID");
+    validateEffectReasonConfig(effect.defaultReason);
     if (effect.defaultDuration !== undefined) validateEffectDuration(effect.defaultDuration);
     effect.fieldEffects.forEach(validateFieldEffect);
+  }
+
+  function validateEffectReasonConfig(reason) {
+    const code = "MVU_EFFECT_REASON_CONFIG_INVALID";
+    if (!isRecord(reason)) throw new Error(code);
+    const keys = Object.keys(reason).sort();
+    if (keys.length !== 3 || keys[0] !== "mode" || keys[1] !== "template" || keys[2] !== "text") throw new Error(code);
+    if (!["template", "custom"].includes(reason.mode) ||
+        !["general", "positive", "negative", "environment", "relationship"].includes(reason.template) ||
+        typeof reason.text !== "string" || reason.text.length > 512 ||
+        (reason.mode === "custom" && reason.text.trim().length === 0)) {
+      throw new Error(code);
+    }
   }
 
   function validateEffectDuration(duration) {
@@ -684,6 +707,48 @@
 
   function contextIdentity(context) {
     return [context?.chatId || "", context?.actorId || "", context?.groupId || ""].join("\u0000");
+  }
+
+  function resetFieldEditorDraft() {
+    state.fieldEditorDraft = null;
+    delete state.editorSelections["field-scope-character"];
+    delete state.editorSelections["field-scope-group"];
+  }
+
+  function ensureFieldEditorDraft(field) {
+    const identity = field && field.id ? field.id : "__new__";
+    if (state.fieldEditorDraft && state.fieldEditorDraft.identity === identity) return state.fieldEditorDraft;
+    const snapshot = state.snapshot;
+    const currentChatId = snapshot && snapshot.activeContext.chatId;
+    const source = field || {
+      name: "",
+      description: "",
+      minimum: 0,
+      maximum: 100,
+      step: 1,
+      initialValue: 0,
+      icon: "favorite",
+      themeColor: "#7058d8",
+      enabled: true,
+      scope: "character",
+      modelVisibility: "full",
+      ai: { enabled: false, minConfidence: 0.7, maxDelta: 8, prompt: "" },
+      stages: [{ id: "stage-1", name: "初始", description: "", threshold: 0 }],
+      bindingIds: snapshot && snapshot.activeContext.actorId ? [snapshot.activeContext.actorId] : [],
+      bindingDisplay: snapshot && snapshot.activeContext.actorName ? snapshot.activeContext.actorName : "未绑定",
+      naturalChange: { enabled: false, unitMs: 86400000, amount: 0 },
+      perTurnChange: { enabled: false, intervalTurns: 1, amount: 0, countMode: "both" },
+      order: 0,
+    };
+    const draft = JSON.parse(JSON.stringify(source));
+    draft.identity = identity;
+    draft.bindingIds = Array.isArray(draft.bindingIds) ? draft.bindingIds.slice() : [];
+    draft.stages = Array.isArray(draft.stages) && draft.stages.length
+      ? draft.stages.map(function (stage, index) { return { ...stage, id: stage.id || "stage-" + (index + 1) }; })
+      : [{ id: "stage-1", name: "初始", description: "", threshold: Number(draft.minimum) || 0 }];
+    draft.chatAutoBind = draft.scope === "chat" && Boolean(currentChatId && draft.bindingIds.includes(currentChatId));
+    state.fieldEditorDraft = draft;
+    return draft;
   }
 
   async function query(method, request, label, validationState) {
@@ -1264,8 +1329,26 @@
   });
 
   function demoCall(method, params) {
+    state.demoLastRequests[method] = JSON.parse(JSON.stringify(params || {}));
+    if (state.demoNextFailureMethod === method) {
+      state.demoNextFailureMethod = "";
+      return Promise.reject(new Error("demo host failure: " + method));
+    }
     const demo = demoDataset(params || {});
     if (method === "snapshot") return Promise.resolve(demo.snapshot);
+    if (method === "addField") {
+      const next = { ...JSON.parse(JSON.stringify(params.field)), id: "demo-created-" + (++state.demoStore.fieldSequence), order: state.demoStore.fields.length };
+      state.demoStore.fields.push(next);
+      state.demoStore.revision += 1;
+      return Promise.resolve(JSON.parse(JSON.stringify(next)));
+    }
+    if (method === "updateField") {
+      const index = state.demoStore.fields.findIndex(function (field) { return field.id === params.id; });
+      if (index < 0) return Promise.reject(new Error("MVU_FIELD_NOT_FOUND:" + params.id));
+      state.demoStore.fields[index] = { ...state.demoStore.fields[index], ...JSON.parse(JSON.stringify(params.patch || {})), id: params.id };
+      state.demoStore.revision += 1;
+      return Promise.resolve(null);
+    }
     if (method === "queryActors") {
       const groupId = params && params.filters && params.filters.groupId;
       const picker = isDemoPickerRequest(method, params);
@@ -1312,8 +1395,229 @@
         return item[idKey] === params.id;
       }));
     }
+    if (method === "exportFieldTemplate") return Promise.resolve(demoExportFieldTemplate(demo, params));
+    if (method === "previewFieldTemplateImport") return Promise.resolve(demoPreviewFieldTemplate(demo, params.json));
+    if (method === "importFieldTemplate") return Promise.resolve(demoImportFieldTemplate(demo, params));
     if (method === "exportDataset") return Promise.resolve({ formatVersion: 3, demo: true });
     return Promise.resolve(null);
+  }
+
+  function demoExportFieldTemplate(demo, request) {
+    const candidates = demo.fields.concat(demo.pickerFields);
+    const fields = request.fieldIds.map(function (fieldId) {
+      const field = candidates.find(function (candidate) { return candidate.id === fieldId; });
+      if (!field) throw new Error("MVU_FIELD_TEMPLATE_FIELD_NOT_FOUND:" + fieldId);
+      const matrix = request.targetSelections.find(function (selection) { return selection.fieldId === fieldId; });
+      const directory = field.scope === "group"
+        ? demo.groups.concat(demo.pickerGroups).map(function (item) { return { id: item.characterGroupId, name: item.name }; })
+        : demo.actors.concat(demo.pickerActors).map(function (item) { return { id: item.characterId, name: item.name }; });
+      const sourceTargets = field.scope === "character" || field.scope === "group"
+        ? (matrix ? matrix.targets : []).filter(function (target) { return target.enabled; }).map(function (target) {
+            if (!field.bindingIds.includes(target.targetId)) throw new Error("MVU_FIELD_TEMPLATE_TARGET_NOT_BOUND:" + target.targetId);
+            const local = directory.find(function (entry) { return entry.id === target.targetId; });
+            const sourceTarget = {
+              kind: field.scope === "group" ? "group" : "actor",
+              sourceId: target.targetId,
+              name: local ? local.name : target.targetId,
+              enabled: true,
+            };
+            if (target.includeValue) sourceTarget.value = field.currentValue === null ? field.initialValue : field.currentValue;
+            return sourceTarget;
+          })
+        : [];
+      return {
+        sourceFieldId: field.id,
+        definition: demoPortableFieldDefinition(field),
+        sourceTargets,
+        omittedDependencies: {
+          items: field.id === "affinity"
+            ? [{ kind: "rule", sourceId: "rule-1", readableName: "关心回应" }]
+            : [],
+          totalCount: field.id === "affinity" ? 1 : 0,
+          truncated: false,
+        },
+      };
+    });
+    const document = {
+      format: "operit-mvu-field-template",
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      checksum: { algorithm: "fnv1a32", value: "demo0001" },
+      fields,
+    };
+    state.demoLastFieldTemplateJson = JSON.stringify(document);
+    const fileName = "operit-mvu-field-template-demo-20260825-120000Z.json";
+    return {
+      fileName,
+      savedPath: "/storage/emulated/0/Download/Operit/MVU/" + fileName,
+      summary: {
+        fieldCount: fields.length,
+        targetCount: fields.reduce(function (sum, field) { return sum + field.sourceTargets.length; }, 0),
+        valueCount: fields.reduce(function (sum, field) { return sum + field.sourceTargets.filter(function (target) { return target.value !== undefined; }).length; }, 0),
+      },
+    };
+  }
+
+  function demoPortableFieldDefinition(field) {
+    return {
+      name: field.name,
+      description: field.description,
+      minimum: field.minimum,
+      maximum: field.maximum,
+      step: field.step,
+      initialValue: field.initialValue,
+      icon: field.icon,
+      themeColor: field.themeColor,
+      enabled: field.enabled,
+      scope: field.scope,
+      modelVisibility: field.modelVisibility,
+      ai: JSON.parse(JSON.stringify(field.ai)),
+      stages: JSON.parse(JSON.stringify(field.stages)),
+      naturalChange: JSON.parse(JSON.stringify(field.naturalChange)),
+      perTurnChange: JSON.parse(JSON.stringify(field.perTurnChange)),
+      order: field.order,
+    };
+  }
+
+  function demoPreviewFieldTemplate(demo, json) {
+    let document;
+    try {
+      document = JSON.parse(json);
+    } catch (_error) {
+      throw new Error("MVU_FIELD_TEMPLATE_JSON_INVALID");
+    }
+    if (!document || document.format !== "operit-mvu-field-template" || document.schemaVersion !== 1 || !Array.isArray(document.fields)) {
+      throw new Error("MVU_FIELD_TEMPLATE_FORMAT_INVALID");
+    }
+    const localFields = demo.fields.concat(demo.pickerFields);
+    const actorDirectory = demo.actors.concat(demo.pickerActors);
+    const groupDirectory = demo.groups.concat(demo.pickerGroups);
+    const occupied = new Set(localFields.map(function (field) { return field.id; }));
+    const fields = document.fields.map(function (entry) {
+      const existing = localFields.find(function (field) { return field.id === entry.sourceFieldId; });
+      return {
+        sourceFieldId: entry.sourceFieldId,
+        name: entry.definition.name,
+        scope: entry.definition.scope,
+        conflict: existing ? "id" : "none",
+        proposedCopyId: demoCopyId(entry.sourceFieldId, occupied),
+        updateCompatibility: existing
+          ? { available: existing.scope === entry.definition.scope, localScope: existing.scope, reason: existing.scope === entry.definition.scope ? null : "scope_mismatch" }
+          : { available: false, localScope: null, reason: "no_local_field" },
+        config: {
+          stages: entry.definition.stages.length,
+          naturalChange: entry.definition.naturalChange.enabled,
+          perTurnChange: entry.definition.perTurnChange.enabled,
+          ai: entry.definition.ai.enabled,
+          appearance: Boolean(entry.definition.icon && entry.definition.themeColor),
+        },
+      };
+    });
+    const mappingNeeds = document.fields.filter(function (entry) {
+      return entry.definition.scope === "character" || entry.definition.scope === "group";
+    }).map(function (entry) {
+      const directory = entry.definition.scope === "group" ? groupDirectory : actorDirectory;
+      return {
+        fieldId: entry.sourceFieldId,
+        scope: entry.definition.scope,
+        requiresLocalTargets: entry.sourceTargets.length === 0,
+        templateValueAvailable: entry.sourceTargets.some(function (target) { return target.value !== undefined; }),
+        sourceTargets: entry.sourceTargets.map(function (target) {
+          const exact = directory.find(function (candidate) {
+            return (candidate.characterId || candidate.characterGroupId) === target.sourceId;
+          });
+          const result = {
+            kind: target.kind,
+            sourceId: target.sourceId,
+            name: target.name,
+            hasValue: target.value !== undefined,
+            requiresSearch: !exact,
+          };
+          if (exact) result.suggestedTarget = {
+            targetId: exact.characterId || exact.characterGroupId,
+            name: exact.name,
+            reason: "stable_id",
+          };
+          if (target.value !== undefined) {
+            const adjusted = demoNormalizeTemplateValue(entry.definition, target.value);
+            if (adjusted !== target.value) result.valueAdjustment = {
+              from: target.value,
+              to: adjusted,
+              reason: target.value < entry.definition.minimum || target.value > entry.definition.maximum ? "clamp" : "step",
+            };
+          }
+          return result;
+        }),
+      };
+    });
+    return {
+      valid: true,
+      revision: state.demoStore.revision,
+      format: document.format,
+      schemaVersion: document.schemaVersion,
+      fields,
+      mappingNeeds,
+      omittedDependencies: document.fields.map(function (entry) { return { fieldId: entry.sourceFieldId, ...entry.omittedDependencies }; }),
+      invalidReferences: [],
+    };
+  }
+
+  function demoImportFieldTemplate(_demo, request) {
+    if (request.expectedRevision !== state.demoStore.revision) throw new Error("MVU_STALE_REVISION");
+    const document = JSON.parse(request.json);
+    const summary = { created: [], updated: [], replaced: [], skippedTargets: 0, valueWrites: 0 };
+    const occupied = new Set(state.demoStore.fields.map(function (field) { return field.id; }));
+    document.fields.forEach(function (entry) {
+      const decision = request.decisions.fields.find(function (item) { return item.sourceFieldId === entry.sourceFieldId; }) || { mappings: [] };
+      const strategy = decision.strategy || "create_copy";
+      const existingIndex = state.demoStore.fields.findIndex(function (field) { return field.id === entry.sourceFieldId; });
+      const id = strategy === "create_copy" ? demoCopyId(entry.sourceFieldId, occupied) : entry.sourceFieldId;
+      const targets = [];
+      (decision.unboundTargets || []).forEach(function (target) { targets.push(target); });
+      (decision.mappings || []).forEach(function (mapping) {
+        mapping.targets.forEach(function (target) { targets.push(target); });
+      });
+      const enabledTargets = targets.filter(function (target) { return target.enabled; });
+      summary.skippedTargets += targets.length - enabledTargets.length;
+      summary.valueWrites += enabledTargets.filter(function (target) { return target.valuePolicy === "template_value"; }).length;
+      const local = existingIndex >= 0 ? state.demoStore.fields[existingIndex] : null;
+      const bindingIds = strategy === "update" && local
+        ? local.bindingIds.slice()
+        : Array.from(new Set(enabledTargets.map(function (target) { return target.targetId; })));
+      const next = {
+        ...JSON.parse(JSON.stringify(entry.definition)),
+        id,
+        bindingIds,
+        order: local ? local.order : state.demoStore.fields.length,
+      };
+      if (strategy === "update" && local) {
+        state.demoStore.fields[existingIndex] = { ...next, bindingIds: local.bindingIds.slice(), order: local.order };
+        summary.updated.push(id);
+      } else if (strategy === "replace") {
+        if (existingIndex >= 0) state.demoStore.fields[existingIndex] = next;
+        else state.demoStore.fields.push(next);
+        summary.replaced.push(id);
+      } else {
+        state.demoStore.fields.push(next);
+        summary.created.push(id);
+      }
+      occupied.add(id);
+    });
+    state.demoStore.revision += 1;
+    return { revision: state.demoStore.revision, summary };
+  }
+
+  function demoCopyId(sourceId, occupied) {
+    let candidate = sourceId + "_copy";
+    let suffix = 2;
+    while (occupied.has(candidate)) candidate = sourceId + "_copy_" + suffix++;
+    return candidate;
+  }
+
+  function demoNormalizeTemplateValue(field, value) {
+    const clamped = Math.min(field.maximum, Math.max(field.minimum, value));
+    return Math.min(field.maximum, Math.max(field.minimum,
+      Number((field.minimum + Math.round((clamped - field.minimum) / field.step) * field.step).toPrecision(15))));
   }
 
   function isDemoPickerRequest(method, params) {
@@ -1505,6 +1809,7 @@
     const effectEntities = [{ id: "effect-1", name: "安心陪伴", description: "短期提高正向变化", enabled: true,
       fieldEffects: [{ id: "field_effect_1", fieldId: "affinity", actorSelector: { kind: "trigger_actor" },
         operations: [{ kind: "positive_multiplier", value: 1.1, sources: ["rule"] }] }],
+      defaultReason: { mode: "template", template: "general", text: "" },
       createdAt: timestamp, updatedAt: timestamp }];
     const ruleEntities = [{ id: "rule-1", name: "关心回应", description: "角色收到明确关心时触发", enabled: true,
       triggerActorSelector: { kind: "current_actor" }, conditionId: "condition-1",
@@ -1540,6 +1845,7 @@
       return { id: "demo-effect-" + ordinal, name: "演示效果 " + ordinal, description: "服务端效果查询", enabled: true,
         fieldEffects: [{ id: "demo-field-effect-" + ordinal, fieldId: "demo-field-" + String(index % 12 + 1).padStart(2, "0"),
           actorSelector: { kind: "all_bound" }, operations: [{ kind: "immediate_delta", value: 1 }] }],
+        defaultReason: { mode: "template", template: "general", text: "" },
         createdAt: timestamp, updatedAt: timestamp };
     });
     const demoRecords = Array.from({ length: 20 }, function (_value, index) {
@@ -1573,7 +1879,9 @@
               : candidate.scope === "chat" ? "chat:chat-a" : "global",
       };
     }
-    const allFields = [field].concat(demoFields).map(projectFieldForDemo);
+    const initialFields = [field].concat(demoFields);
+    if (!state.demoStore.fields) state.demoStore.fields = JSON.parse(JSON.stringify(initialFields));
+    const allFields = state.demoStore.fields.map(projectFieldForDemo);
     const allRuleEntities = ruleEntities.concat(demoRuleEntities);
     const allConditionEntities = conditionEntities.concat(demoConditionEntities);
     const allEffectEntities = effectEntities.concat(demoEffectEntities);
@@ -1585,6 +1893,7 @@
         id: "picker-field-" + ordinal,
         name: "游标字段 " + ordinal,
         description: "浏览器高基数字段选择数据",
+        bindingIds: ["picker-actor-001", "picker-actor-002"],
         stages: stages.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }),
         order: index,
       };
@@ -1608,7 +1917,7 @@
       ruleEntities: allRuleEntities, conditionEntities: allConditionEntities, effectEntities: allEffectEntities,
       pickerFields, pickerActors, pickerGroups, pickerRules, pickerConditions, pickerEffects,
       snapshot: {
-        revision: 7, snapshotTruncated: false,
+        revision: state.demoStore.revision, snapshotTruncated: false,
         activeContext: { chatId: "chat-a", actorId: activeActor ? activeActor.characterId : null,
           groupId: requestedGroup.characterGroupId, actorName: activeActor ? activeActor.name : requestedGroup.name, truncated: false },
         settings: { aiEnabled: true }, migrationStatus: { mode: "v3", source: "existing", truncated: false },
