@@ -8,6 +8,7 @@
   const BACKGROUND_MAX_EDGE = 1600;
   let toastTimer = 0;
   let pendingSegmentFocusId = "";
+  const listSearchTimers = new Map();
 
   ui.render = render;
   ui.switchStatusMode = switchStatusMode;
@@ -45,6 +46,19 @@
       const focusTarget = document.getElementById(pendingSegmentFocusId);
       pendingSegmentFocusId = "";
       if (focusTarget && appRoot.contains(focusTarget)) focusTarget.focus();
+    }
+    if (ui.state.entityPicker) {
+      Promise.resolve().then(function () {
+        if (!ui.state.entityPicker) return;
+        const pickerSearch = appRoot.querySelector("[data-picker-search]");
+        if (pickerSearch) {
+          pickerSearch.focus();
+          if (typeof pickerSearch.setSelectionRange === "function") {
+            const end = pickerSearch.value.length;
+            pickerSearch.setSelectionRange(end, end);
+          }
+        }
+      });
     }
   }
 
@@ -96,6 +110,22 @@
       await ui.navigate("field-editor");
       return;
     }
+    const pickerChoice = target.closest("[data-picker-id]");
+    if (pickerChoice) {
+      ui.toggleEntityPickerSelection(pickerChoice.dataset.pickerId);
+      return;
+    }
+    const pageButton = target.closest("[data-page-route]");
+    if (pageButton && !pageButton.disabled) {
+      setBusy(true);
+      try {
+        await ui.updateListView(pageButton.dataset.pageRoute, { page: Number(pageButton.dataset.page) });
+        render({ resetScroll: true });
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     const statusMode = target.closest("[data-status-mode]");
     if (statusMode) {
       await switchStatusMode(statusMode.dataset.statusMode);
@@ -129,7 +159,8 @@
     }
     const actionButton = target.closest("[data-action]");
     if (!actionButton) return;
-    if (target.closest("[data-stop-close]") && actionButton.classList.contains("drawer-layer")) return;
+    if (target.closest("[data-stop-close]") &&
+        (actionButton.classList.contains("drawer-layer") || actionButton.classList.contains("picker-layer"))) return;
     await handleAction(actionButton.dataset.action, actionButton);
   }
 
@@ -164,9 +195,45 @@
     } else if (action === "edit-current-field") {
       ui.state.selectedEntityId = ui.state.selectedFieldId;
       await ui.navigate("field-editor");
-    } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker") {
-      showToast("搜索选择框将在下一步的大数据界面中打开");
+    } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
+      await openPickerForTrigger(action, element);
+    } else if (action === "close-entity-picker") {
+      ui.closeEntityPicker();
+    } else if (action === "retry-entity-picker") {
+      await ui.retryEntityPicker();
+    } else if (action === "confirm-entity-picker") {
+      ui.confirmEntityPicker();
     }
+  }
+
+  async function openPickerForTrigger(action, element) {
+    const definitions = {
+      "open-field-picker": { entity: "fields", title: "选择字段", mode: "single" },
+      "open-actor-picker": { entity: "actors", title: "选择角色", mode: "multiple" },
+      "open-group-picker": { entity: "groups", title: "选择群组", mode: "multiple" },
+      "open-condition-picker": { entity: "conditions", title: "选择条件", mode: "single" },
+      "open-effect-picker": { entity: "effectGroups", title: "选择临时效果", mode: "multiple" },
+    };
+    const definition = definitions[action];
+    const key = element.dataset.pickerKey || action;
+    let initialIds = [];
+    try {
+      const parsed = JSON.parse(element.dataset.pickerSelected || "[]");
+      if (Array.isArray(parsed) && parsed.every(function (id) { return typeof id === "string"; })) initialIds = parsed;
+    } catch (_error) {
+      initialIds = [];
+    }
+    const previous = ui.state.editorSelections[key] || { ids: initialIds, items: [] };
+    await ui.openEntityPicker({
+      ...definition,
+      mode: element.dataset.pickerMode || definition.mode,
+      selectedIds: previous.ids,
+      selectedItems: previous.items,
+      opener: element,
+      onCommit(ids, items) {
+        ui.state.editorSelections[key] = { ids, items };
+      },
+    });
   }
 
   function focusDrawerFirst() {
@@ -184,6 +251,30 @@
   }
 
   function handleAppKeydown(event) {
+    if (ui.state.entityPicker) {
+      const picker = appRoot.querySelector(".entity-picker");
+      if (event.key === "Escape") {
+        event.preventDefault();
+        ui.closeEntityPicker();
+        return;
+      }
+      const results = picker ? Array.from(picker.querySelectorAll("[data-picker-id].picker-result")) : [];
+      const currentResult = event.target instanceof Element ? event.target.closest(".picker-result") : null;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        const search = event.target instanceof Element ? event.target.closest("[data-picker-search]") : null;
+        if (search || currentResult) {
+          event.preventDefault();
+          const current = currentResult ? results.indexOf(currentResult) : (event.key === "ArrowDown" ? -1 : 0);
+          const next = Math.max(0, Math.min(results.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)));
+          if (results[next]) results[next].focus();
+          return;
+        }
+      }
+      if (event.key === "Tab" && picker) {
+        trapFocus(picker, event);
+        return;
+      }
+    }
     const tab = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
     if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
       const tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
@@ -207,7 +298,11 @@
     }
     if (event.key !== "Tab") return;
     const drawer = appRoot.querySelector(".drawer");
-    const focusable = drawer ? Array.from(drawer.querySelectorAll("button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")) : [];
+    if (drawer) trapFocus(drawer, event);
+  }
+
+  function trapFocus(container, event) {
+    const focusable = Array.from(container.querySelectorAll("button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"));
     if (focusable.length === 0) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
@@ -217,6 +312,35 @@
     } else if (!event.shiftKey && document.activeElement === last) {
       event.preventDefault();
       first.focus();
+    }
+  }
+
+  function handleAppInput(event) {
+    handleRangeInput(event);
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    const pickerSearch = target.closest("[data-picker-search]");
+    if (pickerSearch) {
+      ui.searchEntityPicker(pickerSearch.value);
+      return;
+    }
+    const listSearch = target.closest("[data-list-search-route]");
+    if (!listSearch) return;
+    const route = listSearch.dataset.listSearchRoute;
+    if (listSearchTimers.has(route)) window.clearTimeout(listSearchTimers.get(route));
+    listSearchTimers.set(route, window.setTimeout(function () {
+      listSearchTimers.delete(route);
+      void ui.updateListView(route, { search: listSearch.value }).then(function () {
+        render({ resetScroll: true });
+      }).catch(function () { showToast("搜索失败，请重试"); });
+    }, 180));
+  }
+
+  function handleAppScroll(event) {
+    const results = event.target instanceof Element ? event.target.closest("[data-picker-results]") : null;
+    if (!results) return;
+    if (results.scrollTop + results.clientHeight >= results.scrollHeight - 72) {
+      void ui.fetchNextEntityPickerPage();
     }
   }
 
@@ -474,8 +598,9 @@
       showToast("操作失败，请重试");
     });
   });
-  appRoot.addEventListener("input", handleRangeInput);
+  appRoot.addEventListener("input", handleAppInput);
   appRoot.addEventListener("keydown", handleAppKeydown);
+  appRoot.addEventListener("scroll", handleAppScroll, true);
   window.addEventListener("resize", drawCharts);
 
   async function boot() {

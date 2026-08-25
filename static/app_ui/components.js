@@ -43,9 +43,10 @@
   function shell(route, page, options) {
     const action = options && options.action ? '<div class="bottom-action">' + options.action + "</div>" : '<div class="bottom-action" hidden></div>';
     const drawer = ui.state.drawerOpen ? renderDrawer(route.owner) : "";
+    const picker = ui.state.entityPicker ? renderEntityPicker(ui.state.entityPicker) : "";
     return '<section class="app-screen" data-current-route="' + ui.escapeHtml(ui.state.route) + '">' +
       topBar(route) + '<main class="screen-scroll" tabindex="-1"><div class="route-content">' + page + "</div></main>" +
-      action + bottomNav(route.owner) + drawer + "</section>";
+      action + bottomNav(route.owner) + drawer + picker + "</section>";
   }
 
   function renderDrawer(activeRoot) {
@@ -153,9 +154,22 @@
       ui.escapeHtml(description) + '</small></span>' + (meta ? '<em>' + ui.escapeHtml(meta) + "</em>" : "") + icon("chevron_right") + "</button>";
   }
 
-  function listMeta(page, noun) {
-    const start = page.loadedCount === 0 ? 0 : 1;
-    return '<p class="list-meta" aria-live="polite">本页 ' + start + "–" + page.loadedCount + " / 共 " + page.totalCount + " " + ui.escapeHtml(noun) + "</p>";
+  function listMeta(page, noun, currentPage, pageSize, totalCount, filtered) {
+    const pageNumber = currentPage || 1;
+    const size = pageSize || Math.max(1, page.loadedCount);
+    const start = page.loadedCount === 0 ? 0 : (pageNumber - 1) * size + 1;
+    const end = page.loadedCount === 0 ? 0 : start + page.loadedCount - 1;
+    const allCount = Number.isSafeInteger(totalCount) ? totalCount : page.totalCount;
+    const counts = filtered
+      ? " · 匹配 " + page.totalCount + " / 共 " + allCount
+      : " / 共 " + allCount;
+    return '<p class="list-meta" aria-live="polite">本页 ' + start + "–" + end + counts + " " + ui.escapeHtml(noun) + "</p>";
+  }
+
+  function listViewFiltered(view) {
+    if (!view) return false;
+    if (typeof view.search === "string" && view.search.trim()) return true;
+    return Boolean(view.filters && Object.keys(view.filters).length);
   }
 
   function pagination(page, route, currentPage) {
@@ -164,6 +178,63 @@
       ui.escapeHtml(route) + '"' + (pageNumber <= 1 ? " disabled" : "") + '>' + icon("chevron_left") + '上一页</button><span>第 ' +
       pageNumber + ' 页</span><button type="button" data-page="' + (pageNumber + 1) + '" data-page-route="' + ui.escapeHtml(route) + '"' +
       (!page.hasMore ? " disabled" : "") + '>下一页' + icon("chevron_right") + "</button></nav>";
+  }
+
+  function renderEntityPicker(picker) {
+    const multiple = picker.mode === "multiple";
+    const selectedIdList = Array.from(picker.selectedIds);
+    const pinnedLimit = 12;
+    const pinned = selectedIdList.slice(0, pinnedLimit).map(function (id) {
+      const item = picker.selectedItems.get(id) || picker.items.find(function (candidate) {
+        return candidate[picker.definition.idKey] === id;
+      });
+      return '<span class="picker-pinned-item">' + icon("check_circle") + '<span>' +
+        ui.escapeHtml(item ? item.name : "已选项目") + '</span><button type="button" data-picker-id="' + ui.escapeHtml(id) +
+        '" aria-label="取消选择 ' + ui.escapeHtml(item ? item.name : "已选项目") + '">' + icon("close") + "</button></span>";
+    }).join("");
+    const pinnedOverflow = selectedIdList.length > pinnedLimit
+      ? '<span class="picker-pinned-overflow" role="status" aria-label="另 ' + (selectedIdList.length - pinnedLimit) +
+        ' 项已选择">另 ' + (selectedIdList.length - pinnedLimit) + " 项</span>"
+      : "";
+    const rows = picker.items.map(function (item) {
+      const id = item[picker.definition.idKey];
+      const selected = picker.selectedIds.has(id);
+      return '<button type="button" class="picker-result ' + (selected ? "selected" : "") + '" role="option" aria-selected="' + selected +
+        '" data-picker-id="' + ui.escapeHtml(id) + '"><span class="picker-result-mark">' +
+        icon(selected ? (multiple ? "check_box" : "radio_button_checked") : (multiple ? "check_box_outline_blank" : "radio_button_unchecked")) +
+        '</span><span><strong>' + ui.escapeHtml(item.name) + '</strong><small>' + ui.escapeHtml(pickerItemSummary(picker.entity, item)) +
+        "</small></span></button>";
+    }).join("");
+    const status = picker.error
+      ? '<div class="picker-error" role="alert"><span>' + ui.escapeHtml(picker.error) + '</span><button type="button" data-action="retry-entity-picker">重试</button></div>'
+      : picker.loading && picker.items.length === 0
+        ? '<div class="picker-skeleton" aria-label="正在搜索"><i></i><i></i><i></i></div>'
+        : picker.items.length === 0
+          ? '<p class="picker-empty">没有匹配项目，请调整搜索词。</p>'
+          : rows;
+    return '<div class="picker-layer" data-action="close-entity-picker"><section class="entity-picker' + (picker.opening ? " opening" : "") + '" role="dialog" aria-modal="true" aria-labelledby="entity-picker-title" data-stop-close>' +
+      '<header><div><h2 id="entity-picker-title">' + ui.escapeHtml(picker.title) + '</h2><p>输入名称搜索，结果接近底部时自动继续读取。</p></div>' +
+      '<button type="button" class="icon-button" data-action="close-entity-picker" aria-label="关闭选择框">' + icon("close") + "</button></header>" +
+      '<label class="search-field full picker-search">' + icon("search") + '<input type="search" value="' + ui.escapeHtml(picker.search) +
+      '" placeholder="搜索名称" aria-label="搜索' + ui.escapeHtml(picker.title) + '" data-picker-search autocomplete="off"></label>' +
+      (pinned ? '<div class="picker-pinned"><div class="picker-pinned-heading"><strong>已选择 ' + picker.selectedIds.size + "</strong>" +
+        pinnedOverflow + "</div><div>" + pinned + "</div></div>" : "") +
+      '<div class="picker-results" role="listbox" aria-multiselectable="' + multiple + '" data-picker-results tabindex="0">' + status +
+      (picker.loading && picker.items.length ? '<p class="picker-fetching" aria-live="polite">正在继续读取…</p>' : "") + "</div>" +
+      '<footer><span>匹配 ' + picker.totalCount + " 项</span><div>" +
+      '<button type="button" class="button secondary" data-action="close-entity-picker">取消</button>' +
+      (multiple ? '<button type="button" class="button primary" data-action="confirm-entity-picker">确认选择（' + picker.selectedIds.size + "）</button>" : "") +
+      "</div></footer></section></div>";
+  }
+
+  function pickerItemSummary(entity, item) {
+    if (entity === "fields") return (SCOPE_LABELS[item.scope] || item.scope) + " · " + ui.formatNumber(item.minimum) + "–" + ui.formatNumber(item.maximum);
+    if (entity === "actors") return item.enabled ? "可用角色" : "已停用角色";
+    if (entity === "groups") return "角色群组";
+    if (entity === "rules") return item.enabled ? "已启用规则" : "已停用规则";
+    if (entity === "conditions") return item.enabled ? "已启用条件" : "已停用条件";
+    if (entity === "effectGroups") return item.enabled ? "已启用效果组" : "已停用效果组";
+    return item.description || "";
   }
 
   function stagePalette(field) {
@@ -295,7 +366,9 @@
     groupSelector,
     menuRow,
     listMeta,
+    listViewFiltered,
     pagination,
+    renderEntityPicker,
     stagePalette,
     stageStrip,
     trendModel,

@@ -10,11 +10,27 @@ const execFileAsync = promisify(execFile);
 const runtimeSource = await readFile(new URL("../static/app_ui/runtime.js", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../static/app_ui/app.js", import.meta.url), "utf8");
 const componentsSource = await readFile(new URL("../static/app_ui/components.js", import.meta.url), "utf8");
+const configSource = await readFile(new URL("../static/app_ui/pages-config.js", import.meta.url), "utf8");
 const rulesSource = await readFile(new URL("../static/app_ui/pages-rules.js", import.meta.url), "utf8");
+const statusSource = await readFile(new URL("../static/app_ui/pages-status.js", import.meta.url), "utf8");
 const stylesSource = await readFile(new URL("../static/app_ui/styles.css", import.meta.url), "utf8");
 
 function page(items) {
   return { items, loadedCount: items.length, totalCount: items.length, hasMore: false, nextCursor: null };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function fieldSummary(id = "field_a", currentValue = 4) {
@@ -102,12 +118,13 @@ function validSnapshot(overrides = {}) {
   };
 }
 
-function createHarness() {
+function createHarness(search = "?route=field-detail&field=field_a") {
   class FakeElement {
     constructor() {
       this.listeners = new Map();
       this.classList = { add() {}, remove() {}, contains() { return false; } };
       this.style = { setProperty() {}, removeProperty() {} };
+      this.dataset = {};
       this.files = [];
       this.innerHTML = "";
       this.textContent = "";
@@ -118,6 +135,7 @@ function createHarness() {
     toggleAttribute() {}
     click() {}
     closest() { return null; }
+    focus() { context.document.activeElement = this; }
   }
   const elements = new Map(["appRoot", "backgroundPicker", "datasetImportPicker", "toast"].map((id) => [id, new FakeElement()]));
   const historyCalls = [];
@@ -136,7 +154,7 @@ function createHarness() {
     FileReader: class {},
     Image: class {},
     window: {
-      location: { href: "https://mvu.local/app.html?route=field-detail&field=field_a", search: "?route=field-detail&field=field_a" },
+      location: { href: `https://mvu.local/app.html${search}`, search },
       history: {
         length: 7,
         pushState(state, _title, url) { historyCalls.push(["push", state.route]); this.state = state; context.window.location.href = String(url); context.window.location.search = new URL(String(url)).search; },
@@ -153,6 +171,8 @@ function createHarness() {
     document: {
       getElementById(id) { return elements.get(id); },
       documentElement: new FakeElement(),
+      activeElement: null,
+      querySelectorAll() { return []; },
       createElement() { throw new Error("unexpected browser download"); },
       startViewTransition(update) { update(); },
     },
@@ -593,4 +613,252 @@ test("avatar rendering rejects executable URI schemes", () => {
 
   assert.doesNotMatch(unsafe, /<img/);
   assert.match(safe, /<img src="content:\/\/avatars\/b"/);
+});
+
+test("demo management queries enforce 5/5/10/10/10 pages with real search and totals", async () => {
+  const { ui } = createHarness();
+  ui.state.demo = true;
+
+  const fields = await ui.native.call("queryFields", { page: 2, search: "演示字段" });
+  const rules = await ui.native.call("queryRules", { page: 2, search: "演示规则" });
+  const conditions = await ui.native.call("queryConditions", { page: 2, search: "演示条件" });
+  const effects = await ui.native.call("queryEffectGroups", { page: 2, search: "演示效果" });
+  const records = await ui.native.call("queryRecords", { page: 2 });
+
+  assert.deepEqual(
+    [fields.loadedCount, rules.loadedCount, conditions.loadedCount, effects.loadedCount, records.loadedCount],
+    [5, 5, 10, 10, 10],
+  );
+  assert.deepEqual(
+    [fields.totalCount, rules.totalCount, conditions.totalCount, effects.totalCount, records.totalCount],
+    [12, 12, 23, 23, 24],
+  );
+  assert.equal(Array.from(fields.items, (field) => field.name).join("|"),
+    "演示字段 06|演示字段 07|演示字段 08|演示字段 09|演示字段 10");
+  assert.equal(fields.hasMore, true);
+  assert.equal(records.hasMore, true);
+});
+
+test("management route loading sends page search filter and sort to the owning query", async () => {
+  const { ui } = createHarness();
+  const requests = [];
+  ui.state.snapshot = validSnapshot();
+  ui.state.pages = { ...ui.state.snapshot.pages };
+  ui.state.listViews.rules = {
+    page: 3,
+    search: "关心",
+    filters: { enabled: true },
+    sort: { key: "updatedAt", direction: "desc" },
+  };
+  ui.native.call = async (method, request) => {
+    requests.push([method, request]);
+    return page([]);
+  };
+
+  await ui.loadRouteData("rule-library");
+
+  assert.deepEqual(JSON.parse(JSON.stringify(requests)), [["queryRules", {
+    page: 3,
+    search: "关心",
+    filters: { enabled: true },
+    sort: { key: "updatedAt", direction: "desc" },
+  }]]);
+});
+
+test("picker discards stale search responses and keeps the latest query results", async () => {
+  const { ui } = createHarness();
+  const oldResponse = deferred();
+  const newResponse = deferred();
+  ui.native.call = async (_method, request) => {
+    if (request.search === "旧") return oldResponse.promise;
+    if (request.search === "新") return newResponse.promise;
+    return page([]);
+  };
+
+  await ui.openEntityPicker({ entity: "actors", mode: "single", title: "选择角色" });
+  ui.searchEntityPicker("旧");
+  await wait(190);
+  ui.searchEntityPicker("新");
+  await wait(190);
+  newResponse.resolve(page([{ characterId: "new", name: "新角色", avatarUri: null, enabled: true }]));
+  await wait(0);
+  oldResponse.resolve(page([{ characterId: "old", name: "旧角色", avatarUri: null, enabled: true }]));
+  await wait(0);
+
+  assert.equal(ui.state.entityPicker.search, "新");
+  assert.deepEqual(ui.state.entityPicker.items.map((item) => item.characterId), ["new"]);
+});
+
+test("picker auto-cursor stays bounded and preserves multi-selection through failure", async () => {
+  const { ui } = createHarness();
+  let batch = 0;
+  ui.native.call = async (_method, request) => {
+    if (request.search === "失败") throw new Error("offline");
+    const start = batch * 30;
+    batch += 1;
+    return {
+      items: Array.from({ length: 30 }, (_value, index) => ({
+        characterId: `actor_${start + index}`,
+        name: `角色 ${start + index}`,
+        avatarUri: null,
+        enabled: true,
+      })),
+      loadedCount: 30,
+      totalCount: 90,
+      hasMore: batch < 3,
+      nextCursor: batch < 3 ? `cursor_${batch}` : null,
+    };
+  };
+
+  await ui.openEntityPicker({ entity: "actors", mode: "multiple", selectedIds: ["actor_0"] });
+  ui.toggleEntityPickerSelection("actor_1");
+  await ui.fetchNextEntityPickerPage();
+  await ui.fetchNextEntityPickerPage();
+  assert.equal(ui.state.entityPicker.items.length, 60);
+  assert.deepEqual(Array.from(ui.state.entityPicker.selectedIds), ["actor_0", "actor_1"]);
+
+  ui.searchEntityPicker("失败");
+  await wait(190);
+  await wait(0);
+  assert.match(ui.state.entityPicker.error, /重试/);
+  assert.equal(ui.state.entityPicker.search, "失败");
+  assert.deepEqual(Array.from(ui.state.entityPicker.selectedIds), ["actor_0", "actor_1"]);
+});
+
+test("single picker commits immediately while multiple picker waits for confirmation", async () => {
+  const { ui } = createHarness();
+  ui.native.call = async () => page([
+    { characterGroupId: "group_a", name: "群组甲", avatarUri: null },
+  ]);
+  const commits = [];
+
+  await ui.openEntityPicker({ entity: "groups", mode: "single", onCommit(ids) { commits.push(ids); } });
+  ui.toggleEntityPickerSelection("group_a");
+  assert.deepEqual(commits.map((ids) => Array.from(ids)), [["group_a"]]);
+  assert.equal(ui.state.entityPicker, null);
+
+  await ui.openEntityPicker({ entity: "groups", mode: "multiple", onCommit(ids) { commits.push(ids); } });
+  ui.toggleEntityPickerSelection("group_a");
+  assert.equal(commits.length, 1);
+  ui.confirmEntityPicker();
+  assert.deepEqual(commits.map((ids) => Array.from(ids)), [["group_a"], ["group_a"]]);
+  assert.equal(ui.state.entityPicker, null);
+});
+
+test("picker close resolves the logical opener after the shell rerenders", async () => {
+  const { context, ui } = createHarness();
+  const staleOpener = {
+    dataset: { action: "open-actor-picker", pickerKey: "rule-trigger-actors" },
+    focus() { context.document.activeElement = this; },
+  };
+  const stableOpener = {
+    dataset: { action: "open-actor-picker", pickerKey: "rule-trigger-actors" },
+    focus() { context.document.activeElement = this; },
+  };
+  const body = { dataset: {}, focus() { context.document.activeElement = this; } };
+  context.document.activeElement = body;
+  context.document.querySelectorAll = () => [stableOpener];
+  ui.render = () => { context.document.activeElement = body; };
+  ui.native.call = async () => page([]);
+
+  await ui.openEntityPicker({ entity: "actors", mode: "multiple", title: "选择角色", opener: staleOpener });
+  ui.closeEntityPicker();
+  await Promise.resolve();
+
+  assert.equal(context.document.activeElement, stableOpener);
+  assert.notEqual(context.document.activeElement, staleOpener);
+  assert.notEqual(context.document.activeElement, body);
+});
+
+test("management count copy distinguishes unfiltered totals from authoritative filtered totals", () => {
+  const { context, ui } = createHarness();
+  vm.runInContext(componentsSource, context, { filename: "components.js" });
+  vm.runInContext(configSource, context, { filename: "pages-config.js" });
+  vm.runInContext(rulesSource, context, { filename: "pages-rules.js" });
+  vm.runInContext(statusSource, context, { filename: "pages-status.js" });
+  ui.state.snapshot = validSnapshot({
+    counts: { fields: 51, actors: 2, groups: 1, rules: 52, conditions: 53, effectGroups: 54, records: 55 },
+  });
+  ui.state.pages = {
+    fields: { items: [], loadedCount: 5, totalCount: 51, hasMore: true, nextCursor: null },
+    rules: { items: [], loadedCount: 5, totalCount: 52, hasMore: true, nextCursor: null },
+    conditions: { items: [], loadedCount: 10, totalCount: 53, hasMore: true, nextCursor: null },
+    effectGroups: { items: [], loadedCount: 10, totalCount: 54, hasMore: true, nextCursor: null },
+    records: { items: [], loadedCount: 10, totalCount: 55, hasMore: true, nextCursor: null },
+  };
+
+  assert.match(ui.pages.fields(), /本页 1–5 \/ 共 51 个字段/);
+  assert.match(ui.pages.ruleLibrary(), /本页 1–5 \/ 共 52 条规则/);
+  assert.match(ui.pages.conditionLibrary(), /本页 1–10 \/ 共 53 个条件/);
+  assert.match(ui.pages.effectLibrary(), /本页 1–10 \/ 共 54 个效果组/);
+  assert.match(ui.pages.records(), /本页 1–10 \/ 共 55 条记录/);
+
+  Object.values(ui.state.listViews).forEach((view) => { view.search = "筛选"; });
+  Object.assign(ui.state.pages, {
+    fields: { items: [], loadedCount: 5, totalCount: 7, hasMore: true, nextCursor: null },
+    rules: { items: [], loadedCount: 5, totalCount: 8, hasMore: true, nextCursor: null },
+    conditions: { items: [], loadedCount: 10, totalCount: 19, hasMore: true, nextCursor: null },
+    effectGroups: { items: [], loadedCount: 10, totalCount: 20, hasMore: true, nextCursor: null },
+    records: { items: [], loadedCount: 10, totalCount: 21, hasMore: true, nextCursor: null },
+  });
+
+  assert.match(ui.pages.fields(), /本页 1–5 · 匹配 7 \/ 共 51 个字段/);
+  assert.match(ui.pages.ruleLibrary(), /本页 1–5 · 匹配 8 \/ 共 52 条规则/);
+  assert.match(ui.pages.conditionLibrary(), /本页 1–10 · 匹配 19 \/ 共 53 个条件/);
+  assert.match(ui.pages.effectLibrary(), /本页 1–10 · 匹配 20 \/ 共 54 个效果组/);
+  assert.match(ui.pages.records(), /本页 1–10 · 匹配 21 \/ 共 55 条记录/);
+});
+
+test("demo picker data is high-cardinality and controllable without changing management fixtures", async () => {
+  const { ui } = createHarness("?demo=1&demoPickerSlowSearch=旧&demoPickerSlowMs=40&demoPickerFailSearch=失败");
+  ui.state.demo = true;
+
+  const managementFields = await ui.native.call("queryFields", { page: 1 });
+  assert.equal(managementFields.totalCount, 13);
+
+  await ui.openEntityPicker({ entity: "fields", mode: "multiple", title: "选择字段" });
+  assert.equal(ui.state.entityPicker.items.length, 30);
+  assert.ok(ui.state.entityPicker.totalCount >= 90);
+  assert.equal(ui.state.entityPicker.hasMore, true);
+
+  const startedAt = Date.now();
+  await ui.native.call("queryFields", { search: "旧", filters: { mode: "picker" } });
+  assert.ok(Date.now() - startedAt >= 30);
+  await assert.rejects(
+    ui.native.call("queryFields", { search: "失败", filters: { mode: "picker" } }),
+    /demo picker failure/i,
+  );
+});
+
+test("picker rendering bounds pinned DOM while preserving every selected ID", () => {
+  const { context, ui } = createHarness();
+  vm.runInContext(componentsSource, context, { filename: "components.js" });
+  const selectedIds = new Set(Array.from({ length: 100 }, (_value, index) => `actor_${index}`));
+  const selectedItems = new Map(Array.from(selectedIds, (id, index) => [id, {
+    characterId: id,
+    name: `角色 ${index}`,
+    avatarUri: null,
+    enabled: true,
+  }]));
+
+  const html = ui.components.renderEntityPicker({
+    entity: "actors",
+    definition: { idKey: "characterId" },
+    title: "选择角色",
+    mode: "multiple",
+    search: "",
+    items: [],
+    selectedIds,
+    selectedItems,
+    totalCount: 0,
+    loading: false,
+    error: "",
+  });
+
+  const renderedPins = (html.match(/class="picker-pinned-item"/g) || []).length;
+  const hiddenMatch = html.match(/另 (\d+) 项/);
+  assert.ok(renderedPins > 0 && renderedPins <= 20);
+  assert.equal(Number(hiddenMatch[1]), 100 - renderedPins);
+  assert.match(html, /aria-label="另 \d+ 项已选择"/);
+  assert.equal(selectedIds.size, 100);
 });

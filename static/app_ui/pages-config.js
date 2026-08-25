@@ -16,24 +16,28 @@
 
   function fieldsPage() {
     const page = ui.state.pages.fields;
+    const view = ui.state.listViews.fields;
     return '<div class="fields-page">' +
-      '<div class="toolbar"><label class="search-field">' + c.icon("search") + '<input type="search" placeholder="搜索字段" aria-label="搜索字段" data-field-search /></label>' +
+      '<div class="toolbar"><label class="search-field">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) +
+      '" placeholder="搜索字段" aria-label="搜索字段" data-list-search-route="config-fields" /></label>' +
       '<button type="button" class="square-action" data-action="new-field" aria-label="新增字段">' + c.icon("add") + "</button></div>" +
-      c.listMeta(page, "个字段") + (page.items.length
+      c.listMeta(page, "个字段", view.page, 5, ui.state.snapshot.counts.fields, c.listViewFiltered(view)) + (page.items.length
         ? '<div class="management-list">' + page.items.map(fieldManagementCard).join("") + "</div>"
         : c.emptyState("add_circle", "还没有字段", "创建第一个字段后，可在状态页查看数值。",
           '<button type="button" class="button primary" data-action="new-field">新增字段</button>')) +
-      c.pagination(page, "config-fields", 1) + "</div>";
+      c.pagination(page, "config-fields", view.page) + "</div>";
   }
 
   function fieldManagementCard(field) {
     const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
     const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
     const current = summary && summary.current ? ui.formatNumber(summary.current.value) : "未绑定";
+    const binding = ui.state.bindingLabels.get(field.id) || (field.bindingIds.length ? field.bindingIds.length + " 个绑定" : "未绑定");
     const view = { theme: { icon: field.icon, color: field.themeColor } };
     return '<article class="management-card range-card" data-range-card="' + ui.escapeHtml(field.id) + '"><header><div>' + c.stateIcon(view) +
-      '<span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope] || field.scope) + " · 当前 " + current +
+      '<span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope] || field.scope) + " · " + ui.escapeHtml(binding) +
       '</small></span></div><span class="status-dot ' + (field.enabled ? "enabled" : "") + '">' + (field.enabled ? "已启用" : "已停用") + "</span></header>" +
+      '<dl class="management-summary"><div><dt>当前值</dt><dd>' + current + '</dd></div><div><dt>数值范围</dt><dd>' + ui.formatNumber(field.minimum) + "–" + ui.formatNumber(field.maximum) + "</dd></div></dl>" +
       '<div class="range-preview" style="--range-position:' + ((currentValue - field.minimum) / (field.maximum - field.minimum) * 100) +
       '%"><span class="range-preview-track"><i></i></span><output data-range-preview>换算后 ' + ui.formatNumber(currentValue) + '</output></div>' +
       '<div class="range-editor"><label>下限<input type="number" inputmode="decimal" step="any" value="' + field.minimum + '" data-range-number="minimum"></label>' +
@@ -53,7 +57,7 @@
       ui.escapeHtml(field ? field.name : "") + '" placeholder="例如：亲密度" required></label><label>字段说明<textarea name="description" rows="2" placeholder="简短说明这个数值代表什么">' +
       ui.escapeHtml(field ? field.description : "") + "</textarea></label></div></section>" +
       '<section class="editor-section">' + c.sectionHeading("作用范围", "决定每份数值由谁共享") + '<div class="scope-grid">' + scopeButton("character", field) +
-      scopeButton("group", field) + scopeButton("global", field) + scopeButton("chat", field) + "</div>" +
+      scopeButton("group", field) + scopeButton("global", field) + scopeButton("chat", field) + "</div>" + bindingPicker(field) +
       (field && field.scope === "chat" ? '<div class="binding-summary"><strong>当前会话</strong><span>' + ui.escapeHtml(ui.state.snapshot.contextLabels.chatName) +
         '</span><details><summary>高级绑定设置</summary><p>仅在创建模板或管理多个会话时调整。</p></details></div>' : "") + "</section>" +
       '<section class="editor-section">' + c.sectionHeading("字段外观", "图标与主题色统一呈现") +
@@ -63,6 +67,17 @@
       detailTile("format_list_numbered", "阶段设置", "阶段名称与阈值") + detailTile("schedule", "自然与每轮变化", "配置自动增减") +
       detailTile("magic_button", "AI 自动更新", "置信度与提示") + detailTile("dashboard_customize", "高级选项", "模型可见性与数据管理") +
       '</div></section><div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary" disabled>保存字段</button></div></form>';
+  }
+
+  function bindingPicker(field) {
+    const scope = field ? field.scope : "character";
+    if (scope !== "character" && scope !== "group") return "";
+    const ids = field ? field.bindingIds : [];
+    const actor = scope === "character";
+    return '<div class="binding-summary"><strong>' + (actor ? "绑定角色" : "绑定群组") + '</strong><span>' +
+      (ids.length ? ids.length + (actor ? " 个角色" : " 个群组") : "尚未选择") + '</span><button type="button" class="text-action" data-action="' +
+      (actor ? "open-actor-picker" : "open-group-picker") + '" data-picker-key="field-scope-' + scope + '" data-picker-mode="multiple" data-picker-selected="' +
+      ui.escapeHtml(JSON.stringify(ids)) + '">搜索选择</button></div>';
   }
 
   function scopeButton(scope, field) {
@@ -96,7 +111,7 @@
     return '<div class="change-page">' + tabs + '<div id="segment-panel-change-mode" role="tabpanel"><section class="selected-field-panel"><span>' + c.icon(kind === "link" ? "account_tree" : "schedule") +
       '</span><div><strong>' + copy[0] + '</strong><p>' + copy[1] + '</p></div></section>' +
       c.emptyState("search", "选择要配置的字段", "字段较多时使用可搜索选择框，不在页面中一次展开全部字段。",
-        '<button type="button" class="button primary" data-action="open-field-picker">选择字段</button>') + "</div></div>";
+        '<button type="button" class="button primary" data-action="open-field-picker" data-picker-key="change-' + kind + '-field">选择字段</button>') + "</div></div>";
   }
 
   Object.assign(ui.pages, {

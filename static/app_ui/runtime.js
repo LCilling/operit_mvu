@@ -21,6 +21,23 @@
     "effect-editor": { title: "编辑临时效果", root: false, header: "back", owner: "rules", page: "effectEditor" },
     advanced: { title: "高级", root: true, header: "menu", owner: "advanced", page: "advanced" },
   };
+  const LIST_POLICIES = {
+    "config-fields": { key: "fields", method: "queryFields", pageSize: 5, sort: { key: "order", direction: "asc" } },
+    "rule-library": { key: "rules", method: "queryRules", pageSize: 5, sort: { key: "executionOrder", direction: "asc" } },
+    "condition-library": { key: "conditions", method: "queryConditions", pageSize: 10, sort: { key: "name", direction: "asc" } },
+    "effect-library": { key: "effectGroups", method: "queryEffectGroups", pageSize: 10, sort: { key: "name", direction: "asc" } },
+    records: { key: "records", method: "queryRecords", pageSize: 10, sort: { key: "occurredAt", direction: "desc" } },
+  };
+  const PICKER_SEARCH_DEBOUNCE_MS = 180;
+  const PICKER_RESULT_LIMIT = 60;
+  const PICKER_ENTITIES = {
+    fields: { method: "queryFields", label: "fields", idKey: "id", entityType: "field", cursor: true, filters: { mode: "picker" } },
+    actors: { method: "queryActors", label: "actors", idKey: "characterId", entityType: "actor", cursor: true },
+    groups: { method: "queryGroups", label: "groups", idKey: "characterGroupId", entityType: "group", cursor: true },
+    rules: { method: "queryRules", label: "rules", idKey: "id", entityType: "rule", cursor: false },
+    conditions: { method: "queryConditions", label: "conditions", idKey: "id", entityType: "condition", cursor: false },
+    effectGroups: { method: "queryEffectGroups", label: "effectGroups", idKey: "id", entityType: "effectGroup", cursor: false },
+  };
 
   const requestedRoute = queryState.get("route") || queryState.get("screen") || "status";
   const initialRoute = ROUTES[requestedRoute] ? requestedRoute : "status";
@@ -30,8 +47,19 @@
     pages: {},
     directory: { actors: [], groups: [] },
     entities: new Map(),
+    bindingLabels: new Map(),
+    ruleLabels: new Map(),
     chartModels: new Map(),
     detailRecords: null,
+    listViews: {
+      fields: { page: 1, search: "", filters: {}, sort: LIST_POLICIES["config-fields"].sort },
+      rules: { page: 1, search: "", filters: {}, sort: LIST_POLICIES["rule-library"].sort },
+      conditions: { page: 1, search: "", filters: {}, sort: LIST_POLICIES["condition-library"].sort },
+      effectGroups: { page: 1, search: "", filters: {}, sort: LIST_POLICIES["effect-library"].sort },
+      records: { page: 1, search: "", filters: {}, sort: LIST_POLICIES.records.sort },
+    },
+    entityPicker: null,
+    editorSelections: {},
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -43,6 +71,11 @@
     lastActorId: "",
     routeTrail: [initialRoute],
     demo: queryState.get("demo") === "1",
+    demoPickerControls: {
+      slowSearch: queryState.get("demoPickerSlowSearch") || "",
+      slowMs: demoControlDelay("demoPickerSlowMs"),
+      failSearch: queryState.get("demoPickerFailSearch") || "",
+    },
   };
 
   const native = createNativeBridge();
@@ -60,6 +93,14 @@
     loadRouteData,
     loadDirectory,
     query,
+    openEntityPicker,
+    closeEntityPicker,
+    searchEntityPicker,
+    retryEntityPicker,
+    fetchNextEntityPickerPage,
+    toggleEntityPickerSelection,
+    confirmEntityPicker,
+    updateListView,
     getEntity,
     validateCompactSnapshot,
     validateQueryResponse,
@@ -578,6 +619,279 @@
     }
   }
 
+  async function openEntityPicker(config) {
+    const options = config || {};
+    const definition = PICKER_ENTITIES[options.entity];
+    if (!definition) throw new Error("MVU_PICKER_ENTITY_INVALID");
+    if (options.mode !== undefined && options.mode !== "single" && options.mode !== "multiple") {
+      throw new Error("MVU_PICKER_MODE_INVALID");
+    }
+    const selectedIds = new Set(Array.isArray(options.selectedIds) ? options.selectedIds : []);
+    const selectedItems = new Map();
+    (Array.isArray(options.selectedItems) ? options.selectedItems : []).forEach(function (item) {
+      const id = item && item[definition.idKey];
+      if (typeof id === "string" && selectedIds.has(id)) selectedItems.set(id, item);
+    });
+    const opener = options.opener && typeof options.opener === "object"
+      ? options.opener
+      : document.activeElement || null;
+    state.entityPicker = {
+      entity: options.entity,
+      definition,
+      title: options.title || "选择项目",
+      mode: options.mode === "multiple" ? "multiple" : "single",
+      search: "",
+      filters: { ...(definition.filters || {}), ...(options.filters || {}) },
+      items: [],
+      selectedIds,
+      selectedItems,
+      totalCount: 0,
+      hasMore: false,
+      nextCursor: null,
+      nextPage: 2,
+      loading: false,
+      error: "",
+      requestToken: 0,
+      searchTimer: 0,
+      opening: true,
+      openingTimer: 0,
+      onCommit: typeof options.onCommit === "function" ? options.onCommit : null,
+      restoreFocus: opener,
+      restoreFocusDescriptor: opener && opener.dataset
+        ? { action: opener.dataset.action || "", pickerKey: opener.dataset.pickerKey || "" }
+        : null,
+    };
+    renderIfReady();
+    state.entityPicker.openingTimer = window.setTimeout(function () {
+      if (state.entityPicker) state.entityPicker.opening = false;
+    }, 220);
+    await loadEntityPicker(true);
+    return state.entityPicker;
+  }
+
+  function closeEntityPicker() {
+    const picker = state.entityPicker;
+    if (!picker) return;
+    if (picker.searchTimer) window.clearTimeout(picker.searchTimer);
+    if (picker.openingTimer) window.clearTimeout(picker.openingTimer);
+    picker.requestToken += 1;
+    const restoreFocus = picker.restoreFocus;
+    const restoreFocusDescriptor = picker.restoreFocusDescriptor;
+    state.entityPicker = null;
+    renderIfReady();
+    Promise.resolve().then(function () {
+      let focusTarget = restoreFocus;
+      if (restoreFocusDescriptor && typeof document.querySelectorAll === "function") {
+        focusTarget = Array.from(document.querySelectorAll("[data-action]")).find(function (candidate) {
+          return candidate.dataset.action === restoreFocusDescriptor.action &&
+            (!restoreFocusDescriptor.pickerKey || candidate.dataset.pickerKey === restoreFocusDescriptor.pickerKey);
+        }) || focusTarget;
+      }
+      if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
+    });
+  }
+
+  function searchEntityPicker(value) {
+    const picker = state.entityPicker;
+    if (!picker) return;
+    picker.search = String(value == null ? "" : value);
+    picker.error = "";
+    if (picker.searchTimer) window.clearTimeout(picker.searchTimer);
+    picker.searchTimer = window.setTimeout(function () {
+      picker.searchTimer = 0;
+      void loadEntityPicker(true);
+    }, PICKER_SEARCH_DEBOUNCE_MS);
+  }
+
+  function retryEntityPicker() {
+    return loadEntityPicker(true);
+  }
+
+  function fetchNextEntityPickerPage() {
+    const picker = state.entityPicker;
+    if (!picker || picker.loading || !picker.hasMore) return Promise.resolve(false);
+    return loadEntityPicker(false).then(function () { return true; });
+  }
+
+  async function loadEntityPicker(reset) {
+    const picker = state.entityPicker;
+    if (!picker) return null;
+    const token = ++picker.requestToken;
+    const request = { search: picker.search, filters: { ...picker.filters } };
+    if (picker.definition.cursor) {
+      if (!reset && picker.nextCursor) request.cursor = picker.nextCursor;
+    } else {
+      request.page = reset ? 1 : picker.nextPage;
+    }
+    picker.loading = true;
+    picker.error = "";
+    renderIfReady();
+    try {
+      const response = await query(picker.definition.method, request, picker.definition.label);
+      if (state.entityPicker !== picker || token !== picker.requestToken) return null;
+      response.items.forEach(function (item) {
+        const id = item[picker.definition.idKey];
+        if (picker.selectedIds.has(id)) picker.selectedItems.set(id, item);
+      });
+      picker.items = (reset ? response.items : picker.items.concat(response.items)).slice(-PICKER_RESULT_LIMIT);
+      picker.totalCount = response.totalCount;
+      picker.hasMore = response.hasMore;
+      picker.nextCursor = response.nextCursor;
+      picker.nextPage = reset ? 2 : picker.nextPage + 1;
+      picker.error = "";
+      return response;
+    } catch (_error) {
+      if (state.entityPicker !== picker || token !== picker.requestToken) return null;
+      picker.error = "搜索失败，已保留所选项。请重试。";
+      return null;
+    } finally {
+      if (state.entityPicker === picker && token === picker.requestToken) {
+        picker.loading = false;
+        renderIfReady();
+      }
+    }
+  }
+
+  function toggleEntityPickerSelection(id) {
+    const picker = state.entityPicker;
+    if (!picker || typeof id !== "string") return;
+    const item = picker.items.find(function (candidate) { return candidate[picker.definition.idKey] === id; }) ||
+      picker.selectedItems.get(id);
+    if (picker.mode === "single") {
+      if (item) picker.selectedItems.set(id, item);
+      picker.selectedIds = new Set([id]);
+      commitEntityPicker(picker);
+      return;
+    }
+    if (picker.selectedIds.has(id)) {
+      picker.selectedIds.delete(id);
+      picker.selectedItems.delete(id);
+    } else {
+      picker.selectedIds.add(id);
+      if (item) picker.selectedItems.set(id, item);
+    }
+    renderIfReady();
+  }
+
+  function confirmEntityPicker() {
+    const picker = state.entityPicker;
+    if (!picker || picker.mode !== "multiple") return;
+    commitEntityPicker(picker);
+  }
+
+  function commitEntityPicker(picker) {
+    const ids = Array.from(picker.selectedIds);
+    const items = ids.map(function (id) { return picker.selectedItems.get(id); }).filter(Boolean);
+    if (picker.onCommit) picker.onCommit(ids, items);
+    closeEntityPicker();
+  }
+
+  function renderIfReady() {
+    if (typeof window.MvuUi.render === "function") window.MvuUi.render();
+  }
+
+  async function updateListView(routeId, patch) {
+    const policy = LIST_POLICIES[routeId];
+    if (!policy) throw new Error("MVU_LIST_ROUTE_INVALID");
+    const current = state.listViews[policy.key];
+    const next = { ...current, ...(patch || {}) };
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "search") && !Object.prototype.hasOwnProperty.call(patch, "page")) {
+      next.page = 1;
+    }
+    state.listViews[policy.key] = next;
+    await loadManagementPage(routeId);
+    return state.pages[policy.key];
+  }
+
+  async function loadManagementPage(routeId) {
+    const policy = LIST_POLICIES[routeId];
+    if (!policy) return null;
+    const view = state.listViews[policy.key];
+    const requestToken = (view.requestToken || 0) + 1;
+    view.requestToken = requestToken;
+    const request = { page: view.page };
+    if (view.search) request.search = view.search;
+    if (view.filters && Object.keys(view.filters).length) request.filters = view.filters;
+    if (view.sort) request.sort = view.sort;
+    const response = await query(policy.method, request, policy.key);
+    if (state.listViews[policy.key] !== view || view.requestToken !== requestToken) return state.pages[policy.key];
+    state.pages[policy.key] = response;
+    if (policy.key === "fields") {
+      response.items.forEach(function (field) { state.entities.set("field:" + field.id, field); });
+      await hydrateFieldBindingLabels(response.items);
+    }
+    if (policy.key === "rules") await hydrateRuleLabels(response.items);
+    return response;
+  }
+
+  async function hydrateFieldBindingLabels(fields) {
+    await Promise.all(fields.map(async function (field) {
+      if (field.scope === "global") {
+        state.bindingLabels.set(field.id, "所有角色、群组和会话");
+        return;
+      }
+      if (field.scope === "chat") {
+        const currentChat = state.snapshot && state.snapshot.activeContext.chatId;
+        state.bindingLabels.set(field.id, currentChat && field.bindingIds.includes(currentChat)
+          ? state.snapshot.contextLabels.chatName
+          : field.bindingIds.length + " 个会话");
+        return;
+      }
+      const firstId = field.bindingIds[0];
+      if (!firstId) {
+        state.bindingLabels.set(field.id, "未绑定");
+        return;
+      }
+      try {
+        const entityType = field.scope === "character" ? "actor" : "group";
+        const item = await getEntity(entityType, firstId);
+        const suffix = field.bindingIds.length > 1 ? " 等 " + field.bindingIds.length + " 个" : "";
+        state.bindingLabels.set(field.id, item.name + suffix);
+      } catch (_error) {
+        state.bindingLabels.set(field.id, field.bindingIds.length + (field.scope === "character" ? " 个角色" : " 个群组"));
+      }
+    }));
+  }
+
+  async function hydrateRuleLabels(rules) {
+    await Promise.all(rules.map(async function (rule) {
+      const selector = rule.triggerActorSelector;
+      let actor = selector.kind === "any" ? "任意角色" : selector.kind === "current_actor" ? "当前消息角色" : "未绑定角色";
+      try {
+        if (selector.kind === "selected") {
+          const item = await getEntity("actor", selector.actorIds[0]);
+          actor = item.name + (selector.actorIds.length > 1 ? " 等 " + selector.actorIds.length + " 个角色" : "");
+        } else if (selector.kind === "group") {
+          const item = await getEntity("group", selector.groupIds[0]);
+          actor = item.name + (selector.groupIds.length > 1 ? " 等 " + selector.groupIds.length + " 个群组" : "");
+        }
+      } catch (_error) {
+        actor = selector.kind === "group" ? selector.groupIds.length + " 个群组" : selector.actorIds.length + " 个角色";
+      }
+      let condition = "条件待修复";
+      try {
+        condition = (await getEntity("condition", rule.conditionId)).name;
+      } catch (_error) {
+        condition = "条件待修复";
+      }
+      let actions = rule.actions.length + " 个结果";
+      const first = rule.actions[0];
+      try {
+        if (first && first.kind === "change_field") {
+          const field = await getEntity("field", first.fieldId);
+          actions = field.name + " " + (first.delta >= 0 ? "+" : "") + formatNumber(first.delta) +
+            (rule.actions.length > 1 ? " 等 " + rule.actions.length + " 个结果" : "");
+        } else if (first && first.kind === "activate_effect_group") {
+          const effect = await getEntity("effectGroup", first.effectGroupId);
+          actions = "应用「" + effect.name + "」" + (rule.actions.length > 1 ? "等 " + rule.actions.length + " 个结果" : "");
+        }
+      } catch (_error) {
+        actions = rule.actions.length + " 个结果（需修复引用）";
+      }
+      state.ruleLabels.set(rule.id, { actor, condition, actions });
+    }));
+  }
+
   async function getEntity(entityType, id) {
     if (typeof id !== "string" || id.length === 0) throw new Error("MVU_ENTITY_ID_MISSING");
     const key = entityType + ":" + id;
@@ -614,12 +928,7 @@
     if (!route) throw new Error("MVU_ROUTE_UNKNOWN:" + routeId);
     state.routeError = null;
     try {
-      if (routeId === "config-fields") {
-        state.pages.fields = await query("queryFields", { page: 1 }, "fields");
-        state.pages.fields.items.forEach(function (field) {
-          state.entities.set("field:" + field.id, field);
-        });
-      }
+      if (LIST_POLICIES[routeId]) await loadManagementPage(routeId);
       if ((routeId === "status" || routeId === "field-detail") &&
           state.directory.actors.length === 0 && state.directory.groups.length === 0) {
         await loadDirectory(state.snapshot && state.snapshot.activeContext.groupId);
@@ -753,14 +1062,31 @@
     if (method === "snapshot") return Promise.resolve(demo.snapshot);
     if (method === "queryActors") {
       const groupId = params && params.filters && params.filters.groupId;
-      return Promise.resolve(page(groupId ? (demo.groupMembers[groupId] || []) : demo.actors));
+      const picker = isDemoPickerRequest(method, params);
+      const source = picker ? demo.pickerActors : (groupId ? (demo.groupMembers[groupId] || []) : demo.actors);
+      return demoPickerResponse(demoQuery(source, params, 30, "characterId", true), params, picker);
     }
-    if (method === "queryGroups") return Promise.resolve(page(demo.groups));
-    if (method === "queryFields") return Promise.resolve(page(demo.fields.slice(0, 5)));
-    if (method === "queryRules") return Promise.resolve(page(demo.ruleEntities));
-    if (method === "queryConditions") return Promise.resolve(page(demo.conditionEntities));
-    if (method === "queryEffectGroups") return Promise.resolve(page(demo.effectEntities));
-    if (method === "queryRecords") return Promise.resolve(page(demo.records));
+    if (method === "queryGroups") {
+      const picker = isDemoPickerRequest(method, params);
+      return demoPickerResponse(demoQuery(picker ? demo.pickerGroups : demo.groups, params, 30, "characterGroupId", true), params, picker);
+    }
+    if (method === "queryFields") {
+      const picker = isDemoPickerRequest(method, params);
+      return demoPickerResponse(demoQuery(picker ? demo.pickerFields : demo.fields, params, picker ? 30 : 5, "id", picker), params, picker);
+    }
+    if (method === "queryRules") {
+      const picker = isDemoPickerRequest(method, params);
+      return demoPickerResponse(demoQuery(picker ? demo.pickerRules : demo.ruleEntities, params, picker ? 10 : 5, "id", false), params, picker);
+    }
+    if (method === "queryConditions") {
+      const picker = isDemoPickerRequest(method, params);
+      return demoPickerResponse(demoQuery(picker ? demo.pickerConditions : demo.conditionEntities, params, 10, "id", false), params, picker);
+    }
+    if (method === "queryEffectGroups") {
+      const picker = isDemoPickerRequest(method, params);
+      return demoPickerResponse(demoQuery(picker ? demo.pickerEffects : demo.effectEntities, params, 10, "id", false), params, picker);
+    }
+    if (method === "queryRecords") return Promise.resolve(demoQuery(demo.records, params, 10, "id", false));
     if (method === "getEntityById") {
       const sources = { field: demo.fields, actor: demo.actors, group: demo.groups,
         rule: demo.ruleEntities, condition: demo.conditionEntities, effectGroup: demo.effectEntities };
@@ -774,8 +1100,78 @@
     return Promise.resolve(null);
   }
 
+  function isDemoPickerRequest(method, params) {
+    if (method === "queryFields" && params && params.filters && params.filters.mode === "picker") return true;
+    return Boolean(state.entityPicker && state.entityPicker.definition.method === method);
+  }
+
+  function demoPickerResponse(response, params, picker) {
+    if (!picker) return Promise.resolve(response);
+    const search = params && typeof params.search === "string" ? params.search : "";
+    if (state.demoPickerControls.failSearch && search === state.demoPickerControls.failSearch) {
+      return Promise.reject(new Error("demo picker failure"));
+    }
+    const delay = state.demoPickerControls.slowSearch && search === state.demoPickerControls.slowSearch
+      ? state.demoPickerControls.slowMs
+      : 0;
+    if (!delay) return Promise.resolve(response);
+    return new Promise(function (resolve) {
+      window.setTimeout(function () { resolve(response); }, delay);
+    });
+  }
+
+  function demoControlDelay(key) {
+    const value = Number(queryState.get(key) || 0);
+    return Number.isSafeInteger(value) && value > 0 ? Math.min(value, 2000) : 0;
+  }
+
   function page(items) {
     return { items, loadedCount: items.length, totalCount: items.length, hasMore: false, nextCursor: null };
+  }
+
+  function demoQuery(source, request, pageSize, idKey, cursorMode) {
+    const params = request || {};
+    const filters = params.filters || {};
+    const normalizedSearch = normalizeDemoSearch(params.search || "");
+    let items = source.filter(function (item) {
+      if (normalizedSearch && !normalizeDemoSearch([item[idKey], item.name, item.description].filter(Boolean).join(" ")).includes(normalizedSearch)) {
+        return false;
+      }
+      if (typeof filters.enabled === "boolean" && item.enabled !== filters.enabled) return false;
+      if (typeof filters.scope === "string" && item.scope !== filters.scope) return false;
+      if (typeof filters.bindingId === "string" && (!Array.isArray(item.bindingIds) || !item.bindingIds.includes(filters.bindingId))) return false;
+      if (typeof filters.conditionId === "string" && item.conditionId !== filters.conditionId) return false;
+      if (typeof filters.fieldId === "string" && item.fieldId !== filters.fieldId &&
+          (!Array.isArray(item.fieldEffects) || !item.fieldEffects.some(function (effect) { return effect.fieldId === filters.fieldId; }))) return false;
+      return true;
+    });
+    const sort = params.sort;
+    if (sort) {
+      items = items.slice().sort(function (left, right) {
+        const leftValue = left[sort.key];
+        const rightValue = right[sort.key];
+        const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+          ? leftValue - rightValue
+          : String(leftValue).localeCompare(String(rightValue), "zh-CN");
+        if (comparison !== 0) return sort.direction === "desc" ? -comparison : comparison;
+        return String(left[idKey]).localeCompare(String(right[idKey]), "en");
+      });
+    }
+    const cursorOffset = cursorMode && typeof params.cursor === "string" ? Number(params.cursor.replace(/^demo:/, "")) : 0;
+    const offset = cursorMode ? (Number.isSafeInteger(cursorOffset) ? cursorOffset : 0) : ((params.page || 1) - 1) * pageSize;
+    const result = items.slice(offset, offset + pageSize);
+    const hasMore = offset + result.length < items.length;
+    return {
+      items: result,
+      loadedCount: result.length,
+      totalCount: items.length,
+      hasMore,
+      nextCursor: cursorMode && hasMore ? "demo:" + (offset + result.length) : null,
+    };
+  }
+
+  function normalizeDemoSearch(value) {
+    return String(value).normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
   }
 
   function demoDataset(request) {
@@ -850,16 +1246,92 @@
       triggerActorSelector: { kind: "current_actor" }, conditionId: "condition-1",
       actions: [{ kind: "change_field", fieldId: "affinity", target: { kind: "trigger_actor" }, delta: 4, effectGroupIds: ["effect-1"] }],
       cooldownHours: 0, executionOrder: 1, createdAt: timestamp, updatedAt: timestamp }];
+    const demoFields = Array.from({ length: 12 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(2, "0");
+      return {
+        ...field,
+        id: "demo-field-" + ordinal,
+        name: "演示字段 " + ordinal,
+        description: "用于验证服务端搜索与分页",
+        bindingIds: [index % 2 === 0 ? "operit" : "bob"],
+        stages: stages.map(function (item) { return { ...item, id: item.id + "-" + ordinal }; }),
+        order: index + 1,
+      };
+    });
+    const demoConditionEntities = Array.from({ length: 23 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(2, "0");
+      return { id: "demo-condition-" + ordinal, name: "演示条件 " + ordinal, description: "服务端条件查询", enabled: true,
+        expression: { kind: "predicate", predicate: { kind: "user_care" } }, createdAt: timestamp, updatedAt: timestamp };
+    });
+    const demoRuleEntities = Array.from({ length: 12 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(2, "0");
+      return { id: "demo-rule-" + ordinal, name: "演示规则 " + ordinal, description: "服务端规则查询", enabled: index % 3 !== 0,
+        triggerActorSelector: index % 2 === 0 ? { kind: "current_actor" } : { kind: "selected", actorIds: ["bob"] },
+        conditionId: "demo-condition-" + ordinal,
+        actions: [{ kind: "change_field", fieldId: "demo-field-" + ordinal, target: { kind: "trigger_actor" }, delta: index + 1, effectGroupIds: [] }],
+        cooldownHours: 0, executionOrder: index + 1, createdAt: timestamp, updatedAt: timestamp };
+    });
+    const demoEffectEntities = Array.from({ length: 23 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(2, "0");
+      return { id: "demo-effect-" + ordinal, name: "演示效果 " + ordinal, description: "服务端效果查询", enabled: true,
+        fieldEffects: [{ id: "demo-field-effect-" + ordinal, fieldId: "demo-field-" + String(index % 12 + 1).padStart(2, "0"),
+          actorSelector: { kind: "all_bound" }, operations: [{ kind: "immediate_delta", value: 1 }] }],
+        createdAt: timestamp, updatedAt: timestamp };
+    });
+    const demoRecords = Array.from({ length: 20 }, function (_value, index) {
+      return { id: "demo-record-" + index, fieldId: "demo-field-01", fieldName: "演示字段 01", actorId: "operit",
+        actorName: "Operit", groupId: "group-a", before: index, after: index + 1, delta: 1,
+        reason: "分页验证记录", source: "manual", occurredAt: now - (index + 4) * 3600000, truncated: false };
+    });
+    const allFields = [field].concat(demoFields);
+    const allRuleEntities = ruleEntities.concat(demoRuleEntities);
+    const allConditionEntities = conditionEntities.concat(demoConditionEntities);
+    const allEffectEntities = effectEntities.concat(demoEffectEntities);
+    const allRecords = records.concat(demoRecords);
+    const pickerFields = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return {
+        ...field,
+        id: "picker-field-" + ordinal,
+        name: "游标字段 " + ordinal,
+        description: "浏览器高基数字段选择数据",
+        stages: stages.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }),
+        order: index,
+      };
+    });
+    const pickerActors = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { characterId: "picker-actor-" + ordinal, name: "游标角色 " + ordinal, avatarUri: null, enabled: true };
+    });
+    const pickerGroups = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { characterGroupId: "picker-group-" + ordinal, name: "游标群组 " + ordinal, avatarUri: null };
+    });
+    const pickerConditions = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { ...conditionEntities[0], id: "picker-condition-" + ordinal, name: "游标条件 " + ordinal };
+    });
+    const pickerEffects = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { ...effectEntities[0], id: "picker-effect-" + ordinal, name: "游标效果 " + ordinal,
+        fieldEffects: effectEntities[0].fieldEffects.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }) };
+    });
+    const pickerRules = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { ...ruleEntities[0], id: "picker-rule-" + ordinal, name: "游标规则 " + ordinal, executionOrder: index };
+    });
     const pages = { fields: page([fieldSummary]), rules: page(rules), conditions: page(conditions), effectGroups: page(effects), records: page(records) };
     return {
-      fields: [field], actors, groups, groupMembers, records, rules, conditions, effects,
-      ruleEntities, conditionEntities, effectEntities,
+      fields: allFields, actors, groups, groupMembers, records: allRecords, rules, conditions, effects,
+      ruleEntities: allRuleEntities, conditionEntities: allConditionEntities, effectEntities: allEffectEntities,
+      pickerFields, pickerActors, pickerGroups, pickerRules, pickerConditions, pickerEffects,
       snapshot: {
         revision: 7, snapshotTruncated: false,
         activeContext: { chatId: "chat-a", actorId: activeActor ? activeActor.characterId : null,
           groupId: requestedGroup.characterGroupId, actorName: activeActor ? activeActor.name : requestedGroup.name, truncated: false },
         settings: { aiEnabled: true }, migrationStatus: { mode: "v3", source: "existing", truncated: false },
-        counts: { fields: 1, actors: 2, groups: 2, rules: 1, conditions: 1, effectGroups: 1, records: 4 },
+        counts: { fields: allFields.length, actors: 2, groups: 2, rules: allRuleEntities.length,
+          conditions: allConditionEntities.length, effectGroups: allEffectEntities.length, records: allRecords.length },
         selected: { actor: activeActor ? { characterId: activeActor.characterId, name: activeActor.name,
             avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false } : null,
           group: { characterGroupId: requestedGroup.characterGroupId, name: requestedGroup.name,
