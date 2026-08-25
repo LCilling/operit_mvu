@@ -155,15 +155,9 @@
   }
 
   function listMeta(page, noun, currentPage, pageSize, totalCount, filtered) {
-    const pageNumber = currentPage || 1;
-    const size = pageSize || Math.max(1, page.loadedCount);
-    const start = page.loadedCount === 0 ? 0 : (pageNumber - 1) * size + 1;
-    const end = page.loadedCount === 0 ? 0 : start + page.loadedCount - 1;
     const allCount = Number.isSafeInteger(totalCount) ? totalCount : page.totalCount;
-    const counts = filtered
-      ? " · 匹配 " + page.totalCount + " / 共 " + allCount
-      : " / 共 " + allCount;
-    return '<p class="list-meta" aria-live="polite">本页 ' + start + "–" + end + counts + " " + ui.escapeHtml(noun) + "</p>";
+    return '<p class="list-meta" aria-live="polite">已显示 ' + page.loadedCount + " / 匹配 " + page.totalCount +
+      " / 共 " + allCount + "</p>";
   }
 
   function listViewFiltered(view) {
@@ -185,7 +179,7 @@
     const selectedIdList = Array.from(picker.selectedIds);
     const pinnedLimit = 12;
     const pinned = selectedIdList.slice(0, pinnedLimit).map(function (id) {
-      const item = picker.selectedItems.get(id) || picker.items.find(function (candidate) {
+      const item = picker.selectedItems.get(id) || picker.itemById?.get(id) || picker.items.find(function (candidate) {
         return candidate[picker.definition.idKey] === id;
       });
       return '<span class="picker-pinned-item">' + icon("check_circle") + '<span>' +
@@ -196,35 +190,85 @@
       ? '<span class="picker-pinned-overflow" role="status" aria-label="另 ' + (selectedIdList.length - pinnedLimit) +
         ' 项已选择">另 ' + (selectedIdList.length - pinnedLimit) + " 项</span>"
       : "";
-    const rows = picker.items.map(function (item) {
+    const orderIds = Array.isArray(picker.orderIds)
+      ? picker.orderIds
+      : picker.items.map(function (item) { return item[picker.definition.idKey]; });
+    const itemById = picker.itemById instanceof Map
+      ? picker.itemById
+      : new Map(picker.items.map(function (item) { return [item[picker.definition.idKey], item]; }));
+    const resultIds = orderIds.filter(function (id) { return !picker.selectedIds.has(id); });
+    const virtual = picker.virtualWindow || { start: 0, end: Math.min(resultIds.length, 24), rowHeight: 56 };
+    const start = Math.max(0, Math.min(resultIds.length, virtual.start || 0));
+    const end = Math.max(start, Math.min(resultIds.length, virtual.end === undefined ? start + 24 : virtual.end));
+    const rows = resultIds.slice(start, end).map(function (resultId) {
+      const item = itemById.get(resultId);
+      if (!item) return "";
       const id = item[picker.definition.idKey];
-      const selected = picker.selectedIds.has(id);
-      return '<button type="button" class="picker-result ' + (selected ? "selected" : "") + '" role="option" aria-selected="' + selected +
-        '" data-picker-id="' + ui.escapeHtml(id) + '"><span class="picker-result-mark">' +
-        icon(selected ? (multiple ? "check_box" : "radio_button_checked") : (multiple ? "check_box_outline_blank" : "radio_button_unchecked")) +
+      return '<button type="button" class="picker-result " role="option" aria-selected="false" data-picker-id="' +
+        ui.escapeHtml(id) + '"><span class="picker-result-mark">' +
+        icon(multiple ? "check_box_outline_blank" : "radio_button_unchecked") +
         '</span><span><strong>' + ui.escapeHtml(item.name) + '</strong><small>' + ui.escapeHtml(pickerItemSummary(picker.entity, item)) +
         "</small></span></button>";
     }).join("");
-    const status = picker.error
+    const before = start > 0
+      ? '<div class="picker-spacer" data-picker-spacer="before" aria-hidden="true" style="height:' + (start * virtual.rowHeight) + 'px"></div>'
+      : "";
+    const after = end < resultIds.length
+      ? '<div class="picker-spacer" data-picker-spacer="after" aria-hidden="true" style="height:' + ((resultIds.length - end) * virtual.rowHeight) + 'px"></div>'
+      : "";
+    const error = picker.error
       ? '<div class="picker-error" role="alert"><span>' + ui.escapeHtml(picker.error) + '</span><button type="button" data-action="retry-entity-picker">重试</button></div>'
-      : picker.loading && picker.items.length === 0
+      : "";
+    const status = picker.loading && picker.items.length === 0
         ? '<div class="picker-skeleton" aria-label="正在搜索"><i></i><i></i><i></i></div>'
-        : picker.items.length === 0
+        : resultIds.length === 0
           ? '<p class="picker-empty">没有匹配项目，请调整搜索词。</p>'
-          : rows;
+          : before + rows + after;
     return '<div class="picker-layer" data-action="close-entity-picker"><section class="entity-picker' + (picker.opening ? " opening" : "") + '" role="dialog" aria-modal="true" aria-labelledby="entity-picker-title" data-stop-close>' +
       '<header><div><h2 id="entity-picker-title">' + ui.escapeHtml(picker.title) + '</h2><p>输入名称搜索，结果接近底部时自动继续读取。</p></div>' +
       '<button type="button" class="icon-button" data-action="close-entity-picker" aria-label="关闭选择框">' + icon("close") + "</button></header>" +
       '<label class="search-field full picker-search">' + icon("search") + '<input type="search" value="' + ui.escapeHtml(picker.search) +
       '" placeholder="搜索名称" aria-label="搜索' + ui.escapeHtml(picker.title) + '" data-picker-search autocomplete="off"></label>' +
-      (pinned ? '<div class="picker-pinned"><div class="picker-pinned-heading"><strong>已选择 ' + picker.selectedIds.size + "</strong>" +
-        pinnedOverflow + "</div><div>" + pinned + "</div></div>" : "") +
-      '<div class="picker-results" role="listbox" aria-multiselectable="' + multiple + '" data-picker-results tabindex="0">' + status +
+      '<div data-picker-filter-region>' + renderPickerFilters(picker) + "</div>" +
+      '<div data-picker-pinned-region>' + (pinned ? '<div class="picker-pinned"><div class="picker-pinned-heading"><strong>已选择 ' + picker.selectedIds.size + "</strong>" +
+        pinnedOverflow + "</div><div>" + pinned + "</div></div>" : "") + "</div>" +
+      '<div class="picker-results" role="listbox" aria-multiselectable="' + multiple + '" data-picker-results tabindex="0">' + error + status +
       (picker.loading && picker.items.length ? '<p class="picker-fetching" aria-live="polite">正在继续读取…</p>' : "") + "</div>" +
-      '<footer><span>匹配 ' + picker.totalCount + " 项</span><div>" +
+      '<footer data-picker-footer><span>已显示 ' + orderIds.length + " / 匹配 " + picker.totalCount + " / 共 " +
+      (Number.isSafeInteger(picker.allTotalCount) ? picker.allTotalCount : picker.totalCount) + "</span><div>" +
       '<button type="button" class="button secondary" data-action="close-entity-picker">取消</button>' +
       (multiple ? '<button type="button" class="button primary" data-action="confirm-entity-picker">确认选择（' + picker.selectedIds.size + "）</button>" : "") +
       "</div></footer></section></div>";
+  }
+
+  function renderPickerFilters(picker) {
+    const filters = picker.filters || {};
+    if (picker.entity === "fields") {
+      return '<div class="picker-filters" aria-label="字段筛选">' +
+        pickerFilter("筛选字段作用域", "scope", filters.scope, [["", "全部作用域"], ["character", "角色"], ["group", "群组"], ["global", "全局"], ["chat", "会话"]]) +
+        pickerFilter("筛选字段类型", "type", filters.type, [["", "全部类型"], ["full", "完整数值"], ["stage_only", "仅阶段"], ["hidden", "隐藏"]]) +
+        pickerFilter("筛选启用状态", "enabled", filters.enabled, [["", "全部状态"], ["true", "已启用"], ["false", "已停用"]], "boolean") + "</div>";
+    }
+    if (picker.entity === "actors") {
+      const groupId = ui.state.snapshot?.activeContext?.groupId || "";
+      return '<div class="picker-filters" aria-label="角色筛选">' +
+        pickerFilter("筛选启用状态", "enabled", filters.enabled, [["", "全部状态"], ["true", "可用"], ["false", "已停用"]], "boolean") +
+        (groupId ? pickerFilter("筛选成员范围", "groupId", filters.groupId, [["", "全部角色"], [groupId, "当前群成员"]]) : "") + "</div>";
+    }
+    if (picker.entity === "groups") {
+      const actorId = ui.state.snapshot?.activeContext?.actorId || "";
+      return actorId ? '<div class="picker-filters" aria-label="群组筛选">' +
+        pickerFilter("筛选成员范围", "actorId", filters.actorId, [["", "全部群组"], [actorId, "包含当前角色"]]) + "</div>" : "";
+    }
+    return "";
+  }
+
+  function pickerFilter(ariaLabel, key, current, options, valueType) {
+    const value = current === undefined ? "" : String(current);
+    return '<label><span class="visually-hidden">' + ariaLabel + '</span><select aria-label="' + ariaLabel + '" data-picker-filter="' + key + '"' +
+      (valueType ? ' data-filter-value-type="' + valueType + '"' : "") + '>' + options.map(function (option) {
+        return '<option value="' + ui.escapeHtml(option[0]) + '"' + (value === option[0] ? " selected" : "") + '>' + ui.escapeHtml(option[1]) + "</option>";
+      }).join("") + "</select></label>";
   }
 
   function pickerItemSummary(entity, item) {

@@ -29,7 +29,21 @@
     records: { key: "records", method: "queryRecords", pageSize: 10, sort: { key: "occurredAt", direction: "desc" } },
   };
   const PICKER_SEARCH_DEBOUNCE_MS = 180;
-  const PICKER_RESULT_LIMIT = 60;
+  const PICKER_ROW_HEIGHT = 56;
+  const PICKER_WINDOW_OVERSCAN = 4;
+  const PICKER_WINDOW_MAX_ROWS = 24;
+  const PICKER_RETAINED_PAGE_LIMIT = 128;
+  const QUERY_TOTAL_MAX = 10_000;
+  const QUERY_RESPONSE_POLICIES = {
+    fields: { method: "queryFields", pageSize: 5, pickerPageSize: 30 },
+    actors: { method: "queryActors", pageSize: 30, cursor: true },
+    groups: { method: "queryGroups", pageSize: 30, cursor: true },
+    rules: { method: "queryRules", pageSize: 5 },
+    conditions: { method: "queryConditions", pageSize: 10 },
+    effectgroups: { method: "queryEffectGroups", pageSize: 10 },
+    effects: { method: "queryEffectGroups", pageSize: 10 },
+    records: { method: "queryRecords", pageSize: 10 },
+  };
   const PICKER_ENTITIES = {
     fields: { method: "queryFields", label: "fields", idKey: "id", entityType: "field", cursor: true, filters: { mode: "picker" } },
     actors: { method: "queryActors", label: "actors", idKey: "characterId", entityType: "actor", cursor: true },
@@ -75,7 +89,11 @@
       slowSearch: queryState.get("demoPickerSlowSearch") || "",
       slowMs: demoControlDelay("demoPickerSlowMs"),
       failSearch: queryState.get("demoPickerFailSearch") || "",
+      oversizeSearch: queryState.get("demoPickerOversizeSearch") || "",
+      badCursorSearch: queryState.get("demoPickerBadCursorSearch") || "",
     },
+    demoCursorSequence: 0,
+    demoCursors: new Map(),
   };
 
   const native = createNativeBridge();
@@ -96,6 +114,8 @@
     openEntityPicker,
     closeEntityPicker,
     searchEntityPicker,
+    updateEntityPickerFilter,
+    updateEntityPickerViewport,
     retryEntityPicker,
     fetchNextEntityPickerPage,
     toggleEntityPickerSelection,
@@ -130,7 +150,7 @@
     };
     return {
       call(method, params) {
-        if (state.demo) return demoCall(method, params || {});
+        if (state.demo) return Promise.resolve().then(function () { return demoCall(method, params || {}); });
         if (!window.NativeMvu || typeof window.NativeMvu.call !== "function") {
           return Promise.reject(new Error("MVU_NATIVE_BRIDGE_UNAVAILABLE"));
         }
@@ -182,17 +202,52 @@
     if (!finiteNumber(value)) throw new Error(code);
   }
 
-  function validateQueryResponse(value, label) {
-    const code = "MVU_QUERY_RESPONSE_INVALID:" + label;
+  function validateQueryResponse(value, methodOrLabel, request, cursorState) {
+    const policy = queryResponsePolicy(methodOrLabel, request || {});
+    const code = "MVU_QUERY_RESPONSE_INVALID:" + methodOrLabel;
     if (!isRecord(value) || !Array.isArray(value.items)) throw new Error(code);
     if (!nonNegativeInteger(value.loadedCount) || value.loadedCount !== value.items.length) throw new Error(code);
-    if (!nonNegativeInteger(value.totalCount) || value.totalCount < value.loadedCount) throw new Error(code);
+    if (value.loadedCount > policy.pageSize) throw new Error(code);
+    if (!nonNegativeInteger(value.totalCount) || value.totalCount < value.loadedCount || value.totalCount > QUERY_TOTAL_MAX) throw new Error(code);
     if (typeof value.hasMore !== "boolean") throw new Error(code);
-    if (value.nextCursor !== null && typeof value.nextCursor !== "string") throw new Error(code);
-    if (value.hasMore && value.loadedCount >= value.totalCount) throw new Error(code);
-    const validator = queryItemValidator(label);
+    if (value.nextCursor !== null && (typeof value.nextCursor !== "string" || value.nextCursor.length === 0 || value.nextCursor.length > 96)) {
+      throw new Error(code);
+    }
+    if (policy.cursor) {
+      if (value.hasMore !== (value.nextCursor !== null) || (value.hasMore && value.loadedCount === 0)) throw new Error(code);
+      if (value.nextCursor !== null && (value.nextCursor === request?.cursor || cursorState?.seenCursors?.has(value.nextCursor))) {
+        throw new Error(code);
+      }
+      if (cursorState?.expectedTotal !== undefined && value.totalCount !== cursorState.expectedTotal) throw new Error(code);
+      const priorLoaded = nonNegativeInteger(cursorState?.loadedCount) ? cursorState.loadedCount : 0;
+      const cumulativeLoaded = priorLoaded + value.loadedCount;
+      if (cumulativeLoaded > value.totalCount ||
+          (value.hasMore && cumulativeLoaded >= value.totalCount) ||
+          (!value.hasMore && cumulativeLoaded !== value.totalCount)) throw new Error(code);
+    } else {
+      if (value.nextCursor !== null) throw new Error(code);
+      const pageNumber = Number.isSafeInteger(request?.page) && request.page > 0 ? request.page : 1;
+      const offset = (pageNumber - 1) * policy.pageSize;
+      if (value.loadedCount > Math.max(0, value.totalCount - offset)) throw new Error(code);
+      if (value.hasMore !== (offset + value.loadedCount < value.totalCount)) throw new Error(code);
+    }
+    const validator = queryItemValidator(policy.key);
     if (validator) value.items.forEach(validator);
     return value;
+  }
+
+  function queryResponsePolicy(methodOrLabel, request) {
+    const raw = String(methodOrLabel || "").replace(/^query/i, "").toLocaleLowerCase();
+    const policy = QUERY_RESPONSE_POLICIES[raw];
+    if (!policy) throw new Error("MVU_QUERY_RESPONSE_METHOD_INVALID:" + methodOrLabel);
+    const cursor = policy.cursor === true || (raw === "fields" &&
+      (request.cursor !== undefined || request.filters?.mode === "picker"));
+    return {
+      ...policy,
+      key: raw,
+      cursor,
+      pageSize: cursor && policy.pickerPageSize ? policy.pickerPageSize : policy.pageSize,
+    };
   }
 
   function queryItemValidator(label) {
@@ -276,6 +331,18 @@
     requireFinite(field.perTurnChange.intervalTurns, "MVU_FIELD_INVALID");
     requireFinite(field.perTurnChange.amount, "MVU_FIELD_INVALID");
     if (!["user", "character", "both"].includes(field.perTurnChange.countMode)) throw new Error("MVU_FIELD_INVALID");
+    requireString(field.bindingDisplay, "MVU_FIELD_PROJECTION_INVALID");
+    requireString(field.scopeKey, "MVU_FIELD_PROJECTION_INVALID", true);
+    if (field.currentValue !== null) requireFinite(field.currentValue, "MVU_FIELD_PROJECTION_INVALID");
+    if ((field.currentValue === null) !== (field.scopeKey === null) ||
+        (field.currentValue === null) !== (field.currentStage === null)) throw new Error("MVU_FIELD_PROJECTION_INVALID");
+    if (field.currentStage !== null) {
+      if (!isRecord(field.currentStage)) throw new Error("MVU_FIELD_PROJECTION_INVALID");
+      requireString(field.currentStage.id, "MVU_FIELD_PROJECTION_INVALID");
+      requireString(field.currentStage.name, "MVU_FIELD_PROJECTION_INVALID");
+      requireString(field.currentStage.description, "MVU_FIELD_PROJECTION_INVALID");
+      requireFinite(field.currentStage.threshold, "MVU_FIELD_PROJECTION_INVALID");
+    }
   }
 
   function validateRule(rule) {
@@ -594,7 +661,14 @@
   async function loadSnapshot(request) {
     const snapshot = validateCompactSnapshot(await native.call("snapshot", request || {}));
     const previousRevision = state.snapshot === null ? null : state.snapshot.revision;
+    const previousContext = state.snapshot === null ? "" : contextIdentity(state.snapshot.activeContext);
+    const nextContext = contextIdentity(snapshot.activeContext);
     if (previousRevision !== null && previousRevision !== snapshot.revision) state.entities.clear();
+    else if (previousContext && previousContext !== nextContext) {
+      Array.from(state.entities.keys()).forEach(function (key) {
+        if (key.startsWith("field:")) state.entities.delete(key);
+      });
+    }
     state.snapshot = snapshot;
     state.pages = {
       fields: snapshot.pages.fields,
@@ -609,9 +683,13 @@
     return snapshot;
   }
 
-  async function query(method, request, label) {
+  function contextIdentity(context) {
+    return [context?.chatId || "", context?.actorId || "", context?.groupId || ""].join("\u0000");
+  }
+
+  async function query(method, request, label, validationState) {
     try {
-      return validateQueryResponse(await native.call(method, request || {}), label || method);
+      return validateQueryResponse(await native.call(method, request || {}), method, request || {}, validationState);
     } catch (error) {
       const wrapped = new Error("页面数据有误，请重试");
       wrapped.cause = error;
@@ -643,15 +721,29 @@
       search: "",
       filters: { ...(definition.filters || {}), ...(options.filters || {}) },
       items: [],
+      orderIds: [],
+      itemById: new Map(),
       selectedIds,
       selectedItems,
       totalCount: 0,
+      allTotalCount: pickerAllTotalCount(options.entity),
       hasMore: false,
       nextCursor: null,
       nextPage: 2,
       loading: false,
       error: "",
       requestToken: 0,
+      seenCursors: new Set(),
+      autoFetchBlocked: false,
+      retainedPageLimit: PICKER_RETAINED_PAGE_LIMIT,
+      expectedTotal: undefined,
+      virtualWindow: {
+        scrollTop: 0,
+        viewportHeight: 336,
+        rowHeight: PICKER_ROW_HEIGHT,
+        start: 0,
+        end: 0,
+      },
       searchTimer: 0,
       opening: true,
       openingTimer: 0,
@@ -669,6 +761,12 @@
     return state.entityPicker;
   }
 
+  function pickerAllTotalCount(entity) {
+    const counts = state.snapshot && state.snapshot.counts;
+    const key = entity === "effectGroups" ? "effectGroups" : entity;
+    return counts && nonNegativeInteger(counts[key]) ? counts[key] : 0;
+  }
+
   function closeEntityPicker() {
     const picker = state.entityPicker;
     if (!picker) return;
@@ -680,15 +778,19 @@
     state.entityPicker = null;
     renderIfReady();
     Promise.resolve().then(function () {
-      let focusTarget = restoreFocus;
-      if (restoreFocusDescriptor && typeof document.querySelectorAll === "function") {
-        focusTarget = Array.from(document.querySelectorAll("[data-action]")).find(function (candidate) {
-          return candidate.dataset.action === restoreFocusDescriptor.action &&
-            (!restoreFocusDescriptor.pickerKey || candidate.dataset.pickerKey === restoreFocusDescriptor.pickerKey);
-        }) || focusTarget;
-      }
-      if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
+      focusEntityPickerOpener(restoreFocus, restoreFocusDescriptor);
     });
+  }
+
+  function focusEntityPickerOpener(restoreFocus, restoreFocusDescriptor) {
+    let focusTarget = restoreFocus;
+    if (restoreFocusDescriptor && typeof document.querySelectorAll === "function") {
+      focusTarget = Array.from(document.querySelectorAll("[data-action]")).find(function (candidate) {
+        return candidate.dataset.action === restoreFocusDescriptor.action &&
+          (!restoreFocusDescriptor.pickerKey || candidate.dataset.pickerKey === restoreFocusDescriptor.pickerKey);
+      }) || focusTarget;
+    }
+    if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
   }
 
   function searchEntityPicker(value) {
@@ -696,6 +798,7 @@
     if (!picker) return;
     picker.search = String(value == null ? "" : value);
     picker.error = "";
+    picker.autoFetchBlocked = false;
     if (picker.searchTimer) window.clearTimeout(picker.searchTimer);
     picker.searchTimer = window.setTimeout(function () {
       picker.searchTimer = 0;
@@ -703,13 +806,58 @@
     }, PICKER_SEARCH_DEBOUNCE_MS);
   }
 
+  function updateEntityPickerFilter(key, rawValue, valueType) {
+    const picker = state.entityPicker;
+    if (!picker) return Promise.resolve(null);
+    const allowed = {
+      fields: new Set(["scope", "type", "enabled"]),
+      actors: new Set(["enabled", "groupId"]),
+      groups: new Set(["actorId"]),
+    }[picker.entity];
+    if (!allowed || !allowed.has(key)) return Promise.reject(new Error("MVU_PICKER_FILTER_INVALID"));
+    const nextFilters = { ...picker.filters };
+    if (rawValue === "") delete nextFilters[key];
+    else nextFilters[key] = valueType === "boolean" ? rawValue === "true" : String(rawValue);
+    picker.filters = nextFilters;
+    picker.error = "";
+    picker.autoFetchBlocked = false;
+    return loadEntityPicker(true);
+  }
+
+  function updateEntityPickerViewport(scrollTop, clientHeight) {
+    const picker = state.entityPicker;
+    if (!picker) return false;
+    const previousStart = picker.virtualWindow.start;
+    const previousEnd = picker.virtualWindow.end;
+    picker.virtualWindow.scrollTop = finiteNumber(scrollTop) ? Math.max(0, scrollTop) : 0;
+    if (finiteNumber(clientHeight) && clientHeight > 0) picker.virtualWindow.viewportHeight = clientHeight;
+    computePickerVirtualWindow(picker);
+    return previousStart !== picker.virtualWindow.start || previousEnd !== picker.virtualWindow.end;
+  }
+
+  function pickerVisibleIds(picker) {
+    return picker.orderIds.filter(function (id) { return !picker.selectedIds.has(id); });
+  }
+
+  function computePickerVirtualWindow(picker) {
+    const windowState = picker.virtualWindow;
+    const itemCount = pickerVisibleIds(picker).length;
+    const firstVisible = Math.floor(windowState.scrollTop / windowState.rowHeight);
+    const viewportRows = Math.max(1, Math.ceil(windowState.viewportHeight / windowState.rowHeight));
+    const start = Math.max(0, Math.min(itemCount, firstVisible - PICKER_WINDOW_OVERSCAN));
+    const desiredRows = Math.min(PICKER_WINDOW_MAX_ROWS, viewportRows + PICKER_WINDOW_OVERSCAN * 2);
+    windowState.start = start;
+    windowState.end = Math.min(itemCount, start + desiredRows);
+  }
+
   function retryEntityPicker() {
+    if (state.entityPicker) state.entityPicker.autoFetchBlocked = false;
     return loadEntityPicker(true);
   }
 
   function fetchNextEntityPickerPage() {
     const picker = state.entityPicker;
-    if (!picker || picker.loading || !picker.hasMore) return Promise.resolve(false);
+    if (!picker || picker.loading || !picker.hasMore || picker.autoFetchBlocked) return Promise.resolve(false);
     return loadEntityPicker(false).then(function () { return true; });
   }
 
@@ -717,6 +865,10 @@
     const picker = state.entityPicker;
     if (!picker) return null;
     const token = ++picker.requestToken;
+    if (reset) {
+      picker.seenCursors.clear();
+      picker.expectedTotal = undefined;
+    }
     const request = { search: picker.search, filters: { ...picker.filters } };
     if (picker.definition.cursor) {
       if (!reset && picker.nextCursor) request.cursor = picker.nextCursor;
@@ -727,22 +879,46 @@
     picker.error = "";
     renderIfReady();
     try {
-      const response = await query(picker.definition.method, request, picker.definition.label);
+      const response = await query(picker.definition.method, request, picker.definition.label, {
+        seenCursors: picker.seenCursors,
+        expectedTotal: picker.expectedTotal,
+        loadedCount: reset ? 0 : picker.orderIds.length,
+      });
       if (state.entityPicker !== picker || token !== picker.requestToken) return null;
+      const retentionPageSize = queryResponsePolicy(picker.definition.method, request).pageSize;
+      if (response.totalCount > retentionPageSize * picker.retainedPageLimit) {
+        throw new Error("MVU_PICKER_RETENTION_LIMIT");
+      }
+      if (reset) {
+        picker.orderIds = [];
+        picker.itemById.clear();
+      }
+      let insertedCount = 0;
       response.items.forEach(function (item) {
         const id = item[picker.definition.idKey];
+        if (!picker.itemById.has(id)) {
+          picker.orderIds.push(id);
+          insertedCount += 1;
+        }
+        picker.itemById.set(id, item);
         if (picker.selectedIds.has(id)) picker.selectedItems.set(id, item);
       });
-      picker.items = (reset ? response.items : picker.items.concat(response.items)).slice(-PICKER_RESULT_LIMIT);
+      if (!reset && response.hasMore && insertedCount === 0) throw new Error("MVU_QUERY_CURSOR_NO_PROGRESS");
+      picker.items = picker.orderIds.map(function (id) { return picker.itemById.get(id); });
       picker.totalCount = response.totalCount;
+      picker.expectedTotal = response.totalCount;
       picker.hasMore = response.hasMore;
       picker.nextCursor = response.nextCursor;
+      if (response.nextCursor !== null) picker.seenCursors.add(response.nextCursor);
       picker.nextPage = reset ? 2 : picker.nextPage + 1;
       picker.error = "";
+      picker.autoFetchBlocked = false;
+      computePickerVirtualWindow(picker);
       return response;
     } catch (_error) {
       if (state.entityPicker !== picker || token !== picker.requestToken) return null;
       picker.error = "搜索失败，已保留所选项。请重试。";
+      picker.autoFetchBlocked = true;
       return null;
     } finally {
       if (state.entityPicker === picker && token === picker.requestToken) {
@@ -755,8 +931,7 @@
   function toggleEntityPickerSelection(id) {
     const picker = state.entityPicker;
     if (!picker || typeof id !== "string") return;
-    const item = picker.items.find(function (candidate) { return candidate[picker.definition.idKey] === id; }) ||
-      picker.selectedItems.get(id);
+    const item = picker.itemById.get(id) || picker.selectedItems.get(id);
     if (picker.mode === "single") {
       if (item) picker.selectedItems.set(id, item);
       picker.selectedIds = new Set([id]);
@@ -770,6 +945,7 @@
       picker.selectedIds.add(id);
       if (item) picker.selectedItems.set(id, item);
     }
+    computePickerVirtualWindow(picker);
     renderIfReady();
   }
 
@@ -782,12 +958,24 @@
   function commitEntityPicker(picker) {
     const ids = Array.from(picker.selectedIds);
     const items = ids.map(function (id) { return picker.selectedItems.get(id); }).filter(Boolean);
-    if (picker.onCommit) picker.onCommit(ids, items);
-    closeEntityPicker();
+    let completion;
+    try {
+      if (picker.onCommit) completion = picker.onCommit(ids, items);
+    } finally {
+      closeEntityPicker();
+    }
+    if (completion && typeof completion.then === "function") {
+      Promise.resolve(completion).then(function () {
+        focusEntityPickerOpener(picker.restoreFocus, picker.restoreFocusDescriptor);
+      }, function () {
+        focusEntityPickerOpener(picker.restoreFocus, picker.restoreFocusDescriptor);
+      });
+    }
   }
 
   function renderIfReady() {
-    if (typeof window.MvuUi.render === "function") window.MvuUi.render();
+    if (typeof window.MvuUi.patchEntityPicker === "function") window.MvuUi.patchEntityPicker();
+    else if (typeof window.MvuUi.render === "function") window.MvuUi.render();
   }
 
   async function updateListView(routeId, patch) {
@@ -818,7 +1006,7 @@
     state.pages[policy.key] = response;
     if (policy.key === "fields") {
       response.items.forEach(function (field) { state.entities.set("field:" + field.id, field); });
-      await hydrateFieldBindingLabels(response.items);
+      response.items.forEach(function (field) { state.bindingLabels.set(field.id, field.bindingDisplay); });
     }
     if (policy.key === "rules") await hydrateRuleLabels(response.items);
     return response;
@@ -929,20 +1117,17 @@
     state.routeError = null;
     try {
       if (LIST_POLICIES[routeId]) await loadManagementPage(routeId);
-      if ((routeId === "status" || routeId === "field-detail") &&
+      if (routeId === "status" &&
           state.directory.actors.length === 0 && state.directory.groups.length === 0) {
         await loadDirectory(state.snapshot && state.snapshot.activeContext.groupId);
       }
       if (routeId === "field-detail") {
         if (!state.selectedFieldId) throw new Error("MVU_FIELD_SELECTION_MISSING");
-        await getEntity("field", state.selectedFieldId);
-        const summary = state.snapshot.pages.fields.items.find(function (field) {
-          return field.id === state.selectedFieldId;
-        });
-        if (!summary || !summary.current) throw new Error("MVU_FIELD_CONTEXT_MISSING");
+        const field = await getEntity("field", state.selectedFieldId);
+        if (field.currentValue === null || field.scopeKey === null) throw new Error("MVU_FIELD_CONTEXT_MISSING");
         state.detailRecords = await query("queryRecords", {
           page: 1,
-          filters: { fieldId: state.selectedFieldId, scopeKey: summary.current.scopeKey },
+          filters: { fieldId: state.selectedFieldId, scopeKey: field.scopeKey },
         }, "records");
       }
       const entityRoutes = {
@@ -1063,32 +1248,46 @@
     if (method === "queryActors") {
       const groupId = params && params.filters && params.filters.groupId;
       const picker = isDemoPickerRequest(method, params);
-      const source = picker ? demo.pickerActors : (groupId ? (demo.groupMembers[groupId] || []) : demo.actors);
-      return demoPickerResponse(demoQuery(source, params, 30, "characterId", true), params, picker);
+      const source = picker
+        ? (groupId ? demo.pickerActors.filter(function (_actor, index) {
+            return groupId === "group-b" ? index % 2 === 1 : index % 2 === 0;
+          }) : demo.pickerActors)
+        : (groupId ? (demo.groupMembers[groupId] || []) : demo.actors);
+      return demoPickerResponse(demoQuery(source, params, 30, "characterId", true, "actors"), params, picker, source);
     }
     if (method === "queryGroups") {
       const picker = isDemoPickerRequest(method, params);
-      return demoPickerResponse(demoQuery(picker ? demo.pickerGroups : demo.groups, params, 30, "characterGroupId", true), params, picker);
+      const actorId = params && params.filters && params.filters.actorId;
+      const source = picker
+        ? (actorId ? demo.pickerGroups.filter(function (_group, index) {
+            return actorId === "bob" ? index % 2 === 1 : index % 2 === 0;
+          }) : demo.pickerGroups)
+        : demo.groups;
+      return demoPickerResponse(demoQuery(source, params, 30, "characterGroupId", true, "groups"), params, picker, source);
     }
     if (method === "queryFields") {
       const picker = isDemoPickerRequest(method, params);
-      return demoPickerResponse(demoQuery(picker ? demo.pickerFields : demo.fields, params, picker ? 30 : 5, "id", picker), params, picker);
+      const source = picker ? demo.pickerFields : demo.fields;
+      return demoPickerResponse(demoQuery(source, params, picker ? 30 : 5, "id", picker, "fields"), params, picker, source);
     }
     if (method === "queryRules") {
       const picker = isDemoPickerRequest(method, params);
-      return demoPickerResponse(demoQuery(picker ? demo.pickerRules : demo.ruleEntities, params, picker ? 10 : 5, "id", false), params, picker);
+      const source = picker ? demo.pickerRules : demo.ruleEntities;
+      return demoPickerResponse(demoQuery(source, params, picker ? 10 : 5, "id", false), params, picker, source);
     }
     if (method === "queryConditions") {
       const picker = isDemoPickerRequest(method, params);
-      return demoPickerResponse(demoQuery(picker ? demo.pickerConditions : demo.conditionEntities, params, 10, "id", false), params, picker);
+      const source = picker ? demo.pickerConditions : demo.conditionEntities;
+      return demoPickerResponse(demoQuery(source, params, 10, "id", false), params, picker, source);
     }
     if (method === "queryEffectGroups") {
       const picker = isDemoPickerRequest(method, params);
-      return demoPickerResponse(demoQuery(picker ? demo.pickerEffects : demo.effectEntities, params, 10, "id", false), params, picker);
+      const source = picker ? demo.pickerEffects : demo.effectEntities;
+      return demoPickerResponse(demoQuery(source, params, 10, "id", false), params, picker, source);
     }
     if (method === "queryRecords") return Promise.resolve(demoQuery(demo.records, params, 10, "id", false));
     if (method === "getEntityById") {
-      const sources = { field: demo.fields, actor: demo.actors, group: demo.groups,
+      const sources = { field: demo.fields, actor: demo.actors.concat(demo.pickerActors), group: demo.groups.concat(demo.pickerGroups),
         rule: demo.ruleEntities, condition: demo.conditionEntities, effectGroup: demo.effectEntities };
       const idKey = params.entityType === "actor" ? "characterId" :
         params.entityType === "group" ? "characterGroupId" : "id";
@@ -1105,11 +1304,21 @@
     return Boolean(state.entityPicker && state.entityPicker.definition.method === method);
   }
 
-  function demoPickerResponse(response, params, picker) {
+  function demoPickerResponse(response, params, picker, source) {
     if (!picker) return Promise.resolve(response);
     const search = params && typeof params.search === "string" ? params.search : "";
     if (state.demoPickerControls.failSearch && search === state.demoPickerControls.failSearch) {
       return Promise.reject(new Error("demo picker failure"));
+    }
+    if (state.demoPickerControls.oversizeSearch && search === state.demoPickerControls.oversizeSearch) {
+      const items = source.slice(0, 31);
+      return Promise.resolve({ items, loadedCount: items.length, totalCount: Math.max(31, source.length), hasMore: true,
+        nextCursor: "demo_fault_oversize" });
+    }
+    if (state.demoPickerControls.badCursorSearch && search === state.demoPickerControls.badCursorSearch) {
+      const items = source.slice(0, Math.min(30, source.length));
+      return Promise.resolve({ items, loadedCount: items.length, totalCount: source.length, hasMore: true,
+        nextCursor: "demo_bad_cursor" });
     }
     const delay = state.demoPickerControls.slowSearch && search === state.demoPickerControls.slowSearch
       ? state.demoPickerControls.slowMs
@@ -1129,7 +1338,7 @@
     return { items, loadedCount: items.length, totalCount: items.length, hasMore: false, nextCursor: null };
   }
 
-  function demoQuery(source, request, pageSize, idKey, cursorMode) {
+  function demoQuery(source, request, pageSize, idKey, cursorMode, cursorEntity) {
     const params = request || {};
     const filters = params.filters || {};
     const normalizedSearch = normalizeDemoSearch(params.search || "");
@@ -1139,6 +1348,7 @@
       }
       if (typeof filters.enabled === "boolean" && item.enabled !== filters.enabled) return false;
       if (typeof filters.scope === "string" && item.scope !== filters.scope) return false;
+      if (typeof filters.type === "string" && item.modelVisibility !== filters.type) return false;
       if (typeof filters.bindingId === "string" && (!Array.isArray(item.bindingIds) || !item.bindingIds.includes(filters.bindingId))) return false;
       if (typeof filters.conditionId === "string" && item.conditionId !== filters.conditionId) return false;
       if (typeof filters.fieldId === "string" && item.fieldId !== filters.fieldId &&
@@ -1157,8 +1367,17 @@
         return String(left[idKey]).localeCompare(String(right[idKey]), "en");
       });
     }
-    const cursorOffset = cursorMode && typeof params.cursor === "string" ? Number(params.cursor.replace(/^demo:/, "")) : 0;
-    const offset = cursorMode ? (Number.isSafeInteger(cursorOffset) ? cursorOffset : 0) : ((params.page || 1) - 1) * pageSize;
+    const cursorFingerprint = demoCursorFingerprint(params);
+    let cursorOffset = 0;
+    if (cursorMode && typeof params.cursor === "string") {
+      const cursor = state.demoCursors.get(params.cursor);
+      state.demoCursors.delete(params.cursor);
+      if (!cursor || cursor.entity !== cursorEntity || cursor.fingerprint !== cursorFingerprint) {
+        throw new Error("demo cursor invalid");
+      }
+      cursorOffset = cursor.offset;
+    }
+    const offset = cursorMode ? cursorOffset : ((params.page || 1) - 1) * pageSize;
     const result = items.slice(offset, offset + pageSize);
     const hasMore = offset + result.length < items.length;
     return {
@@ -1166,8 +1385,23 @@
       loadedCount: result.length,
       totalCount: items.length,
       hasMore,
-      nextCursor: cursorMode && hasMore ? "demo:" + (offset + result.length) : null,
+      nextCursor: cursorMode && hasMore ? issueDemoCursor(cursorEntity, cursorFingerprint, offset + result.length) : null,
     };
+  }
+
+  function demoCursorFingerprint(request) {
+    const filters = Object.entries(request.filters || {}).sort(function (left, right) {
+      return left[0].localeCompare(right[0], "en");
+    });
+    return JSON.stringify({ search: normalizeDemoSearch(request.search || ""), filters, sort: request.sort || null });
+  }
+
+  function issueDemoCursor(entity, fingerprint, offset) {
+    state.demoCursorSequence += 1;
+    const token = "demo_c1_" + state.demoCursorSequence.toString(36).padStart(4, "0");
+    state.demoCursors.set(token, { entity, fingerprint, offset });
+    while (state.demoCursors.size > 64) state.demoCursors.delete(state.demoCursors.keys().next().value);
+    return token;
   }
 
   function normalizeDemoSearch(value) {
@@ -1198,12 +1432,20 @@
       { characterGroupId: "group-a", name: "MVU_QA_Group", avatarUri: null },
       { characterGroupId: "group-b", name: "夜航小组", avatarUri: null },
     ];
+    const pickerActors = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { characterId: "picker-actor-" + ordinal, name: "游标角色 " + ordinal, avatarUri: null, enabled: true };
+    });
+    const pickerGroups = Array.from({ length: 96 }, function (_value, index) {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return { characterGroupId: "picker-group-" + ordinal, name: "游标群组 " + ordinal, avatarUri: null };
+    });
     const groupMembers = {
       "group-a": actors,
       "group-b": [actors[1]],
     };
-    const requestedGroup = groups.find(function (group) { return group.characterGroupId === request.groupId; }) || groups[0];
-    const requestedActor = actors.find(function (actor) { return actor.characterId === request.actorId; }) || null;
+    const requestedGroup = groups.concat(pickerGroups).find(function (group) { return group.characterGroupId === request.groupId; }) || groups[0];
+    const requestedActor = actors.concat(pickerActors).find(function (actor) { return actor.characterId === request.actorId; }) || null;
     const isGroupProjection = typeof request.groupId === "string" && !request.actorId;
     const activeActor = isGroupProjection ? null : (requestedActor || actors[0]);
     const value = isGroupProjection
@@ -1283,7 +1525,33 @@
         actorName: "Operit", groupId: "group-a", before: index, after: index + 1, delta: 1,
         reason: "分页验证记录", source: "manual", occurredAt: now - (index + 4) * 3600000, truncated: false };
     });
-    const allFields = [field].concat(demoFields);
+    function projectFieldForDemo(candidate) {
+      const applies = candidate.scope === "global" || candidate.scope === "chat" ||
+        (candidate.scope === "character" && activeActor && candidate.bindingIds.includes(activeActor.characterId)) ||
+        (candidate.scope === "group" && candidate.bindingIds.includes(requestedGroup.characterGroupId));
+      const currentValue = applies ? Math.max(candidate.minimum, Math.min(candidate.maximum, value + candidate.order % 7)) : null;
+      const currentStage = currentValue === null ? null : candidate.stages.slice().reverse().find(function (item) {
+        return currentValue >= item.threshold;
+      }) || candidate.stages[0];
+      const bindingNames = candidate.scope === "character"
+        ? candidate.bindingIds.map(function (id) { return actors.find(function (actor) { return actor.characterId === id; })?.name || id; })
+        : candidate.scope === "group"
+          ? candidate.bindingIds.map(function (id) { return groups.find(function (group) { return group.characterGroupId === id; })?.name || id; })
+          : [];
+      return {
+        ...candidate,
+        currentValue,
+        currentStage,
+        bindingDisplay: candidate.scope === "global" ? "所有角色、群组和会话"
+          : candidate.scope === "chat" ? "当前会话"
+            : bindingNames.length ? bindingNames.join("、") : "未绑定",
+        scopeKey: currentValue === null ? null
+          : candidate.scope === "character" ? "character:" + activeActor.characterId
+            : candidate.scope === "group" ? "group:" + requestedGroup.characterGroupId
+              : candidate.scope === "chat" ? "chat:chat-a" : "global",
+      };
+    }
+    const allFields = [field].concat(demoFields).map(projectFieldForDemo);
     const allRuleEntities = ruleEntities.concat(demoRuleEntities);
     const allConditionEntities = conditionEntities.concat(demoConditionEntities);
     const allEffectEntities = effectEntities.concat(demoEffectEntities);
@@ -1298,15 +1566,7 @@
         stages: stages.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }),
         order: index,
       };
-    });
-    const pickerActors = Array.from({ length: 96 }, function (_value, index) {
-      const ordinal = String(index + 1).padStart(3, "0");
-      return { characterId: "picker-actor-" + ordinal, name: "游标角色 " + ordinal, avatarUri: null, enabled: true };
-    });
-    const pickerGroups = Array.from({ length: 96 }, function (_value, index) {
-      const ordinal = String(index + 1).padStart(3, "0");
-      return { characterGroupId: "picker-group-" + ordinal, name: "游标群组 " + ordinal, avatarUri: null };
-    });
+    }).map(projectFieldForDemo);
     const pickerConditions = Array.from({ length: 96 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(3, "0");
       return { ...conditionEntities[0], id: "picker-condition-" + ordinal, name: "游标条件 " + ordinal };
@@ -1330,7 +1590,7 @@
         activeContext: { chatId: "chat-a", actorId: activeActor ? activeActor.characterId : null,
           groupId: requestedGroup.characterGroupId, actorName: activeActor ? activeActor.name : requestedGroup.name, truncated: false },
         settings: { aiEnabled: true }, migrationStatus: { mode: "v3", source: "existing", truncated: false },
-        counts: { fields: allFields.length, actors: 2, groups: 2, rules: allRuleEntities.length,
+        counts: { fields: allFields.length, actors: pickerActors.length, groups: pickerGroups.length, rules: allRuleEntities.length,
           conditions: allConditionEntities.length, effectGroups: allEffectEntities.length, records: allRecords.length },
         selected: { actor: activeActor ? { characterId: activeActor.characterId, name: activeActor.name,
             avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false } : null,

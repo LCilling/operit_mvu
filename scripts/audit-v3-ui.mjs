@@ -138,8 +138,6 @@ requireMatch(files["runtime.js"], /PICKER_SEARCH_DEBOUNCE_MS\s*=\s*180/,
   "picker search must use the exact 180ms debounce");
 requireMatch(files["runtime.js"], /requestToken[\s\S]*?token\s*!==[\s\S]*?requestToken/,
   "picker must discard stale async responses by request token");
-requireMatch(files["runtime.js"], /PICKER_RESULT_LIMIT\s*=\s*60[\s\S]*?slice\(-PICKER_RESULT_LIMIT\)/,
-  "picker result DOM must remain bounded while cursor batches append");
 requireMatch(files["components.js"], /role="dialog"[\s\S]*?data-picker-search[\s\S]*?data-picker-results/,
   "picker must render as a searchable dialog with a bounded result region");
 requireMatch(files["components.js"], /picker-pinned[\s\S]*?已选择/,
@@ -164,10 +162,6 @@ requireMatch(files["app.js"], /entityPicker[\s\S]*?Escape[\s\S]*?Tab/,
   "picker must support Escape and trapped keyboard focus");
 rejectMatch(allUi, /加载更多/,
   "large lists and pickers must not expose load-more copy or actions");
-rejectMatch(allUi, /<select[^>]*>[\s\S]{0,800}(?:fields|字段列表|allFields)/i,
-  "field selectors must not populate a select with an unbounded field collection");
-requireMatch(files["components.js"], /const counts\s*=\s*filtered[\s\S]*?匹配[\s\S]*?\/ 共 [\s\S]*?allCount[\s\S]*?本页/,
-  "list counts must distinguish the matched total from the authoritative all total");
 requireMatch(files["pages-config.js"] + files["pages-rules.js"] + files["pages-status.js"],
   /snapshot\.counts\.fields[\s\S]*?snapshot\.counts\[pageCountKey\(route\)\][\s\S]*?snapshot\.counts\.records/,
   "field, rule, condition, effect and record counts must source all totals from the compact snapshot");

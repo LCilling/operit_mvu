@@ -21,18 +21,18 @@
       '<div class="toolbar"><label class="search-field">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) +
       '" placeholder="搜索字段" aria-label="搜索字段" data-list-search-route="config-fields" /></label>' +
       '<button type="button" class="square-action" data-action="new-field" aria-label="新增字段">' + c.icon("add") + "</button></div>" +
-      c.listMeta(page, "个字段", view.page, 5, ui.state.snapshot.counts.fields, c.listViewFiltered(view)) + (page.items.length
+      fieldFilters(view) +
+      '<div data-management-region="config-fields">' + c.listMeta(page, "个字段", view.page, 5, ui.state.snapshot.counts.fields, c.listViewFiltered(view)) + (page.items.length
         ? '<div class="management-list">' + page.items.map(fieldManagementCard).join("") + "</div>"
         : c.emptyState("add_circle", "还没有字段", "创建第一个字段后，可在状态页查看数值。",
           '<button type="button" class="button primary" data-action="new-field">新增字段</button>')) +
-      c.pagination(page, "config-fields", view.page) + "</div>";
+      c.pagination(page, "config-fields", view.page) + "</div></div>";
   }
 
   function fieldManagementCard(field) {
-    const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
-    const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
-    const current = summary && summary.current ? ui.formatNumber(summary.current.value) : "未绑定";
-    const binding = ui.state.bindingLabels.get(field.id) || (field.bindingIds.length ? field.bindingIds.length + " 个绑定" : "未绑定");
+    const currentValue = field.currentValue === null ? field.initialValue : field.currentValue;
+    const current = field.currentValue === null ? "未绑定" : ui.formatNumber(field.currentValue);
+    const binding = field.bindingDisplay;
     const view = { theme: { icon: field.icon, color: field.themeColor } };
     return '<article class="management-card range-card" data-range-card="' + ui.escapeHtml(field.id) + '"><header><div>' + c.stateIcon(view) +
       '<span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope] || field.scope) + " · " + ui.escapeHtml(binding) +
@@ -47,6 +47,25 @@
       '<button type="button" class="button secondary" data-action="edit-field" data-field-id="' + ui.escapeHtml(field.id) + '">修改</button>' +
       '<button type="button" class="button primary compact" data-action="save-field-range" data-field-id="' + ui.escapeHtml(field.id) + '" disabled>保存范围</button></div>' +
       '<p class="inline-error" role="alert" data-range-error></p></article>';
+  }
+
+  function fieldFilters(view) {
+    return '<div class="filter-bar" aria-label="筛选字段">' +
+      filterSelect("作用域", "scope", "筛选字段作用域", view.filters.scope, [
+        ["", "全部作用域"], ["character", "角色"], ["group", "群组"], ["global", "全局"], ["chat", "会话"],
+      ]) + filterSelect("类型", "type", "筛选字段类型", view.filters.type, [
+        ["", "全部类型"], ["full", "完整数值"], ["stage_only", "仅阶段"], ["hidden", "隐藏"],
+      ]) + filterSelect("状态", "enabled", "筛选启用状态", view.filters.enabled, [
+        ["", "全部状态"], ["true", "已启用"], ["false", "已停用"],
+      ], "boolean") + "</div>";
+  }
+
+  function filterSelect(label, key, ariaLabel, current, options, valueType) {
+    const value = current === undefined ? "" : String(current);
+    return '<label><span>' + label + '</span><select aria-label="' + ariaLabel + '" data-list-filter-route="config-fields" data-list-filter-key="' +
+      key + '"' + (valueType ? ' data-filter-value-type="' + valueType + '"' : "") + '>' + options.map(function (option) {
+        return '<option value="' + option[0] + '"' + (value === option[0] ? " selected" : "") + '>' + option[1] + "</option>";
+      }).join("") + "</select></label>";
   }
 
   function fieldEditorPage() {

@@ -243,6 +243,77 @@ test("management queries own exact page sizes and stable ID tie-breaking", async
   assert.equal(conditionPage.nextCursor, null);
 });
 
+test("every field query page and field detail carry the active-context value stage binding and scope key", async () => {
+  const dataset = makeDataset();
+  dataset.fields = Array.from({ length: 12 }, (_, index) => ({
+    ...field(index),
+    order: index,
+    scope: "character",
+    bindingIds: ["actor_000"],
+    modelVisibility: index % 2 === 0 ? "full" : "stage_only",
+    stages: [
+      { id: "low", name: "低", description: "低阶段", threshold: 0 },
+      { id: "close", name: "接近", description: "接近阶段", threshold: 45 },
+    ],
+  }));
+  dataset.stateValues["character:actor_000"] = Object.fromEntries(
+    dataset.fields.map((item, index) => [item.id, 41 + index]),
+  );
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+
+  const page2 = await service.queryFields({ page: 2, sort: { key: "order", direction: "asc" } });
+  const first = page2.items[0];
+  assert.equal(first.id, "field_0005");
+  assert.equal(first.currentValue, 46);
+  assert.equal(first.currentStage.id, "close");
+  assert.equal(first.scopeKey, "character:actor_000");
+  assert.equal(first.bindingDisplay, "Actor 000");
+
+  const detail = await service.getEntityById({ entityType: "field", id: first.id });
+  assert.equal(detail.currentValue, 46);
+  assert.equal(detail.currentStage.id, "close");
+  assert.equal(detail.scopeKey, "character:actor_000");
+  assert.equal(detail.bindingDisplay, "Actor 000");
+
+  const stageOnly = await service.queryFields({ filters: { type: "stage_only" }, page: 1 });
+  assert.equal(stageOnly.totalCount, 6);
+  assert.equal(stageOnly.items.every((item) => item.modelVisibility === "stage_only"), true);
+  assert.deepEqual(MVU_REQUEST_PARSERS.queryFields({ filters: { type: "stage_only" } }), {
+    filters: { type: "stage_only" },
+  });
+});
+
+test("group membership filtering is server-owned and cursor tokens cannot be reused", async () => {
+  const fixture = createSource(makeDataset(), {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async listActorsForGroup(groupId) {
+      return groupId === "group_031"
+        ? [{ characterId: "actor_000", name: "Actor 000", enabled: true }]
+        : [{ characterId: "someone_else", name: "Other", enabled: true }];
+    },
+  }, fixture.options);
+
+  const memberGroups = await service.queryGroups({ filters: { actorId: "actor_000" } });
+  assert.deepEqual(memberGroups.items.map((group) => group.characterGroupId), ["group_031"]);
+  assert.deepEqual(MVU_REQUEST_PARSERS.queryGroups({ filters: { actorId: "actor_000" } }), {
+    filters: { actorId: "actor_000" },
+  });
+
+  const first = await service.queryActors({ search: "Actor" });
+  assert.notEqual(first.nextCursor, null);
+  await service.queryActors({ search: "Actor", cursor: first.nextCursor });
+  await assert.rejects(
+    service.queryActors({ search: "Actor", cursor: first.nextCursor }),
+    /MVU_QUERY_CURSOR_INVALID/,
+  );
+});
+
 test("actor group and field pickers normalize Unicode case and whitespace with stable cursors", async () => {
   const fixture = createSource(makeDataset(), {
     queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
@@ -287,7 +358,8 @@ test("picker keyset cursors do not duplicate rows inserted before the prior batc
   };
   const service = new MvuQueryService(source, fixture.options);
   const first = await service.queryActors({});
-  const expectedSecond = await service.queryActors({ cursor: first.nextCursor });
+  const comparisonFirst = await service.queryActors({});
+  const expectedSecond = await service.queryActors({ cursor: comparisonFirst.nextCursor });
   actors.push({ characterId: "actor_inserted", name: "Actor -001", enabled: true });
   const second = await service.queryActors({ cursor: first.nextCursor });
 

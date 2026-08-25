@@ -15,6 +15,11 @@
     const identitySelector = groupMode
       ? renderGroupSelector(ui.state.directory.groups, snapshot.activeContext.groupId)
       : renderActorSelector(ui.state.directory.actors, snapshot.activeContext.actorId);
+    const finder = '<button type="button" class="identity-finder" data-action="' +
+      (groupMode ? "open-status-group-picker" : "open-status-actor-picker") + '" data-picker-key="status-' +
+      (groupMode ? "group" : "actor") + '-finder">' + c.icon(groupMode ? "group_search" : "person_search") +
+      '<span>查找' + (groupMode ? "群组" : "角色") + '（共 ' + (groupMode ? snapshot.counts.groups : snapshot.counts.actors) +
+      "）</span></button>";
     const selected = groupMode ? snapshot.selected.group : snapshot.selected.actor;
     const identityName = selected && selected.name ? selected.name :
       groupMode ? (snapshot.contextLabels.groupName || "群组状态") : (snapshot.activeContext.actorName || "当前角色");
@@ -23,7 +28,7 @@
       ? '<div class="status-field-list">' + fields.map(function (field) { return c.fieldCard(field); }).join("") + "</div>"
       : c.emptyState("favorite", "当前没有可显示状态", "请前往配置创建字段，并为当前上下文启用。",
         '<button type="button" class="button primary" data-route="config-fields">新增字段</button>');
-    return '<div class="status-page">' + modeControl + '<div id="segment-panel-status-scope" role="tabpanel">' + identitySelector +
+    return '<div class="status-page">' + modeControl + '<div id="segment-panel-status-scope" role="tabpanel"><div class="identity-tools">' + identitySelector + finder + "</div>" +
       '<section class="context-hero"><span class="context-avatar">' + c.icon(groupMode ? "groups" : "person") + '</span><div><p>' +
       (groupMode ? "群组状态" : "角色状态") + '</p><h2>' + ui.escapeHtml(identityName) + '</h2><span>' +
       ui.escapeHtml(snapshot.contextLabels.chatName) + "</span></div>" +
@@ -35,12 +40,11 @@
   function fieldDetailPage() {
     const fieldId = ui.state.selectedFieldId;
     const field = ui.state.entities.get("field:" + fieldId);
-    const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === fieldId; });
-    if (!field || !summary) {
-      return c.emptyState("search_off", "字段暂不可用", "该字段不在当前上下文的首屏状态中，请返回后重新选择。",
+    if (!field || field.currentValue === null) {
+      return c.emptyState("search_off", "字段暂不可用", "该字段不适用于当前上下文，请返回后重新选择。",
         '<button type="button" class="button secondary" data-action="go-back">返回状态</button>');
     }
-    const currentValue = summary.current ? summary.current.value : field.initialValue;
+    const currentValue = field.currentValue;
     const records = ui.state.detailRecords ? ui.state.detailRecords.items : [];
     const colors = c.stagePalette(field);
     const model = c.trendModel({
@@ -51,7 +55,7 @@
       stages: field.stages,
       themeColor: field.themeColor,
     }, records.length ? records : [{ after: currentValue, occurredAt: Date.now() }], colors);
-    const currentStage = currentStageFor(field, currentValue);
+    const currentStage = field.currentStage || currentStageFor(field, currentValue);
     return '<div class="field-detail-stack">' +
       '<article class="detail-card value-card" style="--field-color:' + c.safeColor(field.themeColor) + '"><div class="detail-title">' +
       '<span class="state-icon large" style="--field-color:' + c.safeColor(field.themeColor) + '">' + c.icon(field.icon) + '</span><div><h2>' +
@@ -70,10 +74,10 @@
     const page = ui.state.pages.records;
     const view = ui.state.listViews.records;
     return '<div class="records-page">' + c.sectionHeading("变化记录", "每页 10 条，按最新变化排列") +
-      c.listMeta(page, "条记录", view.page, 10, ui.state.snapshot.counts.records, c.listViewFiltered(view)) + (page.items.length
+      '<div data-management-region="records">' + c.listMeta(page, "条记录", view.page, 10, ui.state.snapshot.counts.records, c.listViewFiltered(view)) + (page.items.length
         ? '<div class="record-list">' + page.items.map(c.recordRow).join("") + "</div>"
         : c.emptyState("history", "还没有变化记录", "字段发生变化后，会在这里显示原因和时间。")) +
-      c.pagination(page, "records", view.page) + "</div>";
+      c.pagination(page, "records", view.page) + "</div></div>";
   }
 
   function currentStageFor(field, value) {

@@ -21,6 +21,7 @@ import {
   type EffectGroupInput,
   type EffectGroupPatch,
   type EntityReferenceSummary,
+  type FieldQueryItem,
   type GetEntityByIdRequest,
   type MvuCompactPageSnapshot,
   type MvuQueryService,
@@ -827,12 +828,14 @@ function parseFieldsQuery(value: unknown): QueryRequest {
   const request = parseQueryRequest(
     value,
     ["id", "name", "order", "enabled", "scope", "minimum", "maximum"],
-    ["mode", "enabled", "scope", "bindingId"],
+    ["mode", "enabled", "scope", "type", "bindingId"],
   );
   assertFilterValue(request, "mode", (entry) => entry === "picker");
   assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
   assertFilterValue(request, "scope", (entry) =>
     entry === "character" || entry === "group" || entry === "global" || entry === "chat");
+  assertFilterValue(request, "type", (entry) =>
+    entry === "full" || entry === "stage_only" || entry === "hidden");
   assertFilterValue(request, "bindingId", isBoundedFilterString);
   return request;
 }
@@ -844,8 +847,11 @@ function parseActorsQuery(value: unknown): QueryRequest {
   return request;
 }
 
-const parseGroupsQuery = (value: unknown): QueryRequest =>
-  parseQueryRequest(value, ["id", "name"], []);
+function parseGroupsQuery(value: unknown): QueryRequest {
+  const request = parseQueryRequest(value, ["id", "name"], ["actorId"]);
+  assertFilterValue(request, "actorId", isBoundedFilterString);
+  return request;
+}
 
 function parseRulesQuery(value: unknown): QueryRequest {
   const request = parseQueryRequest(
@@ -1470,7 +1476,7 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
       MVU_IPC.deleteTemporaryEffect,
       guarded("deleteTemporaryEffect", MVU_REQUEST_PARSERS.deleteTemporaryEffect, (request) => runtime.service.deleteTemporaryEffect(request.id))
     ),
-    ToolPkg.ipc.on<unknown, QueryResponse<DataField>>(
+    ToolPkg.ipc.on<unknown, QueryResponse<FieldQueryItem>>(
       MVU_IPC.queryFields,
       guarded("queryFields", MVU_REQUEST_PARSERS.queryFields, (request) => deps.queries.queryFields(request))
     ),
@@ -1646,8 +1652,8 @@ export const mvuIpcClient = {
   deleteTemporaryEffect(request: IdRequest): Promise<void> {
     return call<IdRequest, void>(MVU_IPC.deleteTemporaryEffect, request);
   },
-  queryFields(request: QueryRequest): Promise<QueryResponse<DataField>> {
-    return call<QueryRequest, QueryResponse<DataField>>(MVU_IPC.queryFields, request);
+  queryFields(request: QueryRequest): Promise<QueryResponse<FieldQueryItem>> {
+    return call<QueryRequest, QueryResponse<FieldQueryItem>>(MVU_IPC.queryFields, request);
   },
   queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
     return call<QueryRequest, QueryResponse<DataActor>>(MVU_IPC.queryActors, request);
