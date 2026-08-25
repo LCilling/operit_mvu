@@ -1,4 +1,5 @@
 import type { DataField } from "./model";
+import type { ConditionExpression, MvuDatasetV3 } from "./model-v3";
 import type { MvuQuerySource } from "./query";
 import { klona } from "../port/util";
 import { validateDataField } from "./validation";
@@ -12,6 +13,7 @@ export const FIELD_TEMPLATE_MAX_STAGES_PER_FIELD = 100;
 export const FIELD_TEMPLATE_MAX_ID_LENGTH = 256;
 export const FIELD_TEMPLATE_MAX_NAME_LENGTH = 512;
 export const FIELD_TEMPLATE_MAX_DESCRIPTION_LENGTH = 4_096;
+export const FIELD_TEMPLATE_MAX_DEPENDENCIES_PER_FIELD = 200;
 
 export interface FieldTemplateTargetSelection { targetId: string; enabled: boolean; includeValue: boolean; }
 export interface FieldTemplateFieldSelection { fieldId: string; targets: FieldTemplateTargetSelection[]; }
@@ -34,6 +36,7 @@ export interface FieldTemplateImportFieldDecision {
   sourceFieldId: string;
   strategy?: FieldTemplateConflictStrategy;
   mappings: FieldTemplateSourceMapping[];
+  unboundTargets?: FieldTemplateImportTargetDecision[];
 }
 export interface ImportFieldTemplateRequest {
   json: string;
@@ -63,7 +66,18 @@ interface PortableFieldEntry {
   sourceFieldId: string;
   definition: PortableFieldDefinition;
   sourceTargets: PortableSourceTarget[];
-  dependencySummary: { linkRuleCount: number; automationRuleCount: number; effectGroupCount: number; };
+  omittedDependencies: PortableOmittedDependencies;
+}
+type PortableDependencyKind = "link_rule" | "rule" | "condition" | "effect_group";
+interface PortableDependency {
+  kind: PortableDependencyKind;
+  sourceId: string;
+  readableName: string;
+}
+interface PortableOmittedDependencies {
+  items: PortableDependency[];
+  totalCount: number;
+  truncated: boolean;
 }
 interface FieldTemplateDocument {
   format: typeof FIELD_TEMPLATE_FORMAT;
@@ -84,19 +98,29 @@ export interface FieldTemplatePreview {
     scope: DataField["scope"];
     conflict: "none" | "id";
     proposedCopyId: string;
+    updateCompatibility: {
+      available: boolean;
+      localScope: DataField["scope"] | null;
+      reason: "no_local_field" | "scope_mismatch" | null;
+    };
     config: { stages: number; naturalChange: boolean; perTurnChange: boolean; ai: boolean; appearance: boolean; };
   }>;
   mappingNeeds: Array<{
     fieldId: string;
     scope: DataField["scope"];
+    requiresLocalTargets: boolean;
+    templateValueAvailable: boolean;
     sourceTargets: Array<{
       kind: "actor" | "group";
       sourceId: string;
       name: string;
       hasValue: boolean;
+      requiresSearch: boolean;
+      suggestedTarget?: { targetId: string; name: string; reason: "stable_id" | "unique_name" };
       valueAdjustment?: { from: number; to: number; reason: "clamp" | "step" };
     }>;
   }>;
+  omittedDependencies: Array<PortableOmittedDependencies & { fieldId: string }>;
   invalidReferences: string[];
 }
 
@@ -155,14 +179,7 @@ export async function createFieldTemplateExport(
       sourceFieldId: field.id,
       definition,
       sourceTargets,
-      dependencySummary: {
-        linkRuleCount: snapshot.dataset.linkRules.filter((rule) =>
-          rule.sourceFieldId === field.id || rule.targetFieldId === field.id).length,
-        automationRuleCount: snapshot.dataset.rules.filter((rule) => rule.actions.some((action) =>
-          action.kind === "change_field" && action.fieldId === field.id)).length,
-        effectGroupCount: snapshot.dataset.effectGroups.filter((group) => group.fieldEffects.some((effect) =>
-          effect.fieldId === field.id)).length,
-      },
+      omittedDependencies: collectOmittedDependencies(snapshot.dataset, field),
     });
   }
   fields.sort((left, right) => compareRaw(left.sourceFieldId, right.sourceFieldId));
@@ -192,19 +209,22 @@ export async function previewFieldTemplate(
   request: PreviewFieldTemplateImportRequest,
 ): Promise<FieldTemplatePreview> {
   const document = parseFieldTemplateDocument(request.json);
-  const snapshot = await source.readV3();
+  const [snapshot, actors, groups] = await Promise.all([source.readV3(), source.listActors(), source.listGroups()]);
   const occupied = new Set(snapshot.dataset.fields.map((field) => field.id));
-  return {
-    valid: true,
-    revision: snapshot.revision,
-    format: document.format,
-    schemaVersion: document.schemaVersion,
-    fields: document.fields.map((entry) => ({
+  const fields = document.fields.map((entry) => {
+    const existing = snapshot.dataset.fields.find((field) => field.id === entry.sourceFieldId);
+    const sameScope = existing?.scope === entry.definition.scope;
+    return {
       sourceFieldId: entry.sourceFieldId,
       name: entry.definition.name,
       scope: entry.definition.scope,
-      conflict: occupied.has(entry.sourceFieldId) ? "id" : "none",
+      conflict: occupied.has(entry.sourceFieldId) ? "id" as const : "none" as const,
       proposedCopyId: collisionSafeCopyId(entry.sourceFieldId, occupied),
+      updateCompatibility: existing === undefined
+        ? { available: false, localScope: null, reason: "no_local_field" as const }
+        : sameScope
+          ? { available: true, localScope: existing.scope, reason: null }
+          : { available: false, localScope: existing.scope, reason: "scope_mismatch" as const },
       config: {
         stages: entry.definition.stages.length,
         naturalChange: entry.definition.naturalChange.enabled,
@@ -212,20 +232,43 @@ export async function previewFieldTemplate(
         ai: entry.definition.ai.enabled,
         appearance: entry.definition.icon.length > 0 && entry.definition.themeColor.length > 0,
       },
-    })),
+    };
+  });
+  const omittedDependencies = document.fields.map((entry) => ({
+    fieldId: entry.sourceFieldId,
+    ...klona(entry.omittedDependencies),
+  }));
+  return {
+    valid: true,
+    revision: snapshot.revision,
+    format: document.format,
+    schemaVersion: document.schemaVersion,
+    fields,
     mappingNeeds: document.fields.filter((entry) =>
       entry.definition.scope === "character" || entry.definition.scope === "group").map((entry) => ({
       fieldId: entry.sourceFieldId,
       scope: entry.definition.scope,
-      sourceTargets: entry.sourceTargets.map((target) => ({
-        kind: target.kind,
-        sourceId: target.sourceId,
-        name: target.name,
-        hasValue: target.value !== undefined,
-        ...(target.value === undefined ? {} : adjustmentPreview(entry.definition, target.value)),
-      })),
+      requiresLocalTargets: entry.sourceTargets.length === 0,
+      templateValueAvailable: entry.sourceTargets.some((target) => target.value !== undefined),
+      sourceTargets: entry.sourceTargets.map((target) => {
+        const suggestion = suggestLocalTarget(target, actors, groups);
+        return {
+          kind: target.kind,
+          sourceId: target.sourceId,
+          name: target.name,
+          hasValue: target.value !== undefined,
+          requiresSearch: suggestion === undefined,
+          ...(suggestion === undefined ? {} : { suggestedTarget: suggestion }),
+          ...(target.value === undefined ? {} : adjustmentPreview(entry.definition, target.value)),
+        };
+      }),
     })),
-    invalidReferences: [],
+    omittedDependencies,
+    invalidReferences: omittedDependencies.flatMap((entry) => [
+      ...entry.items.map((dependency) =>
+        `OMITTED_DEPENDENCY:${entry.fieldId}:${dependency.kind}:${dependency.sourceId}`),
+      ...(entry.truncated ? [`OMITTED_DEPENDENCIES_TRUNCATED:${entry.fieldId}:${entry.totalCount}`] : []),
+    ]),
   };
 }
 
@@ -259,6 +302,13 @@ export async function commitFieldTemplateImport(
     const strategy = decision.strategy ?? "create_copy";
     if (strategy === "update") {
       if (existing === undefined) throw new Error("MVU_FIELD_TEMPLATE_CONFLICT_REQUIRED");
+      if (decision.unboundTargets !== undefined) {
+        throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE");
+      }
+      if (decision.mappings.length > 0) throw new Error("MVU_FIELD_TEMPLATE_MAPPING_SCOPE_INVALID");
+      if (existing.scope !== entry.definition.scope) {
+        throw new Error(`MVU_FIELD_TEMPLATE_UPDATE_SCOPE_MISMATCH:${existing.scope}:${entry.definition.scope}`);
+      }
       const bindings = [...existing.bindingIds];
       Object.assign(existing, klona(entry.definition), { id: existing.id, bindingIds: bindings });
       validateDataField(existing);
@@ -289,11 +339,10 @@ export async function commitFieldTemplateImport(
       summary.created.push(fieldId);
     }
     for (const write of bindings.writes) {
-      const sourceTarget = entry.sourceTargets.find((target) => target.sourceId === write.sourceTargetId)!;
       const scopeKey = `${field.scope}:${write.targetId}`;
       const existingValue = snapshot.dataset.stateValues[scopeKey]?.[entry.sourceFieldId];
       const value = write.valuePolicy === "template_value"
-        ? sourceTarget.value === undefined ? undefined : normalizeTemplateValue(field, sourceTarget.value).value
+        ? write.templateValue === undefined ? undefined : normalizeTemplateValue(field, write.templateValue).value
         : write.valuePolicy === "keep_existing" ? existingValue ?? field.initialValue : field.initialValue;
       if (value === undefined) throw new Error("MVU_FIELD_TEMPLATE_VALUE_MISSING");
       requireFieldValue(field, value, "MVU_FIELD_TEMPLATE_VALUE_INVALID");
@@ -312,10 +361,21 @@ function resolveImportBindings(
   actors: Awaited<ReturnType<MvuQuerySource["listActors"]>>,
   groups: Awaited<ReturnType<MvuQuerySource["listGroups"]>>,
   summary: FieldTemplateImportResult["summary"],
-): { ids: string[]; writes: Array<FieldTemplateImportTargetDecision & { sourceTargetId: string }> } {
+): { ids: string[]; writes: Array<FieldTemplateImportTargetDecision & { templateValue?: number }> } {
   if (entry.definition.scope !== "character" && entry.definition.scope !== "group") {
+    if (decision.unboundTargets !== undefined) throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE");
     if (decision.mappings.length > 0) throw new Error("MVU_FIELD_TEMPLATE_MAPPING_SCOPE_INVALID");
     return { ids: [], writes: [] };
+  }
+  if (entry.sourceTargets.length === 0) {
+    if (decision.mappings.length > 0) throw new Error("MVU_FIELD_TEMPLATE_MAPPING_SCOPE_INVALID");
+    if (decision.unboundTargets === undefined || decision.unboundTargets.length === 0) {
+      throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_REQUIRED");
+    }
+    return resolveUnboundTargets(entry, decision.unboundTargets, actors, groups, summary);
+  }
+  if (decision.unboundTargets !== undefined) {
+    throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE");
   }
   const mappings = new Map(decision.mappings.map((mapping) => [mapping.sourceTargetId, mapping]));
   if (mappings.size !== decision.mappings.length || mappings.size !== entry.sourceTargets.length ||
@@ -323,7 +383,7 @@ function resolveImportBindings(
     throw new Error("MVU_FIELD_TEMPLATE_MAPPING_MISSING");
   }
   const ids: string[] = [];
-  const writes: Array<FieldTemplateImportTargetDecision & { sourceTargetId: string }> = [];
+  const writes: Array<FieldTemplateImportTargetDecision & { templateValue?: number }> = [];
   const seen = new Set<string>();
   for (const sourceTarget of entry.sourceTargets) {
     const mapping = mappings.get(sourceTarget.sourceId)!;
@@ -341,10 +401,40 @@ function resolveImportBindings(
         continue;
       }
       ids.push(target.targetId);
-      writes.push({ ...target, sourceTargetId: sourceTarget.sourceId });
+      writes.push({ ...target, ...(sourceTarget.value === undefined ? {} : { templateValue: sourceTarget.value }) });
     }
   }
   return { ids: [...ids].sort(compareRaw), writes };
+}
+
+function resolveUnboundTargets(
+  entry: PortableFieldEntry,
+  targets: FieldTemplateImportTargetDecision[],
+  actors: Awaited<ReturnType<MvuQuerySource["listActors"]>>,
+  groups: Awaited<ReturnType<MvuQuerySource["listGroups"]>>,
+  summary: FieldTemplateImportResult["summary"],
+): { ids: string[]; writes: FieldTemplateImportTargetDecision[] } {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  const writes: FieldTemplateImportTargetDecision[] = [];
+  for (const target of targets) {
+    if (seen.has(target.targetId)) throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGET_DUPLICATE");
+    seen.add(target.targetId);
+    if (target.valuePolicy === "template_value") {
+      throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TEMPLATE_VALUE_INVALID");
+    }
+    const exists = entry.definition.scope === "character"
+      ? actors.some((actor) => actor.characterId === target.targetId)
+      : groups.some((group) => group.characterGroupId === target.targetId);
+    if (!exists) throw new Error(`MVU_FIELD_TEMPLATE_UNBOUND_TARGET_INVALID:${target.targetId}`);
+    if (!target.enabled) {
+      summary.skippedTargets += 1;
+      continue;
+    }
+    ids.push(target.targetId);
+    writes.push(target);
+  }
+  return { ids: ids.sort(compareRaw), writes };
 }
 
 function validateExistingValues(stateValues: Record<string, Record<string, number>>, field: DataField): void {
@@ -383,7 +473,7 @@ function parseFieldTemplateDocument(json: string): FieldTemplateDocument {
 
 function parsePortableField(value: unknown): PortableFieldEntry {
   const field = requireRecord(value, "MVU_FIELD_TEMPLATE_FIELD_INVALID");
-  assertExactKeys(field, ["sourceFieldId", "definition", "sourceTargets", "dependencySummary"]);
+  assertExactKeys(field, ["sourceFieldId", "definition", "sourceTargets", "omittedDependencies"]);
   if (typeof field.sourceFieldId !== "string" || field.sourceFieldId.length > FIELD_TEMPLATE_MAX_ID_LENGTH ||
     !Array.isArray(field.sourceTargets)) throw new Error("MVU_FIELD_TEMPLATE_FIELD_INVALID");
   const definition = requireRecord(field.definition, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
@@ -392,11 +482,7 @@ function parsePortableField(value: unknown): PortableFieldEntry {
   const targets = field.sourceTargets.map(parsePortableTarget);
   if (targets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) throw new Error("MVU_FIELD_TEMPLATE_TARGET_LIMIT");
   if (targets.length > 0) requireUniqueNonEmpty(targets.map((target) => target.sourceId), "MVU_FIELD_TEMPLATE_TARGET_DUPLICATE");
-  const dependencySummary = requireRecord(field.dependencySummary, "MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
-  assertExactKeys(dependencySummary, ["linkRuleCount", "automationRuleCount", "effectGroupCount"]);
-  if (Object.values(dependencySummary).some((count) => !Number.isSafeInteger(count) || (count as number) < 0)) {
-    throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
-  }
+  const omittedDependencies = parseOmittedDependencies(field.omittedDependencies);
   const validated = { ...definition, id: field.sourceFieldId, bindingIds: targets.map((target) => target.sourceId) } as DataField;
   validateDataField(validated);
   requireFieldValue(validated, validated.initialValue, "MVU_FIELD_TEMPLATE_INITIAL_VALUE_INVALID");
@@ -410,8 +496,38 @@ function parsePortableField(value: unknown): PortableFieldEntry {
     sourceFieldId: field.sourceFieldId,
     definition: definition as unknown as PortableFieldDefinition,
     sourceTargets: targets,
-    dependencySummary: dependencySummary as unknown as PortableFieldEntry["dependencySummary"],
+    omittedDependencies,
   };
+}
+
+function parseOmittedDependencies(value: unknown): PortableOmittedDependencies {
+  const dependencies = requireRecord(value, "MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+  assertExactKeys(dependencies, ["items", "totalCount", "truncated"]);
+  if (!Array.isArray(dependencies.items) || dependencies.items.length > FIELD_TEMPLATE_MAX_DEPENDENCIES_PER_FIELD ||
+    !Number.isSafeInteger(dependencies.totalCount) || (dependencies.totalCount as number) < 0 ||
+    typeof dependencies.truncated !== "boolean") {
+    throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+  }
+  const items = dependencies.items.map((value) => {
+    const item = requireRecord(value, "MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+    assertExactKeys(item, ["kind", "sourceId", "readableName"]);
+    if ((item.kind !== "link_rule" && item.kind !== "rule" && item.kind !== "condition" && item.kind !== "effect_group") ||
+      typeof item.sourceId !== "string" || item.sourceId.length === 0 || item.sourceId.length > FIELD_TEMPLATE_MAX_ID_LENGTH ||
+      typeof item.readableName !== "string" || item.readableName.trim().length === 0) {
+      throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+    }
+    if (item.readableName.length > FIELD_TEMPLATE_MAX_NAME_LENGTH) throw new Error("MVU_FIELD_TEMPLATE_TEXT_LIMIT");
+    return item as unknown as PortableDependency;
+  });
+  if (new Set(items.map((item) => `${item.kind}\u0000${item.sourceId}`)).size !== items.length) {
+    throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+  }
+  const totalCount = dependencies.totalCount as number;
+  const truncated = dependencies.truncated;
+  if (totalCount < items.length || (truncated ? totalCount <= items.length : totalCount !== items.length)) {
+    throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
+  }
+  return { items, totalCount, truncated };
 }
 
 function parsePortableTarget(value: unknown): PortableSourceTarget {
@@ -441,6 +557,66 @@ function checksumFields(fields: PortableFieldEntry[]): string {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+}
+
+function collectOmittedDependencies(dataset: MvuDatasetV3, field: DataField): PortableOmittedDependencies {
+  const dependencies = new Map<string, PortableDependency>();
+  const add = (kind: PortableDependencyKind, sourceId: string, readableName: string): void => {
+    if (sourceId.length === 0 || sourceId.length > FIELD_TEMPLATE_MAX_ID_LENGTH) {
+      throw new Error("MVU_FIELD_TEMPLATE_DEPENDENCY_ID_INVALID");
+    }
+    const boundedName = readableName.trim().slice(0, FIELD_TEMPLATE_MAX_NAME_LENGTH) || sourceId;
+    dependencies.set(`${kind}\u0000${sourceId}`, { kind, sourceId, readableName: boundedName });
+  };
+  for (const rule of dataset.linkRules) {
+    if (rule.sourceFieldId !== field.id && rule.targetFieldId !== field.id) continue;
+    const sourceName = dataset.fields.find((candidate) => candidate.id === rule.sourceFieldId)?.name ?? rule.sourceFieldId;
+    const targetName = dataset.fields.find((candidate) => candidate.id === rule.targetFieldId)?.name ?? rule.targetFieldId;
+    add("link_rule", rule.id, `${sourceName} → ${targetName}`);
+  }
+  const effectGroups = dataset.effectGroups.filter((group) =>
+    group.fieldEffects.some((effect) => effect.fieldId === field.id));
+  const effectGroupIds = new Set(effectGroups.map((group) => group.id));
+  for (const group of effectGroups) add("effect_group", group.id, group.name);
+  const rules = dataset.rules.filter((rule) => rule.actions.some((action) => action.kind === "change_field"
+    ? action.fieldId === field.id || action.effectGroupIds.some((id) => effectGroupIds.has(id))
+    : effectGroupIds.has(action.effectGroupId)));
+  for (const rule of rules) add("rule", rule.id, rule.name);
+  const sharedConditionIds = new Set(rules.map((rule) => rule.conditionId));
+  for (const condition of dataset.conditions) {
+    if (sharedConditionIds.has(condition.id) || expressionReferencesField(condition.expression, field.id)) {
+      add("condition", condition.id, condition.name);
+    }
+  }
+  const all = [...dependencies.values()].sort((left, right) =>
+    compareRaw(left.kind, right.kind) || compareRaw(left.sourceId, right.sourceId));
+  return {
+    items: all.slice(0, FIELD_TEMPLATE_MAX_DEPENDENCIES_PER_FIELD),
+    totalCount: all.length,
+    truncated: all.length > FIELD_TEMPLATE_MAX_DEPENDENCIES_PER_FIELD,
+  };
+}
+
+function expressionReferencesField(expression: ConditionExpression, fieldId: string): boolean {
+  if (expression.kind === "predicate") {
+    return expression.predicate.kind === "field_comparison" && expression.predicate.fieldId === fieldId;
+  }
+  if (expression.kind === "not") return expressionReferencesField(expression.child, fieldId);
+  return expression.children.some((child) => expressionReferencesField(child, fieldId));
+}
+
+function suggestLocalTarget(
+  target: PortableSourceTarget,
+  actors: Awaited<ReturnType<MvuQuerySource["listActors"]>>,
+  groups: Awaited<ReturnType<MvuQuerySource["listGroups"]>>,
+): { targetId: string; name: string; reason: "stable_id" | "unique_name" } | undefined {
+  const directory = target.kind === "actor"
+    ? actors.map((actor) => ({ targetId: actor.characterId, name: actor.name }))
+    : groups.map((group) => ({ targetId: group.characterGroupId, name: group.name }));
+  const exact = directory.find((entry) => entry.targetId === target.sourceId);
+  if (exact !== undefined) return { ...exact, reason: "stable_id" };
+  const named = directory.filter((entry) => entry.name === target.name);
+  return named.length === 1 ? { ...named[0], reason: "unique_name" } : undefined;
 }
 
 function collisionSafeCopyId(sourceId: string, occupied: Set<string>): string {

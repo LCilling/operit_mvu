@@ -833,7 +833,7 @@ function parseImportFieldTemplateRequest(value: unknown): ImportFieldTemplateReq
   if (!Array.isArray(decisionsRecord.fields) || decisionsRecord.fields.length > FIELD_TEMPLATE_MAX_FIELDS) fail(code);
   const fields = decisionsRecord.fields.map((fieldValue) => {
     const field = requireRecord(fieldValue, code);
-    assertKeys(field, ["sourceFieldId", "mappings"], ["strategy"], code);
+    assertKeys(field, ["sourceFieldId", "mappings"], ["strategy", "unboundTargets"], code);
     const sourceFieldId = requireBoundedNonEmptyString(field, "sourceFieldId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
     if (!Array.isArray(field.mappings) || field.mappings.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
     const mappings = field.mappings.map((mappingValue) => {
@@ -841,20 +841,16 @@ function parseImportFieldTemplateRequest(value: unknown): ImportFieldTemplateReq
       assertKeys(mapping, ["sourceTargetId", "targets"], [], code);
       const sourceTargetId = requireBoundedNonEmptyString(mapping, "sourceTargetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code);
       if (!Array.isArray(mapping.targets) || mapping.targets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
-      const targets = mapping.targets.map((targetValue) => {
-        const target = requireRecord(targetValue, code);
-        assertKeys(target, ["targetId", "enabled", "valuePolicy"], [], code);
-        return {
-          targetId: requireBoundedNonEmptyString(target, "targetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code),
-          enabled: requireBoolean(target, "enabled", code),
-          valuePolicy: requireEnum(target, "valuePolicy", ["template_value", "keep_existing", "field_initial"], code),
-        };
-      });
+      const targets = mapping.targets.map((targetValue) => parseFieldTemplateImportTarget(targetValue, code));
       return { sourceTargetId, targets };
     });
     const parsed = { sourceFieldId, mappings } as ImportFieldTemplateRequest["decisions"]["fields"][number];
     if (hasOwn(field, "strategy")) {
       parsed.strategy = requireEnum(field, "strategy", ["create_copy", "update", "replace"] as const, code);
+    }
+    if (hasOwn(field, "unboundTargets")) {
+      if (!Array.isArray(field.unboundTargets) || field.unboundTargets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) fail(code);
+      parsed.unboundTargets = field.unboundTargets.map((targetValue) => parseFieldTemplateImportTarget(targetValue, code));
     }
     return parsed;
   });
@@ -862,6 +858,19 @@ function parseImportFieldTemplateRequest(value: unknown): ImportFieldTemplateReq
     json,
     expectedRevision: requireExpectedRevision(record, code),
     decisions: { fields },
+  };
+}
+
+function parseFieldTemplateImportTarget(
+  value: unknown,
+  code: string,
+): ImportFieldTemplateRequest["decisions"]["fields"][number]["mappings"][number]["targets"][number] {
+  const target = requireRecord(value, code);
+  assertKeys(target, ["targetId", "enabled", "valuePolicy"], [], code);
+  return {
+    targetId: requireBoundedNonEmptyString(target, "targetId", FIELD_TEMPLATE_MAX_ID_LENGTH, code),
+    enabled: requireBoolean(target, "enabled", code),
+    valuePolicy: requireEnum(target, "valuePolicy", ["template_value", "keep_existing", "field_initial"] as const, code),
   };
 }
 
