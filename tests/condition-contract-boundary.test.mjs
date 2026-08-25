@@ -157,6 +157,51 @@ test("actor group and concrete-date arrays share production item and count bound
   }
 });
 
+test("actor group and concrete-date selections require one through one hundred items at every boundary", () => {
+  const cases = [
+    ["actor", "actorIds", "actor_one", "MVU_V3_CONDITION_ACTOR_INVALID"],
+    ["group", "groupIds", "group_one", "MVU_V3_CONDITION_GROUP_INVALID"],
+    ["concrete_date", "dates", "2000-02-29", "MVU_V3_CONDITION_CONCRETE_DATE_INVALID"],
+  ];
+
+  for (const [kind, key, oneItem, datasetCode] of cases) {
+    const one = { kind, [key]: [oneItem] };
+    const empty = { kind, [key]: [] };
+
+    assert.deepEqual(parsePredicate(one)[key], [oneItem], `${kind} IPC accepts one selection`);
+    assert.throws(
+      () => parsePredicate(empty),
+      /MVU_CONDITION_PREDICATE_INVALID/,
+      `${kind} IPC rejects zero selections`,
+    );
+    assert.doesNotThrow(
+      () => assertMvuDatasetV3(datasetFixture(one)),
+      `${kind} dataset accepts one selection`,
+    );
+    assert.throws(
+      () => assertMvuDatasetV3(datasetFixture(empty)),
+      new RegExp(datasetCode),
+      `${kind} dataset rejects zero selections`,
+    );
+
+    const validDataset = datasetFixture(one);
+    const exported = createFullBackupExport({
+      revision: validDataset.revision,
+      dataset: validDataset,
+      records: [],
+    }, NOW);
+    assert.equal(parseDatasetImport(exported.json, NOW).config.conditions[0].expression.predicate[key].length, 1,
+      `${kind} full import accepts one selection`);
+    const emptyImport = JSON.parse(exported.json);
+    emptyImport.payload.config.conditions[0].expression.predicate[key] = [];
+    assert.throws(
+      () => parseDatasetImport(JSON.stringify(resign(emptyImport)), NOW),
+      new RegExp(datasetCode),
+      `${kind} full import rejects zero selections`,
+    );
+  }
+});
+
 test("full-v3 import cannot bypass condition calendar or array bounds", () => {
   const validDataset = datasetFixture({ kind: "concrete_date", dates: ["2000-02-29"] });
   const exported = createFullBackupExport({

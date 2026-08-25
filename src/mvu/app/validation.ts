@@ -47,7 +47,7 @@ export const CONDITION_STRING_ARRAY_ITEM_MAX_LENGTH = 256;
 
 /** Shared production boundary for condition ID/date arrays. Duplicate entries remain allowed. */
 export function isBoundedConditionStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length <= CONDITION_STRING_ARRAY_MAX_ITEMS &&
+  return Array.isArray(value) && value.length >= 1 && value.length <= CONDITION_STRING_ARRAY_MAX_ITEMS &&
     value.every((entry) => typeof entry === "string" && entry.length > 0 &&
       entry.length <= CONDITION_STRING_ARRAY_ITEM_MAX_LENGTH);
 }
