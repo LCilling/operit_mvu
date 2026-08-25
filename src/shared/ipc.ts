@@ -838,8 +838,9 @@ function parseFieldsQuery(value: unknown): QueryRequest {
 }
 
 function parseActorsQuery(value: unknown): QueryRequest {
-  const request = parseQueryRequest(value, ["id", "name", "enabled"], ["enabled"]);
+  const request = parseQueryRequest(value, ["id", "name", "enabled"], ["enabled", "groupId"]);
   assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
+  assertFilterValue(request, "groupId", isBoundedFilterString);
   return request;
 }
 

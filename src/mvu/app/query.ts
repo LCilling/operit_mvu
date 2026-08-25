@@ -109,6 +109,7 @@ export interface MvuQuerySource {
   ): Promise<V3MvuStoreSnapshot>;
   queryCommittedRecords(request: RecordQueryRequest): Promise<RecordQueryResult>;
   listActors(): Promise<DataActor[]>;
+  listActorsForGroup?(groupId: string): Promise<DataActor[]>;
   listGroups(): Promise<QueryGroup[]>;
   activeContext(): Promise<StateScopeContext>;
   migrationStatus(): Promise<MigrationStatus>;
@@ -353,9 +354,15 @@ export class MvuQueryService {
   }
 
   async queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
+    const groupId = request.filters?.groupId;
+    if (groupId !== undefined && (typeof groupId !== "string" || this.source.listActorsForGroup === undefined)) {
+      throw new Error("MVU_QUERY_FILTER_INVALID");
+    }
     return queryCollection({
       entity: "actors",
-      items: await this.source.listActors(),
+      items: typeof groupId === "string"
+        ? await this.source.listActorsForGroup!(groupId)
+        : await this.source.listActors(),
       request,
       pageSize: PICKER_BATCH_SIZE,
       cursor: true,
@@ -367,10 +374,12 @@ export class MvuQueryService {
       },
       filterKeys: {
         enabled: (item, value) => item.enabled === value,
+        groupId: (_item, value) => value === groupId,
       },
-      validateFilters: (filters) => requireFilter(
-        filters, "enabled", (value) => typeof value === "boolean",
-      ),
+      validateFilters: (filters) => {
+        requireFilter(filters, "enabled", (value) => typeof value === "boolean");
+        requireFilter(filters, "groupId", isNonEmptyFilterString);
+      },
       searchText: (item) => [item.characterId, item.name],
       id: (item) => item.characterId,
     }, this.cursorAccess());

@@ -39,6 +39,7 @@
     fatal: null,
     routeError: null,
     lastActorId: "",
+    routeTrail: [initialRoute],
     demo: queryState.get("demo") === "1",
   };
 
@@ -49,11 +50,13 @@
     components: {},
     pages: {},
     routes: ROUTES,
-    navigate: null,
+    navigate,
+    goBack,
     render: null,
     transition,
     loadSnapshot,
     loadRouteData,
+    loadDirectory,
     query,
     getEntity,
     validateCompactSnapshot,
@@ -133,7 +136,85 @@
     if (typeof value.hasMore !== "boolean") throw new Error(code);
     if (value.nextCursor !== null && typeof value.nextCursor !== "string") throw new Error(code);
     if (value.hasMore && value.loadedCount >= value.totalCount) throw new Error(code);
+    const validator = queryItemValidator(label);
+    if (validator) value.items.forEach(validator);
     return value;
+  }
+
+  function queryItemValidator(label) {
+    const key = String(label || "").replace(/^query/, "").toLocaleLowerCase();
+    if (key === "fields") return validateFieldEntity;
+    if (key === "actors") return validateActor;
+    if (key === "groups") return validateGroup;
+    if (key === "rules") return validateRule;
+    if (key === "conditions") return validateCondition;
+    if (key === "effectgroups" || key === "effects") return validateEffectGroup;
+    if (key === "records") return validateRecord;
+    return null;
+  }
+
+  function requireBoolean(value, code) {
+    if (typeof value !== "boolean") throw new Error(code);
+  }
+
+  function validateIdentity(item, idKey, code) {
+    if (!isRecord(item)) throw new Error(code);
+    requireString(item[idKey], code);
+    requireString(item.name, code);
+  }
+
+  function validateActor(actor) {
+    validateIdentity(actor, "characterId", "MVU_ACTOR_INVALID");
+    requireBoolean(actor.enabled, "MVU_ACTOR_INVALID");
+    if (actor.avatarUri !== undefined && actor.avatarUri !== null) requireString(actor.avatarUri, "MVU_ACTOR_INVALID");
+  }
+
+  function validateGroup(group) {
+    validateIdentity(group, "characterGroupId", "MVU_GROUP_INVALID");
+    if (group.avatarUri !== undefined && group.avatarUri !== null) requireString(group.avatarUri, "MVU_GROUP_INVALID");
+  }
+
+  function validateFieldEntity(field) {
+    if (isRecord(field.range)) return validateFieldSummary(field);
+    validateIdentity(field, "id", "MVU_FIELD_INVALID");
+    if (!finiteNumber(field.minimum) || !finiteNumber(field.maximum) || field.minimum >= field.maximum ||
+        !finiteNumber(field.step) || field.step <= 0 || !Array.isArray(field.stages)) throw new Error("MVU_FIELD_INVALID");
+  }
+
+  function validateRule(rule) {
+    validateIdentity(rule, "id", "MVU_RULE_INVALID");
+    requireBoolean(rule.enabled, "MVU_RULE_INVALID");
+    requireString(rule.conditionId, "MVU_RULE_INVALID");
+    if ("actionCount" in rule) {
+      if (!nonNegativeInteger(rule.actionCount) || !Number.isSafeInteger(rule.executionOrder)) throw new Error("MVU_RULE_INVALID");
+    } else if (!Array.isArray(rule.actions)) throw new Error("MVU_RULE_INVALID");
+  }
+
+  function validateCondition(condition) {
+    validateIdentity(condition, "id", "MVU_CONDITION_INVALID");
+    requireBoolean(condition.enabled, "MVU_CONDITION_INVALID");
+    if ("rootKind" in condition) {
+      if (!["all", "any", "not", "predicate"].includes(condition.rootKind)) throw new Error("MVU_CONDITION_INVALID");
+    } else if (!isRecord(condition.expression)) throw new Error("MVU_CONDITION_INVALID");
+  }
+
+  function validateEffectGroup(effect) {
+    validateIdentity(effect, "id", "MVU_EFFECT_GROUP_INVALID");
+    requireBoolean(effect.enabled, "MVU_EFFECT_GROUP_INVALID");
+    if ("fieldCount" in effect) {
+      if (!nonNegativeInteger(effect.fieldCount)) throw new Error("MVU_EFFECT_GROUP_INVALID");
+    } else if (!Array.isArray(effect.fieldEffects)) throw new Error("MVU_EFFECT_GROUP_INVALID");
+  }
+
+  function validateRecord(record) {
+    if (!isRecord(record)) throw new Error("MVU_RECORD_INVALID");
+    requireString(record.id, "MVU_RECORD_INVALID");
+    requireString(record.fieldId, "MVU_RECORD_INVALID");
+    if (record.actorId !== null) requireString(record.actorId, "MVU_RECORD_INVALID");
+    if (record.groupId !== null) requireString(record.groupId, "MVU_RECORD_INVALID");
+    if (!finiteNumber(record.before) || !finiteNumber(record.after) || !finiteNumber(record.delta) ||
+        !finiteNumber(record.occurredAt)) throw new Error("MVU_RECORD_INVALID");
+    requireString(record.reason, "MVU_RECORD_INVALID");
   }
 
   function validateFieldSummary(field) {
@@ -175,7 +256,12 @@
     });
     const pageKeys = ["fields", "rules", "conditions", "effectGroups", "records"];
     pageKeys.forEach(function (key) { validateQueryResponse(snapshot.pages[key], key); });
-    snapshot.pages.fields.items.forEach(validateFieldSummary);
+    if (snapshot.selected.actor !== null) validateActor(snapshot.selected.actor);
+    if (snapshot.selected.group !== null) validateGroup(snapshot.selected.group);
+    requireBoolean(snapshot.snapshotTruncated, "MVU_PAGE_SNAPSHOT_TRUNCATION_INVALID");
+    Object.keys(snapshot.returnedCount).forEach(function (key) {
+      if (!nonNegativeInteger(snapshot.returnedCount[key])) throw new Error("MVU_PAGE_RETURNED_COUNT_INVALID:" + key);
+    });
     return snapshot;
   }
 
@@ -217,9 +303,9 @@
     return entity;
   }
 
-  async function loadDirectory() {
+  async function loadDirectory(groupId) {
     const results = await Promise.all([
-      query("queryActors", {}, "actors"),
+      query("queryActors", groupId ? { filters: { groupId } } : {}, "actors"),
       query("queryGroups", {}, "groups"),
     ]);
     state.directory.actors = results[0].items;
@@ -267,14 +353,27 @@
     if (routeId === state.route && !opts.force) return;
     state.route = routeId;
     state.drawerOpen = false;
+    if (opts.replace) state.routeTrail[state.routeTrail.length - 1] = routeId;
+    else state.routeTrail.push(routeId);
     const url = new URL(window.location.href);
     url.searchParams.delete("screen");
     url.searchParams.set("route", routeId);
     if (state.selectedFieldId) url.searchParams.set("field", state.selectedFieldId);
     else url.searchParams.delete("field");
-    window.history[opts.replace ? "replaceState" : "pushState"]({ route: routeId }, "", url);
+    window.history[opts.replace ? "replaceState" : "pushState"]({ mvu: true, route: routeId }, "", url);
     await loadRouteData(routeId);
     transition(function () { window.MvuUi.render({ resetScroll: true }); });
+  }
+
+  async function goBack() {
+    const current = ROUTES[state.route] || ROUTES.status;
+    let target = current.owner;
+    if (state.routeTrail.length > 1) {
+      state.routeTrail.pop();
+      const previous = state.routeTrail.at(-1);
+      if (previous && ROUTES[previous]) target = previous;
+    }
+    await navigate(target, { replace: true, force: true });
   }
 
   function transition(update) {
@@ -331,6 +430,7 @@
   window.addEventListener("popstate", function () {
     const routeId = new URLSearchParams(window.location.search).get("route") || "status";
     state.route = ROUTES[routeId] ? routeId : "status";
+    state.routeTrail = [state.route];
     state.drawerOpen = false;
     void loadRouteData(state.route).then(function () {
       window.MvuUi.render({ resetScroll: true });

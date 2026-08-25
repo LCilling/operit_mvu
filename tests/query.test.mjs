@@ -458,6 +458,26 @@ test("picker pagination uses normalized human sort and raw ID as the final tie-b
   assert.equal(new Set(ids).size, actors.length);
 });
 
+test("actor picker can be restricted to authoritative members of one group", async () => {
+  const fixture = createSource(makeDataset());
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async listActorsForGroup(groupId) {
+      assert.equal(groupId, "group_007");
+      return [
+        { characterId: "member_b", name: "成员乙", enabled: true },
+        { characterId: "member_a", name: "成员甲", enabled: true },
+      ];
+    },
+  }, fixture.options);
+
+  assert.deepEqual(MVU_REQUEST_PARSERS.queryActors({ filters: { groupId: "group_007" } }), {
+    filters: { groupId: "group_007" },
+  });
+  const result = await service.queryActors({ filters: { groupId: "group_007" } });
+  assert.deepEqual(result.items.map((actor) => actor.characterId), ["member_b", "member_a"]);
+});
+
 test("100,000-record paging reads only the needed committed line range", async () => {
   const manifest = recordManifest();
   const last = manifest.segments.at(-1);
