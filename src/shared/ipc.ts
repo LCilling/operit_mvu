@@ -874,7 +874,7 @@ function parseEffectGroupsQuery(value: unknown): QueryRequest {
   return request;
 }
 const parseRecordsQuery = (value: unknown): QueryRequest => parseQueryRequest(
-  value, ["occurredAt"], [],
+  value, ["occurredAt"], ["fieldId", "scopeKey"],
 );
 
 function assertFilterValue(

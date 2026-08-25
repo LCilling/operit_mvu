@@ -41,7 +41,7 @@
         '<button type="button" class="button secondary" data-action="go-back">返回状态</button>');
     }
     const currentValue = summary.current ? summary.current.value : field.initialValue;
-    const records = ui.state.snapshot.pages.records.items.filter(function (record) { return record.fieldId === field.id; });
+    const records = ui.state.detailRecords ? ui.state.detailRecords.items : [];
     const colors = c.stagePalette(field);
     const model = c.trendModel({
       minimum: field.minimum,

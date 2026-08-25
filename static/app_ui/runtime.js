@@ -31,6 +31,7 @@
     directory: { actors: [], groups: [] },
     entities: new Map(),
     chartModels: new Map(),
+    detailRecords: null,
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -317,6 +318,12 @@
     if (!route) throw new Error("MVU_ROUTE_UNKNOWN:" + routeId);
     state.routeError = null;
     try {
+      if (routeId === "config-fields") {
+        state.pages.fields = await query("queryFields", { page: 1 }, "fields");
+        state.pages.fields.items.forEach(function (field) {
+          state.entities.set("field:" + field.id, field);
+        });
+      }
       if ((routeId === "status" || routeId === "field-detail") &&
           state.directory.actors.length === 0 && state.directory.groups.length === 0) {
         await loadDirectory();
@@ -324,6 +331,14 @@
       if (routeId === "field-detail") {
         if (!state.selectedFieldId) throw new Error("MVU_FIELD_SELECTION_MISSING");
         await getEntity("field", state.selectedFieldId);
+        const summary = state.snapshot.pages.fields.items.find(function (field) {
+          return field.id === state.selectedFieldId;
+        });
+        if (!summary || !summary.current) throw new Error("MVU_FIELD_CONTEXT_MISSING");
+        state.detailRecords = await query("queryRecords", {
+          page: 1,
+          filters: { fieldId: state.selectedFieldId, scopeKey: summary.current.scopeKey },
+        }, "records");
       }
       const entityRoutes = {
         "field-editor": "field",

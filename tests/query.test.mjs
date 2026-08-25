@@ -662,7 +662,7 @@ test("compact snapshot contains summaries counts and first pages without option 
   const service = new MvuQueryService(fixture.source, fixture.options);
   const snapshot = await service.pageSnapshot();
 
-  assert.equal(snapshot.pages.fields.items.length, 5);
+  assert.equal(snapshot.pages.fields.items.length, 1);
   assert.equal(snapshot.pages.rules.items.length, 5);
   assert.equal(snapshot.pages.conditions.items.length, 10);
   assert.equal(snapshot.pages.effectGroups.items.length, 10);
@@ -701,6 +701,44 @@ test("compact snapshot contains summaries counts and first pages without option 
   assert.equal("actors" in snapshot, false);
   assert.equal("groups" in snapshot, false);
   assert.equal("records" in snapshot, false);
+});
+
+test("status snapshot filters disabled and context-inapplicable fields before taking five", async () => {
+  const dataset = makeDataset();
+  dataset.fields = Array.from({ length: 12 }, (_, index) => ({
+    ...field(index),
+    enabled: index >= 6,
+    scope: "character",
+    bindingIds: index >= 6 ? ["actor_000"] : ["actor_elsewhere"],
+  }));
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+
+  const snapshot = await new MvuQueryService(fixture.source, fixture.options).pageSnapshot();
+
+  assert.deepEqual(snapshot.pages.fields.items.map((item) => item.id), [
+    "field_0007", "field_0008", "field_0009", "field_0010", "field_0011",
+  ]);
+  assert.equal(snapshot.pages.fields.totalCount, 6);
+});
+
+test("record query forwards exact field and scope filters to the bounded store", async () => {
+  const fixture = createSource(makeDataset(), {
+    queryCommittedRecords: async (request) => {
+      assert.deepEqual(request, {
+        offset: 0, limit: 10, direction: "desc", fieldId: "field_0001", scopeKey: "character:actor_000",
+      });
+      return { items: [record(7)], loadedCount: 1, totalCount: 1, hasMore: false, nextOffset: null };
+    },
+  });
+
+  const response = await new MvuQueryService(fixture.source, fixture.options).queryRecords({
+    page: 1,
+    filters: { fieldId: "field_0001", scopeKey: "character:actor_000" },
+  });
+  assert.equal(response.items[0].id, "record_7");
+  assert.equal(response.totalCount, 1);
 });
 
 test("compact snapshot preserves exact identity reference timestamp and color values", async () => {
