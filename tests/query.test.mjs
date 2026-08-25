@@ -463,12 +463,35 @@ test("query parsers reject unknown oversized and unsafe query input", () => {
     () => MVU_REQUEST_PARSERS.copyCondition({ id: "x".repeat(257), expectedRevision: 1 }),
     /MVU_.*REQUEST_INVALID/,
   );
+  assert.throws(
+    () => MVU_REQUEST_PARSERS.getRuleReferences({ id: "x".repeat(257) }),
+    /MVU_.*(?:INVALID|REQUIRED)/,
+  );
   const polluted = Object.create({ expectedRevision: 1 });
   polluted.id = "condition_0000";
   assert.throws(
     () => MVU_REQUEST_PARSERS.deleteCondition(polluted),
     /MVU_.*REQUEST_INVALID/,
   );
+});
+
+test("oversized reference IDs are rejected before any dataset read", async () => {
+  let reads = 0;
+  const fixture = createSource(makeDataset(), {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async readV3() {
+      reads += 1;
+      return fixture.source.readV3();
+    },
+  }, fixture.options);
+
+  await assert.rejects(service.getConditionReferences({ id: "x".repeat(257), page: 1 }), /MVU_ENTITY_ID_INVALID/);
+  await assert.rejects(service.getEffectGroupReferences({ id: "x".repeat(257), page: 1 }), /MVU_ENTITY_ID_INVALID/);
+  await assert.rejects(service.getRuleReferences({ id: "x".repeat(257) }), /MVU_ENTITY_ID_INVALID/);
+  assert.equal(reads, 0);
 });
 
 test("v3 mutation parsers require strict client revisions and reject unknown keys", () => {
