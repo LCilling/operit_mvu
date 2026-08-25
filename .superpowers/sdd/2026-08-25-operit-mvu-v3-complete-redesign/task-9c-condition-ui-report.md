@@ -2,64 +2,68 @@
 
 Date: 2026-08-26
 Branch: `codex/mvu-v3-complete-redesign`
-Commit message: `feat: complete condition library editor`
+Original commit: `a1bb95c feat: complete condition library editor`
+Follow-up commit message: `fix: harden condition editor UX`
 
 ## Outcome
 
-Task 9C is complete within Rules → 条件设定. No root navigation item, settings window, rule editor, effect editor, model, IPC parser, package, version, documentation, or artifact ownership was added or changed.
+Task 9C remains entirely under Rules → 条件设定. No root navigation item, settings window, rule/effect editor feature, model/parser, package/version, or artifact change was introduced.
 
-The condition library retains server-owned search and ten-row pagination, shows explicit `显示 x–y / 共 n`, and gives each row a readable expression, enabled state, reference status, whole-row open affordance, explicit toggle, and more-actions menu. New, view, edit, copy, toggle, and delete flows use the real condition IPC contract with exact revisions.
+The condition library retains server-owned search and ten-row pagination with explicit `显示 x–y / 共 n`. Rows expose readable expression, enabled and reference status, whole-row view/edit, toggle, copy, and delete actions. Create/update/copy/toggle/delete use real condition IPC calls and exact revisions; Demo implements the same strict, atomic flow.
 
-Referenced edits visibly identify affected rules. Delete always fetches references first: referenced conditions remain blocked with readable guidance, zero-reference deletion requires explicit confirmation, and larger reference sets use a searchable ten-row paged dialog.
-
-## Recursive editor and predicate coverage
-
-The editor preserves and serializes recursive AND, OR, NOT, and predicate nodes without flattening or dropping existing data. Every group exposes direct add-predicate, add-AND, add-OR, add-NOT, AND/OR conversion, and removal controls. NOT retains exactly one child by wrapping or replacing its child safely. Client and Demo validation enforce a non-empty valid expression, depth at most 12, at most 100 nodes, numeric/date/list limits, valid references, and unique valid AI IDs.
-
-All production predicate kinds are visible and editable in the DOM and serialize with exact production keys:
+The recursive editor renders AND, OR, NOT, and all 14 production predicates as editable nested cards. The 14 kinds are individually exercised from DOM input through exact save payload and authoritative entity reload, not only through serializer tests:
 
 - `recent_positive`, `long_inactive`, `user_care`, `special_day`
 - `high_frequency`, `field_comparison`, `message_count`, `keywords`, `sender`
 - `actor`, `group`, `concrete_date`, `repeating_date`, `ai_semantic`
 
-Field, actor, and group predicates use the existing bounded searchable picker. Keyword/date lists use bounded text/chip-style counts. AI semantic cards show the stable ID, built-in trigger suggestions, direct custom trigger type input, requirement, and minimum confidence together. Existing AI predicates can be edited or removed; copied expressions receive fresh AI IDs.
+## Independent-review hardening
 
-## Mutation and Demo parity
-
-Create/update/copy/toggle/delete calls carry the exact current `expectedRevision`. Mutation locks prevent duplicate submissions. Drafts survive validation, host, and stale-revision failures. Stale saves reload the latest authoritative revision while retaining the draft for explicit retry. A committed mutation followed by a failed refresh is shown as committed and offers refresh-only recovery, preventing accidental duplicate mutation.
-
-Demo mode implements condition CRUD, reference paging, strict unknown-key and expression validation, field/actor/group reference validation, referenced-delete rejection, AI ID refresh on copy, atomic revision semantics, and authoritative query/entity/reference refresh behavior.
+1. Required numeric controls now have HTML `required` and use one `parseRequiredFinite` path that rejects raw empty strings before conversion. Required/optional numeric fields across every numeric predicate retain exact production-shaped numbers or omitted optional keys.
+2. Concrete dates use year-aware Gregorian validation, so rolled dates such as `2026-02-31` fail. Repeating dates use each month's maximum, permit February 29, reject February 30/31, and visibly explain that February 29 triggers only in leap years.
+3. UI and Demo enforce condition array/string boundaries: 100 entries, 256 code units per entry, keyword total bounds, field/AI string bounds, and 4,096-unit AI requirements. Demo rejects 101-item actor/group/date mutations without changing revision. Condition actor/group pickers stop at 100 and show the count plus a readable reason.
+4. A failed reference read now states `影响范围未知`, never claims zero references, blocks save, preserves the draft, and provides a persistent retry. A successful retry restores the authoritative affected-rule summary and permits save.
+5. Condition picker selected items are built from hydrated entity cache entries. Multiple selections outside the first cursor page render `名称 · ID`; missing labels still render the stable ID, including accessible removal labels.
+6. Condition-tree rerenders restore focus to the same logical control. The reference modal receives initial focus, traps Tab/Shift+Tab, closes with Escape, and returns focus to its live delete opener.
+7. At widths below 350px the picker footer stacks and wraps instead of shrinking text. The picker no longer uses hidden overflow as a mask; live Chromium measurements cover the footer, filters, pinned selection, results, buttons, and all tested internal containers.
+8. A stale list mutation loads the latest authoritative revision and leaves a persistent recovery panel that prevents accidental repeat until the user explicitly rechecks the list.
+9. The focused suite now parameterizes all 14 predicate cards through DOM entry, mutation payload, commit, and authoritative reload. It also covers reference retry, modal keyboard behavior, picker hydration/limit, and 130% picker pressure.
 
 ## TDD evidence
 
-Behavior tests were added before each implementation slice and observed failing:
+Review fixes were test-first and observed failing before implementation:
 
-- Initial RED: 0/3 passed — ten-row condition library controls, exact complete serializer vocabulary, and referenced-delete blocking were absent.
-- Second RED: existing 3 passed; 3 new failures — real DOM AI create, deep recursive edit/save, and copy/toggle/delete revision flows were absent.
-- Third RED: 8/11 passed — stale revision recovery, paged references, and strict Demo unknown-key rejection failed.
-- Fourth RED: 12/14 passed — committed list-refresh recovery and narrow/reduced-motion CSS contracts failed.
-- Pressure/vocabulary RED: DOM transition setup and full predicate-card assertions exposed incomplete test stabilization; the final test verifies state-changing UI events and rendered per-kind controls.
+- First RED: 16/21 passed, 5 failed — required numeric semantics, Gregorian date validity, 101-item Demo bounds, unknown-reference copy, and save blocking.
+- Second RED: five focused interaction gaps reproduced — picker item 101, off-cursor labels, tree focus restoration, reference-modal focus lifecycle, and Chromium picker overflow masking.
+- Stale recovery RED: 2/3 focused tests passed; the stale list case timed out waiting for a persistent recovery entry.
+- Repeating-date copy RED: 0/1 passed until the visible Gregorian/leap-day explanation was added beside the month/day controls.
+- Hydrated-picker cache RED: 0/1 passed when direct confirmation duplicated the display ID; the display-only label is now stripped before the authoritative cache update.
 
-Final GREEN:
+Final verification:
 
-- `node --test tests/ui-task9-condition-dom.test.cjs`: 16/16 passed.
+- `node --test tests/ui-task9-condition-dom.test.cjs`: 29/29 passed.
 - `node --test tests/ui-task9-field-template-dom.test.cjs`: 20/20 passed.
+- `node --test tests/ui-shell.test.mjs`: 48/48 passed; `node tests/ui-task8-dom-behavior.cjs`: 4/4 passed.
 - `node scripts/audit-v3-ui.mjs`: PASS, seven modules and exactly four roots.
-- `pnpm check`: PASS — all audits/typecheck/effect audit, 257/257 v3 tests, and 4/4 DOM gates.
+- Syntax checks: `app.js`, `pages-rules.js`, `runtime.js`, and `audit-v3-ui.mjs` passed.
+- `pnpm run typecheck`: PASS.
+- `pnpm check`: an earlier full run passed with 271/271 v3 tests and 4/4 DOM gates. A final rerun after the shared worktree's out-of-scope `tests/model-budget.test.mjs` changed passed 260 in-scope v3 tests but failed that single concurrent test because it expects a `state-prompt` export absent from the concurrent build. That file was neither modified nor staged by Task 9C.
+- Committed Node regression constructed with `git ls-files tests/*.test.mjs` and explicitly excluding the concurrent `tests/model-budget.test.mjs`: 260/260 passed across 13 files.
 - `pnpm build`: PASS; `dist/app.html` generated successfully.
-- Syntax checks for `runtime.js`, `pages-rules.js`, `app.js`, and the audit script passed.
-- `git diff --check`: PASS.
+- `git diff --check`: PASS before staging and commit.
 
 ## 320px and 130% pressure evidence
 
-The condition test launches installed Chromium at a 320px viewport for both 100% and the repository's real 130% text-only scaling fixture. It loads a depth-12 expression containing an AI semantic card and measures live layout:
+Installed Chromium ran at a 320px viewport using both normal typography and the repository's actual 130% text-only fixture.
 
-| Scale | Body size / line | Nodes | document | app | editor | tree | off-screen cards |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100% | 14px / 21px | 13 | 0px | 0px | 0px | 0px | 0 |
-| 130% | 18.2px / 27.3px | 13 | 0px | 0px | 0px | 0px | 0 |
+| View | Scale | document | app | tested inner containers | off-screen cards |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Depth-12 AI editor | 100% | 0px | 0px | editor/tree 0px | 0 |
+| Depth-12 AI editor | 130% | 0px | 0px | editor/tree 0px | 0 |
+| Open actor picker | 100% | 0px | 0px | every measured container 0px | 0 |
+| Open actor picker | 130% | 0px | 0px | every measured container 0px | 0 |
 
-Both cases retained the required `Roboto, "Noto Sans SC", system-ui, sans-serif` stack and all three editable AI inputs. Targeted transitions use 200ms and become immediate under reduced motion. Text is wrapped rather than shrunk.
+The editor retained 14px/21px at normal scale and 18.2px/27.3px at 130%, with `Roboto, "Noto Sans SC", system-ui, sans-serif`. Picker/footer computed horizontal overflow is visible rather than hidden, while every measured `scrollWidth - clientWidth` is zero.
 
 ## Owned files
 
@@ -75,6 +79,5 @@ Both cases retained the required `Roboto, "Noto Sans SC", system-ui, sans-serif`
 
 ## Residual risks
 
-- Chromium pressure tests cover the web layout and real 130% fixture, but not every vendor WebView rendering quirk on physical Android devices.
-- Reference search filters the currently loaded ten-row page; navigation remains server-paged so no unbounded rule directory enters the DOM.
-- Impeccable's detector flags the mandated Roboto stack as a generic-font warning. The explicit product typography requirement takes precedence. Its side-accent warning was addressed by replacing the thick nested-card border cue with restrained icon color and shallow background depth cues.
+- Chromium verifies the repository's real 320px/130% pressure fixture, but physical Android WebViews may still differ in vendor font metrics.
+- Reference search remains intentionally bounded to the currently loaded server page; navigation provides the next/previous authoritative pages without creating an unbounded directory in the DOM.
