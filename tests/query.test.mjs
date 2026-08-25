@@ -272,6 +272,28 @@ test("actor group and field pickers normalize Unicode case and whitespace with s
   }
 });
 
+test("picker keyset cursors do not duplicate rows inserted before the prior batch", async () => {
+  const fixture = createSource(makeDataset(), {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const actors = makeActors();
+  const source = {
+    ...fixture.source,
+    async listActors() {
+      return structuredClone(actors);
+    },
+  };
+  const service = new MvuQueryService(source, fixture.options);
+  const first = await service.queryActors({});
+  const expectedSecond = await service.queryActors({ cursor: first.nextCursor });
+  actors.push({ characterId: "actor_inserted", name: "Actor -001", enabled: true });
+  const second = await service.queryActors({ cursor: first.nextCursor });
+
+  const firstIds = new Set(first.items.map((item) => item.characterId));
+  assert.equal(second.items.some((item) => firstIds.has(item.characterId)), false);
+  assert.equal(second.items[0].characterId, expectedSecond.items[0].characterId);
+});
+
 test("100,000-record paging reads only the needed committed line range", async () => {
   const manifest = recordManifest();
   const last = manifest.segments.at(-1);
