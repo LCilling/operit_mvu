@@ -6,6 +6,12 @@ import { validateDataField } from "./validation";
 export const FIELD_TEMPLATE_FORMAT = "operit-mvu-field-template";
 export const FIELD_TEMPLATE_SCHEMA_VERSION = 1;
 export const FIELD_TEMPLATE_MAX_BYTES = 1_048_576;
+export const FIELD_TEMPLATE_MAX_FIELDS = 100;
+export const FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD = 1_000;
+export const FIELD_TEMPLATE_MAX_STAGES_PER_FIELD = 100;
+export const FIELD_TEMPLATE_MAX_ID_LENGTH = 256;
+export const FIELD_TEMPLATE_MAX_NAME_LENGTH = 512;
+export const FIELD_TEMPLATE_MAX_DESCRIPTION_LENGTH = 4_096;
 
 export interface FieldTemplateTargetSelection { targetId: string; enabled: boolean; includeValue: boolean; }
 export interface FieldTemplateFieldSelection { fieldId: string; targets: FieldTemplateTargetSelection[]; }
@@ -83,7 +89,13 @@ export interface FieldTemplatePreview {
   mappingNeeds: Array<{
     fieldId: string;
     scope: DataField["scope"];
-    sourceTargets: Array<{ kind: "actor" | "group"; sourceId: string; name: string; hasValue: boolean; }>;
+    sourceTargets: Array<{
+      kind: "actor" | "group";
+      sourceId: string;
+      name: string;
+      hasValue: boolean;
+      valueAdjustment?: { from: number; to: number; reason: "clamp" | "step" };
+    }>;
   }>;
   invalidReferences: string[];
 }
@@ -107,6 +119,7 @@ export async function createFieldTemplateExport(
   for (const fieldId of request.fieldIds) {
     const field = snapshot.dataset.fields.find((candidate) => candidate.id === fieldId);
     if (field === undefined) throw new Error(`MVU_FIELD_TEMPLATE_FIELD_NOT_FOUND:${fieldId}`);
+    requireFieldValue(field, field.initialValue, "MVU_FIELD_TEMPLATE_INITIAL_VALUE_INVALID");
     const sourceTargets: PortableSourceTarget[] = [];
     const seenTargets = new Set<string>();
     for (const selected of selections.get(fieldId)?.targets ?? []) {
@@ -209,6 +222,7 @@ export async function previewFieldTemplate(
         sourceId: target.sourceId,
         name: target.name,
         hasValue: target.value !== undefined,
+        ...(target.value === undefined ? {} : adjustmentPreview(entry.definition, target.value)),
       })),
     })),
     invalidReferences: [],
@@ -279,7 +293,7 @@ export async function commitFieldTemplateImport(
       const scopeKey = `${field.scope}:${write.targetId}`;
       const existingValue = snapshot.dataset.stateValues[scopeKey]?.[entry.sourceFieldId];
       const value = write.valuePolicy === "template_value"
-        ? sourceTarget.value
+        ? sourceTarget.value === undefined ? undefined : normalizeTemplateValue(field, sourceTarget.value).value
         : write.valuePolicy === "keep_existing" ? existingValue ?? field.initialValue : field.initialValue;
       if (value === undefined) throw new Error("MVU_FIELD_TEMPLATE_VALUE_MISSING");
       requireFieldValue(field, value, "MVU_FIELD_TEMPLATE_VALUE_INVALID");
@@ -349,7 +363,7 @@ function parseFieldTemplateDocument(json: string): FieldTemplateDocument {
   assertExactKeys(document, ["format", "schemaVersion", "exportedAt", "checksum", "fields"]);
   if (document.format !== FIELD_TEMPLATE_FORMAT || document.schemaVersion !== FIELD_TEMPLATE_SCHEMA_VERSION ||
     typeof document.exportedAt !== "string" || !Number.isFinite(Date.parse(document.exportedAt)) ||
-    !Array.isArray(document.fields) || document.fields.length === 0 || document.fields.length > 100) {
+    !Array.isArray(document.fields) || document.fields.length === 0 || document.fields.length > FIELD_TEMPLATE_MAX_FIELDS) {
     throw new Error("MVU_FIELD_TEMPLATE_INVALID");
   }
   const checksum = requireRecord(document.checksum, "MVU_FIELD_TEMPLATE_CHECKSUM_INVALID");
@@ -370,11 +384,13 @@ function parseFieldTemplateDocument(json: string): FieldTemplateDocument {
 function parsePortableField(value: unknown): PortableFieldEntry {
   const field = requireRecord(value, "MVU_FIELD_TEMPLATE_FIELD_INVALID");
   assertExactKeys(field, ["sourceFieldId", "definition", "sourceTargets", "dependencySummary"]);
-  if (typeof field.sourceFieldId !== "string" || !Array.isArray(field.sourceTargets)) throw new Error("MVU_FIELD_TEMPLATE_FIELD_INVALID");
+  if (typeof field.sourceFieldId !== "string" || field.sourceFieldId.length > FIELD_TEMPLATE_MAX_ID_LENGTH ||
+    !Array.isArray(field.sourceTargets)) throw new Error("MVU_FIELD_TEMPLATE_FIELD_INVALID");
   const definition = requireRecord(field.definition, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
   assertExactKeys(definition, PORTABLE_DEFINITION_KEYS);
+  assertPortableDefinitionShape(definition);
   const targets = field.sourceTargets.map(parsePortableTarget);
-  if (targets.length > 1_000) throw new Error("MVU_FIELD_TEMPLATE_TARGET_LIMIT");
+  if (targets.length > FIELD_TEMPLATE_MAX_TARGETS_PER_FIELD) throw new Error("MVU_FIELD_TEMPLATE_TARGET_LIMIT");
   if (targets.length > 0) requireUniqueNonEmpty(targets.map((target) => target.sourceId), "MVU_FIELD_TEMPLATE_TARGET_DUPLICATE");
   const dependencySummary = requireRecord(field.dependencySummary, "MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID");
   assertExactKeys(dependencySummary, ["linkRuleCount", "automationRuleCount", "effectGroupCount"]);
@@ -383,11 +399,12 @@ function parsePortableField(value: unknown): PortableFieldEntry {
   }
   const validated = { ...definition, id: field.sourceFieldId, bindingIds: targets.map((target) => target.sourceId) } as DataField;
   validateDataField(validated);
+  requireFieldValue(validated, validated.initialValue, "MVU_FIELD_TEMPLATE_INITIAL_VALUE_INVALID");
   for (const target of targets) {
     if ((validated.scope === "character" && target.kind !== "actor") ||
       (validated.scope === "group" && target.kind !== "group") ||
       (validated.scope !== "character" && validated.scope !== "group")) throw new Error("MVU_FIELD_TEMPLATE_TARGET_SCOPE_INVALID");
-    if (target.value !== undefined) requireFieldValue(validated, target.value, "MVU_FIELD_TEMPLATE_VALUE_INVALID");
+    if (target.value !== undefined && !Number.isFinite(target.value)) throw new Error("MVU_FIELD_TEMPLATE_VALUE_INVALID");
   }
   return {
     sourceFieldId: field.sourceFieldId,
@@ -403,8 +420,14 @@ function parsePortableTarget(value: unknown): PortableSourceTarget {
     ? ["kind", "sourceId", "name", "enabled"]
     : ["kind", "sourceId", "name", "enabled", "value"]);
   if ((target.kind !== "actor" && target.kind !== "group") || typeof target.sourceId !== "string" ||
-    target.sourceId.length === 0 || typeof target.name !== "string" || target.name.trim().length === 0 ||
-    target.enabled !== true || (target.value !== undefined && typeof target.value !== "number")) {
+    target.sourceId.length === 0 || target.sourceId.length > FIELD_TEMPLATE_MAX_ID_LENGTH ||
+    typeof target.name !== "string" || target.name.trim().length === 0 ||
+    target.name.length > FIELD_TEMPLATE_MAX_NAME_LENGTH ||
+    target.enabled !== true || (target.value !== undefined &&
+      (typeof target.value !== "number" || !Number.isFinite(target.value)))) {
+    if (typeof target.name === "string" && target.name.length > FIELD_TEMPLATE_MAX_NAME_LENGTH) {
+      throw new Error("MVU_FIELD_TEMPLATE_TEXT_LIMIT");
+    }
     throw new Error("MVU_FIELD_TEMPLATE_TARGET_INVALID");
   }
   return target as unknown as PortableSourceTarget;
@@ -421,10 +444,12 @@ function checksumFields(fields: PortableFieldEntry[]): string {
 }
 
 function collisionSafeCopyId(sourceId: string, occupied: Set<string>): string {
-  const base = `${sourceId}_copy`;
+  const copySuffix = "_copy";
+  const base = `${sourceId.slice(0, FIELD_TEMPLATE_MAX_ID_LENGTH - copySuffix.length)}${copySuffix}`;
   if (!occupied.has(base)) return base;
   for (let suffix = 2; suffix <= 10_000; suffix += 1) {
-    const candidate = `${base}_${suffix}`;
+    const numberedSuffix = `_copy_${suffix}`;
+    const candidate = `${sourceId.slice(0, FIELD_TEMPLATE_MAX_ID_LENGTH - numberedSuffix.length)}${numberedSuffix}`;
     if (!occupied.has(candidate)) return candidate;
   }
   throw new Error("MVU_FIELD_TEMPLATE_ID_EXHAUSTED");
@@ -436,6 +461,66 @@ function buildFileName(fields: PortableFieldEntry[], exportedAt: string): string
     : `${fields.length}-fields`;
   const timestamp = exportedAt.replace(/[-:]/g, "").replace("T", "-").replace(/\.\d{3}Z$/, "Z");
   return `operit-mvu-field-template-${label.slice(0, 48)}-${timestamp}.json`;
+}
+
+function assertPortableDefinitionShape(definition: Record<string, unknown>): void {
+  const textFields: Array<[unknown, number]> = [
+    [definition.name, FIELD_TEMPLATE_MAX_NAME_LENGTH],
+    [definition.description, FIELD_TEMPLATE_MAX_DESCRIPTION_LENGTH],
+    [definition.icon, FIELD_TEMPLATE_MAX_NAME_LENGTH],
+    [definition.themeColor, FIELD_TEMPLATE_MAX_NAME_LENGTH],
+  ];
+  if (textFields.some(([value, limit]) => typeof value !== "string" || value.length > limit)) {
+    throw new Error("MVU_FIELD_TEMPLATE_TEXT_LIMIT");
+  }
+  const ai = requireRecord(definition.ai, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
+  assertExactKeys(ai, ["enabled", "minConfidence", "maxDelta", "prompt"]);
+  if (typeof ai.prompt !== "string" || ai.prompt.length > FIELD_TEMPLATE_MAX_DESCRIPTION_LENGTH) {
+    throw new Error("MVU_FIELD_TEMPLATE_TEXT_LIMIT");
+  }
+  const natural = requireRecord(definition.naturalChange, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
+  assertExactKeys(natural, ["enabled", "unitMs", "amount"]);
+  const perTurn = requireRecord(definition.perTurnChange, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
+  assertExactKeys(perTurn, ["enabled", "intervalTurns", "amount", "countMode"]);
+  if (!Array.isArray(definition.stages) || definition.stages.length > FIELD_TEMPLATE_MAX_STAGES_PER_FIELD) {
+    throw new Error("MVU_FIELD_TEMPLATE_STAGE_LIMIT");
+  }
+  for (const value of definition.stages) {
+    const stage = requireRecord(value, "MVU_FIELD_TEMPLATE_DEFINITION_INVALID");
+    assertExactKeys(stage, ["id", "name", "description", "threshold"]);
+    if (typeof stage.id !== "string" || stage.id.length > FIELD_TEMPLATE_MAX_ID_LENGTH ||
+      typeof stage.name !== "string" || stage.name.length > FIELD_TEMPLATE_MAX_NAME_LENGTH ||
+      typeof stage.description !== "string" || stage.description.length > FIELD_TEMPLATE_MAX_DESCRIPTION_LENGTH) {
+      throw new Error("MVU_FIELD_TEMPLATE_TEXT_LIMIT");
+    }
+  }
+}
+
+function adjustmentPreview(
+  field: PortableFieldDefinition,
+  value: number,
+): { valueAdjustment?: { from: number; to: number; reason: "clamp" | "step" } } {
+  const normalized = normalizeTemplateValue(field as DataField, value);
+  return normalized.adjustment === undefined ? {} : { valueAdjustment: normalized.adjustment };
+}
+
+function normalizeTemplateValue(
+  field: Pick<DataField, "minimum" | "maximum" | "step">,
+  value: number,
+): { value: number; adjustment?: { from: number; to: number; reason: "clamp" | "step" } } {
+  if (!Number.isFinite(value)) throw new Error("MVU_FIELD_TEMPLATE_VALUE_INVALID");
+  const clamped = Math.min(field.maximum, Math.max(field.minimum, value));
+  const stepped = field.minimum + Math.round((clamped - field.minimum) / field.step) * field.step;
+  const normalized = Math.min(field.maximum, Math.max(field.minimum, Number(stepped.toPrecision(15))));
+  if (Math.abs(normalized - value) <= 1e-7) return { value: normalized };
+  return {
+    value: normalized,
+    adjustment: {
+      from: value,
+      to: normalized,
+      reason: value < field.minimum || value > field.maximum ? "clamp" : "step",
+    },
+  };
 }
 
 function requireFieldValue(field: DataField, value: number, code: string): void {
