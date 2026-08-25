@@ -24,11 +24,13 @@ import type {
   EffectActorSelector,
   EffectDuration,
   EffectGroupDefinition,
+  EffectReasonConfig,
   EffectOperation,
   MvuDatasetV3,
   RuleActorSelector,
   RuleTargetSelector,
 } from "./model-v3";
+import { EFFECT_REASON_TEXT_MAX_LENGTH } from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
 } from "./temporary-effect";
@@ -667,6 +669,7 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     new Set(value.processedMessageIds).size !== value.processedMessageIds.length) {
     fail("INVALID_MVU_V3_DATASET");
   }
+  backfillLegacyV3EffectReasonConfigs(value);
   assertSettingsShape(value.settings);
   assertNestedNumberMap(value.stateValues);
   assertNestedNumberMap(value.lastSettled);
@@ -858,6 +861,12 @@ function assertEffectGroupDefinitionShape(
     !isIsoTimestamp(value.createdAt) || !isIsoTimestamp(value.updatedAt)) {
     fail("INVALID_MVU_V3_EFFECT_GROUP");
   }
+  const definitionKeys = [
+    "id", "name", "description", "enabled", "fieldEffects", "defaultReason", "createdAt", "updatedAt",
+    ...(value.defaultDuration === undefined ? [] : ["defaultDuration"]),
+  ];
+  if (!hasExactKeys(value, definitionKeys)) fail("INVALID_MVU_V3_EFFECT_GROUP");
+  assertEffectReasonConfigShape(value.defaultReason);
   if (value.defaultDuration !== undefined) assertEffectDurationShape(value.defaultDuration);
 
   const fieldIds = new Set<string>();
@@ -875,6 +884,17 @@ function assertEffectGroupDefinitionShape(
     for (const operation of fieldEffect.operations) assertEffectOperationShape(operation);
     fieldIds.add(fieldEffect.fieldId);
     fieldEffectIds.add(fieldEffect.id);
+  }
+}
+
+function assertEffectReasonConfigShape(value: unknown): asserts value is EffectReasonConfig {
+  if (!isRecord(value) || !hasExactKeys(value, ["mode", "template", "text"]) ||
+    (value.mode !== "template" && value.mode !== "custom") ||
+    (value.template !== "general" && value.template !== "positive" && value.template !== "negative" &&
+      value.template !== "environment" && value.template !== "relationship") ||
+    typeof value.text !== "string" || value.text.length > EFFECT_REASON_TEXT_MAX_LENGTH ||
+    (value.mode === "custom" && value.text.trim().length === 0)) {
+    fail("MVU_V3_EFFECT_REASON_CONFIG_INVALID");
   }
 }
 
@@ -958,6 +978,7 @@ function assertActiveEffectInstanceShape(
       description: snapshot.description,
       enabled: true,
       fieldEffects: snapshotFieldEffects,
+      defaultReason: { mode: "template", template: "general", text: "" },
       createdAt: snapshot.updatedAt,
       updatedAt: snapshot.updatedAt,
     }, fields);
@@ -966,6 +987,18 @@ function assertActiveEffectInstanceShape(
       fail("MVU_V3_ACTIVE_EFFECT_DEFINITION_SNAPSHOT_INVALID");
     }
   }
+}
+
+/** Deterministic compatibility fill for v3 files written before effect reasons lived on definitions. */
+export function backfillLegacyV3EffectReasonConfigs(value: unknown): boolean {
+  if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.effectGroups)) return false;
+  let changed = false;
+  for (const effectGroup of value.effectGroups) {
+    if (!isRecord(effectGroup) || Object.prototype.hasOwnProperty.call(effectGroup, "defaultReason")) continue;
+    effectGroup.defaultReason = { mode: "template", template: "general", text: "" };
+    changed = true;
+  }
+  return changed;
 }
 
 function assertEffectDurationShape(value: unknown): asserts value is EffectDuration {

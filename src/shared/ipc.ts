@@ -54,6 +54,7 @@ import type {
   EffectActorSelector,
   EffectDuration,
   EffectGroupDefinition,
+  EffectReasonConfig,
   EffectOperation,
   FieldEffectDefinition,
   RuleActionV3,
@@ -61,6 +62,7 @@ import type {
   RuleDefinitionV3,
   RuleTargetSelector,
 } from "../mvu/app/model-v3";
+import { EFFECT_REASON_TEXT_MAX_LENGTH } from "../mvu/app/model-v3";
 import type {
   BackgroundModelProbeResult,
   SystemModelApi,
@@ -1240,11 +1242,26 @@ function parseEffectDuration(value: unknown): EffectDuration {
   };
 }
 
+function parseEffectReasonConfig(value: unknown): EffectReasonConfig {
+  const record = requireRecord(value, "MVU_EFFECT_REASON_CONFIG_INVALID");
+  assertKeys(record, ["mode", "template", "text"], [], "MVU_EFFECT_REASON_CONFIG_INVALID");
+  const mode = requireEnum(record, "mode", ["template", "custom"] as const, "MVU_EFFECT_REASON_CONFIG_INVALID");
+  const template = requireEnum(
+    record,
+    "template",
+    ["general", "positive", "negative", "environment", "relationship"] as const,
+    "MVU_EFFECT_REASON_CONFIG_INVALID",
+  );
+  const text = requireBoundedString(record, "text", EFFECT_REASON_TEXT_MAX_LENGTH, "MVU_EFFECT_REASON_CONFIG_INVALID");
+  if (mode === "custom" && text.trim().length === 0) fail("MVU_EFFECT_REASON_CONFIG_INVALID");
+  return { mode, template, text };
+}
+
 function parseEffectGroupInput(value: unknown, patch: false): EffectGroupInput;
 function parseEffectGroupInput(value: unknown, patch: true): EffectGroupPatch;
 function parseEffectGroupInput(value: unknown, patch: boolean): EffectGroupInput | EffectGroupPatch {
   const record = requireRecord(value, patch ? "MVU_EFFECT_GROUP_PATCH_INVALID" : "MVU_EFFECT_GROUP_INPUT_INVALID");
-  const required = ["name", "description", "enabled", "fieldEffects"];
+  const required = ["name", "description", "enabled", "fieldEffects", "defaultReason"];
   const optional = ["defaultDuration"];
   assertKeys(record, patch ? [] : required, patch ? [...required, ...optional] : optional,
     patch ? "MVU_EFFECT_GROUP_PATCH_INVALID" : "MVU_EFFECT_GROUP_INPUT_INVALID");
@@ -1256,6 +1273,7 @@ function parseEffectGroupInput(value: unknown, patch: boolean): EffectGroupInput
     if (!Array.isArray(record.fieldEffects) || record.fieldEffects.length > 100) fail("MVU_EFFECT_GROUP_INPUT_INVALID");
     result.fieldEffects = record.fieldEffects.map(parseFieldEffect);
   }
+  if (hasOwn(record, "defaultReason")) result.defaultReason = parseEffectReasonConfig(record.defaultReason);
   if (hasOwn(record, "defaultDuration")) result.defaultDuration = parseEffectDuration(record.defaultDuration);
   return result;
 }
