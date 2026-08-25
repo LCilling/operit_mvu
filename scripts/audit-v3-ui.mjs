@@ -239,8 +239,27 @@ requireMatch(files["runtime.js"], /validateNativeMutationRequest[\s\S]*?createEf
   "effect-group create and update requests must retain the 512-character editor boundary");
 requireMatch(files["app.js"] + files["pages-config.js"], /loading:\s*true[\s\S]*?flow\.loading\s*=\s*false[\s\S]*?flow\.loading\s*\?\s*"progress_activity"\s*:\s*"error"/,
   "field-template loading state must stay separate from inline error state");
-requireMatch(files["pages-rules.js"], /rule-summary[\s\S]*?触发角色[\s\S]*?触发条件[\s\S]*?触发结果[\s\S]*?>查看<[\s\S]*?>修改</,
-  "compact rule rows must show actor, condition and action summaries with view/edit actions");
+requireMatch(files["pages-rules.js"], /data-rule-row[\s\S]*?触发角色[\s\S]*?条件：[\s\S]*?结果：[\s\S]*?查看 \/ 编辑[\s\S]*?toggle-rule[\s\S]*?copy-rule[\s\S]*?delete-rule/,
+  "compact rule rows must expose readable summaries and real view/toggle/copy/delete actions");
+requireMatch(files["pages-rules.js"], /data-effect-row[\s\S]*?查看 \/ 编辑[\s\S]*?toggle-effect-group[\s\S]*?copy-effect-group[\s\S]*?delete-effect-group/,
+  "effect-group rows must expose visible creation and real row CRUD actions");
+requireMatch(files["pages-rules.js"], /触发角色绑定[\s\S]*?ruleActorKind[\s\S]*?rule-condition[\s\S]*?触发后改变的字段内容/,
+  "rule editor must keep actor binding, condition, and post-trigger results in product order");
+for (const token of ["any", "current_actor", "selected", "group", "change_field", "activate_effect_group", "trigger_actor", "all_bound"]) {
+  requireMatch(files["pages-rules.js"] + files["app.js"], new RegExp(`["']${token}["']`), `rule editor must expose production token ${token}`);
+}
+for (const token of ["immediate_delta", "fixed_adjustment", "positive_multiplier", "negative_multiplier", "all_multiplier"]) {
+  requireMatch(files["pages-rules.js"] + files["app.js"], new RegExp(`["']${token}["']`), `effect editor must expose production operation ${token}`);
+}
+for (const token of ["manual", "natural", "per_turn", "rule", "ai"]) {
+  requireMatch(files["pages-rules.js"] + files["app.js"], new RegExp(`["']${token}["']`), `effect editor must expose production source ${token}`);
+}
+requireMatch(files["app.js"], /createRule[\s\S]*?updateRule[\s\S]*?expectedRevision[\s\S]*?mutationCommitted[\s\S]*?STALE_REVISION/,
+  "rule editor mutations must be revisioned and distinguish committed refresh recovery from stale conflicts");
+requireMatch(files["app.js"], /createEffectGroup[\s\S]*?updateEffectGroup[\s\S]*?expectedRevision[\s\S]*?mutationCommitted[\s\S]*?STALE_REVISION/,
+  "effect editor mutations must be revisioned and distinguish committed refresh recovery from stale conflicts");
+requireMatch(styles, /\.rule-editor,\s*\.effect-editor\s*\{[^}]*min-width:\s*0;[^}]*overflow-x:\s*hidden;/,
+  "rule and effect editors must stay horizontally bounded on narrow WebViews");
 const conditionPredicateTokens = [
   "recent_positive", "long_inactive", "user_care", "special_day", "high_frequency", "field_comparison",
   "message_count", "keywords", "sender", "actor", "group", "concrete_date", "repeating_date", "ai_semantic",

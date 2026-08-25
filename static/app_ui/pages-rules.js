@@ -5,7 +5,7 @@
   function rulesPage() {
     const counts = ui.state.snapshot.counts;
     return '<div class="hub-page">' +
-      '<section class="hub-intro"><span>' + c.icon("account_tree") + '</span><div><h2>规则与效果</h2><p>条件负责判断，结果负责改变状态。</p></div></section>' +
+      '<section class="hub-intro"><span>' + c.icon("account_tree") + '</span><div><h2>规则与效果</h2><p>条件负责判断；效果是结果，不包含触发条件。</p></div></section>' +
       '<div class="menu-group" aria-label="规则功能">' +
       c.menuRow("rule", "规则总体设置", "绑定触发角色、条件和结果", "rule-library", counts.rules + " 条") +
       c.menuRow("schema", "条件设定", "完整条件库与 AI 触发类型", "condition-library", counts.conditions + " 个") +
@@ -18,12 +18,17 @@
     const view = ui.state.listViews.rules;
     return managementPage("规则设置", "每页 5 条，触发条件与结果分开显示", page, "条规则", "rule", function (rule) {
       const labels = ui.state.ruleLabels.get(rule.id) || { actor: "绑定信息读取中", condition: "条件读取中", actions: rule.actions.length + " 个结果" };
-      return '<article class="compact-row management-rule-row"><header><strong>' + ui.escapeHtml(rule.name) + '</strong><span class="status-dot ' +
-        (rule.enabled ? "enabled" : "") + '">' + (rule.enabled ? "已启用" : "已停用") + '</span></header><dl class="rule-summary"><div><dt>触发角色</dt><dd>' +
-        ui.escapeHtml(labels.actor) + '</dd></div><div><dt>触发条件</dt><dd>' + ui.escapeHtml(labels.condition) + '</dd></div><div><dt>触发结果</dt><dd>' +
-        ui.escapeHtml(labels.actions) + '</dd></div></dl><div class="row-actions"><button type="button" class="button ghost" data-open-entity="rule" data-entity-id="' +
-        ui.escapeHtml(rule.id) + '">查看</button><button type="button" class="button secondary" data-open-entity="rule" data-entity-id="' +
-        ui.escapeHtml(rule.id) + '">修改</button></div></article>';
+      const disabled = ui.state.managementRecoveries.rules ? " disabled" : "";
+      return '<article class="management-entity-row rule-management-row" data-rule-row="' + ui.escapeHtml(rule.id) + '"><button type="button" class="management-row-main" data-open-entity="rule" data-entity-id="' +
+        ui.escapeHtml(rule.id) + '"><span class="management-row-copy"><span><strong>' + ui.escapeHtml(rule.name) + '</strong><em class="status-dot ' +
+        (rule.enabled ? "enabled" : "") + '">' + (rule.enabled ? "已启用" : "已停用") + '</em></span><small>触发角色：' +
+        ui.escapeHtml(labels.actor) + '</small><small class="' + (labels.condition === "条件待修复" ? "missing-reference" : "") + '">条件：' +
+        ui.escapeHtml(labels.condition) + '</small><small>结果：' + ui.escapeHtml(labels.actions) + '</small></span><span class="management-open-copy">查看 / 编辑</span>' +
+        c.icon("chevron_right") + '</button><div class="management-row-actions"><button type="button" class="entity-toggle" data-action="toggle-rule" data-rule-id="' +
+        ui.escapeHtml(rule.id) + '" data-rule-enabled="' + String(rule.enabled) + '" aria-pressed="' + String(rule.enabled) + '"' + disabled + '>' +
+        c.icon(rule.enabled ? "toggle_on" : "toggle_off") + '<span>' + (rule.enabled ? "已启用" : "已停用") + '</span></button><button type="button" data-action="copy-rule" data-rule-id="' +
+        ui.escapeHtml(rule.id) + '"' + disabled + '>复制</button><button type="button" class="danger-text" data-action="delete-rule" data-rule-id="' +
+        ui.escapeHtml(rule.id) + '"' + disabled + '>删除</button></div></article>';
     }, "rule-library", "新增规则", view, 5);
   }
 
@@ -138,20 +143,59 @@
     const view = ui.state.listViews.effectGroups;
     return managementPage("临时效果", "一个效果组可以影响多个字段", page, "个效果组", "effectGroup", function (effect) {
       const fieldCount = effect.fieldEffects ? effect.fieldEffects.length : effect.fieldCount;
-      return '<article class="compact-row"><button type="button" data-open-entity="effectGroup" data-entity-id="' + ui.escapeHtml(effect.id) + '"><span><strong>' +
-        ui.escapeHtml(effect.name) + '</strong><small>' + ui.escapeHtml(effect.description || "未填写说明") + '</small></span><span class="type-chip">' +
-        fieldCount + " 个字段</span>" + c.icon("chevron_right") + "</button></article>";
+      const disabled = ui.state.managementRecoveries.effectGroups ? " disabled" : "";
+      return '<article class="management-entity-row effect-management-row" data-effect-row="' + ui.escapeHtml(effect.id) + '"><button type="button" class="management-row-main" data-open-entity="effectGroup" data-entity-id="' +
+        ui.escapeHtml(effect.id) + '"><span class="management-row-copy"><span><strong>' + ui.escapeHtml(effect.name) + '</strong><em class="status-dot ' +
+        (effect.enabled ? "enabled" : "") + '">' + (effect.enabled ? "已启用" : "已停用") + '</em></span><small>' + ui.escapeHtml(effect.description || "未填写说明") +
+        '</small><small>' + fieldCount + ' 个目标字段</small></span><span class="management-open-copy">查看 / 编辑</span>' + c.icon("chevron_right") +
+        '</button><div class="management-row-actions"><button type="button" class="entity-toggle" data-action="toggle-effect-group" data-effect-id="' +
+        ui.escapeHtml(effect.id) + '" data-effect-enabled="' + String(effect.enabled) + '" aria-pressed="' + String(effect.enabled) + '"' + disabled + '>' +
+        c.icon(effect.enabled ? "toggle_on" : "toggle_off") + '<span>' + (effect.enabled ? "已启用" : "已停用") + '</span></button><button type="button" data-action="copy-effect-group" data-effect-id="' +
+        ui.escapeHtml(effect.id) + '"' + disabled + '>复制</button><button type="button" class="danger-text" data-action="delete-effect-group" data-effect-id="' +
+        ui.escapeHtml(effect.id) + '"' + disabled + '>删除</button></div></article>';
     }, "effect-library", "新增效果组", view, 10);
   }
 
   function managementPage(title, description, page, noun, entityType, row, route, addLabel, view, pageSize) {
+    const allCount = ui.state.snapshot.counts[pageCountKey(route)];
+    const start = page.loadedCount ? (view.page - 1) * pageSize + 1 : 0;
+    const end = page.loadedCount ? start + page.loadedCount - 1 : 0;
+    const key = pageCountKey(route);
+    const recovery = ui.state.managementRecoveries[key];
+    const recoveryPanel = recovery ? '<section class="management-list-recovery" role="alert"><span>' + c.icon("sync_problem") +
+      '</span><div><strong>' + (recovery.kind === "stale" ? "检测到修订冲突" : "操作已经提交") + '</strong><p>' + ui.escapeHtml(recovery.error) +
+      '</p></div><button type="button" class="button secondary" data-action="reload-management-list" data-management-key="' + key + '">重新载入</button></section>' : "";
+    const meta = '<p class="list-meta" aria-live="polite">显示 ' + start + '–' + end + ' / ' +
+      (c.listViewFiltered(view) ? '匹配 ' + page.totalCount + ' / ' : '') + '共 ' + allCount + ' ' + noun + '</p>';
     return '<div class="library-page">' + c.sectionHeading(title, description,
       '<button type="button" class="text-action" data-new-entity="' + entityType + '">' + c.icon("add") + addLabel + "</button>") +
       '<label class="search-field full">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) + '" placeholder="搜索' +
       title + '" aria-label="搜索' + title + '" data-list-search-route="' + route + '"></label>' +
-      '<div data-management-region="' + route + '">' + c.listMeta(page, noun, view.page, pageSize, ui.state.snapshot.counts[pageCountKey(route)], c.listViewFiltered(view)) +
+      recoveryPanel + '<div data-management-region="' + route + '">' + meta +
       (page.items.length ? '<div class="compact-list">' + page.items.map(row).join("") + "</div>" :
-        c.emptyState("inbox", "还没有" + title, "创建后会显示在这里。")) + c.pagination(page, route, view.page) + "</div></div>";
+        c.emptyState("inbox", c.listViewFiltered(view) ? "没有匹配结果" : "还没有" + title,
+          c.listViewFiltered(view) ? "请调整搜索词或筛选条件。" : "创建后会显示在这里。")) + c.pagination(page, route, view.page) +
+      "</div>" + renderManagementDeleteDialog() + "</div>";
+  }
+
+  function renderManagementDeleteDialog() {
+    const dialog = ui.state.managementDeleteDialog;
+    if (!dialog) return "";
+    const references = dialog.references || [];
+    const label = dialog.entityType === "rule" ? "规则" : "效果组";
+    const list = references.length ? '<ul class="management-reference-list">' + references.map(function (reference) {
+      return '<li><strong>' + ui.escapeHtml(reference.name) + '</strong><small>' + ui.escapeHtml(reference.entityType === "rule" ? "规则引用" : reference.relation || "引用") + '</small></li>';
+    }).join("") + "</ul>" : "";
+    const guidance = dialog.loading ? '<p class="dialog-status">正在检查引用…</p>' : dialog.error
+      ? '<p class="inline-error" role="alert">' + ui.escapeHtml(dialog.error) + '</p>' : references.length
+        ? '<p class="reference-guidance">此' + label + '仍被引用。请先从规则中移除相关引用，再返回删除。</p>'
+        : '<p class="reference-guidance">没有发现引用。删除后无法恢复。</p>';
+    return '<div class="management-delete-layer" data-action="close-management-delete"><section class="management-delete-dialog" data-management-delete-dialog="' +
+      dialog.entityType + '" role="dialog" aria-modal="true" aria-labelledby="management-delete-title" data-stop-close><header><div><h2 id="management-delete-title">删除「' +
+      ui.escapeHtml(dialog.name) + '」</h2><p>删除前检查受影响内容</p></div><button type="button" class="icon-button" data-action="close-management-delete" aria-label="关闭">' +
+      c.icon("close") + '</button></header>' + guidance + list + '<footer><button type="button" class="button secondary" data-action="close-management-delete">取消</button>' +
+      (!dialog.loading && !dialog.error && !references.length ? '<button type="button" class="button danger" data-action="confirm-management-delete">确认删除</button>' : "") +
+      '</footer></section></div>';
   }
 
   function pageCountKey(route) {
@@ -159,21 +203,59 @@
   }
 
   function ruleEditorPage() {
-    const entity = ui.state.selectedEntityId ? ui.state.entities.get("rule:" + ui.state.selectedEntityId) : null;
-    const name = entity ? entity.name : "新自动规则";
-    return '<form class="editor-page rule-editor"><section class="editor-section">' + c.sectionHeading("基础信息", "规则名称和说明") +
-      '<div class="form-card"><label>规则名称<input value="' + ui.escapeHtml(name) + '"></label><label>描述<textarea rows="2">' +
-      ui.escapeHtml(entity ? entity.description : "") + "</textarea></label></div></section>" +
-      '<section class="editor-section">' + c.sectionHeading("触发角色", "先筛选角色，再判断条件与 AI") +
-      '<button type="button" class="picker-trigger" data-action="open-actor-picker" data-picker-key="rule-trigger-actors" data-picker-mode="multiple"><span>' + c.icon("person_search") + '</span><span><strong>任意角色</strong><small>可搜索并绑定一个或多个角色</small></span>' + c.icon("chevron_right") + "</button></section>" +
-      '<section class="editor-section">' + c.sectionHeading("当……", "满足以下条件时") +
-      '<button type="button" class="picker-trigger" data-action="open-condition-picker" data-picker-key="rule-condition"><span>' + c.icon("schema") + '</span><span><strong>选择条件</strong><small>从完整条件库复用或新建</small></span>' + c.icon("chevron_right") + "</button></section>" +
-      '<section class="editor-section result-section">' + c.sectionHeading("触发后改变的字段内容", "效果是结果，不包含触发条件") +
-      '<article class="result-card"><label>状态字段<button type="button" class="field-picker" data-action="open-field-picker" data-picker-key="rule-result-field">选择目标字段 ' + c.icon("search") +
-      '</button></label><label>变化值<input type="number" value="0"></label><div class="effect-import"><strong>应用临时效果</strong><p>显式导入的效果只参与本条字段结果。</p>' +
-      '<button type="button" class="picker-trigger compact" data-action="open-effect-picker" data-picker-key="rule-result-effects" data-picker-mode="multiple">' + c.icon("bolt") + '<span>选择一个或多个效果组</span>' + c.icon("add") +
-      '</button></div></article><button type="button" class="button secondary full">' + c.icon("add") + "添加字段变化</button></section>" +
-      '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary" disabled>保存规则</button></div></form>';
+    const draft = ui.state.ruleEditorDraft;
+    if (!draft) return c.emptyState("progress_activity", "正在准备规则", "正在读取角色、条件与结果引用。");
+    const locked = draft.submitting || draft.mutationCommitted || draft.stale;
+    const actorPicker = draft.actorKind === "selected" || draft.actorKind === "group"
+      ? '<button type="button" class="picker-trigger compact" data-action="' + (draft.actorKind === "group" ? "open-group-picker" : "open-actor-picker") +
+        '" data-editor-picker="rule-trigger" data-rule-trigger-picker data-picker-key="rule-trigger-' + draft.actorKind + '" data-picker-mode="multiple" data-picker-selected="' +
+        ui.escapeHtml(JSON.stringify(draft.actorKind === "group" ? draft.groupIds : draft.actorIds)) + '"><span>' + c.icon(draft.actorKind === "group" ? "groups" : "person_search") +
+        '</span><span><strong>' + (draft.actorKind === "group" ? "搜索触发群组" : "搜索触发角色") + '</strong><small>' +
+        ui.escapeHtml(readableSelection(draft.actorKind === "group" ? draft.groupItems : draft.actorItems,
+          draft.actorKind === "group" ? draft.groupIds : draft.actorIds, draft.actorKind === "group" ? "个群组" : "个角色")) + '</small></span>' + c.icon("chevron_right") + '</button>' : "";
+    const conditionSummary = draft.condition ? draft.condition.name : draft.conditionId ? "条件引用已失效" : "尚未选择条件";
+    const conditionRepair = draft.conditionMissing ? ' data-rule-condition-repair' : "";
+    const error = draft.error ? '<div class="inline-error editor-error-panel" data-rule-editor-error role="alert">' + ui.escapeHtml(draft.error) +
+      (draft.mutationCommitted ? '<button type="button" class="button secondary" data-action="reload-management-list" data-management-key="rules">只重新载入列表</button>' : "") + '</div>' : "";
+    return '<form class="editor-page rule-editor" data-form="rule-editor"><section class="editor-section">' + c.sectionHeading("基础信息", "规则名称、说明与启用状态") +
+      '<div class="form-card editor-form-grid"><label>规则名称<input name="ruleName" maxlength="256" value="' + ui.escapeHtml(draft.name) + '" autocomplete="off"></label><label>描述<textarea name="ruleDescription" maxlength="4096" rows="2">' +
+      ui.escapeHtml(draft.description) + '</textarea></label><label class="switch-line"><input name="ruleEnabled" type="checkbox"' + (draft.enabled ? " checked" : "") + '><span>启用此规则</span></label></div></section>' +
+      '<section class="editor-section">' + c.sectionHeading("触发角色绑定", "先确定哪些角色可进入条件判断；不会改变结果目标") +
+      '<div class="form-card editor-form-grid"><label>触发范围<select name="ruleActorKind">' + selectOptions([
+        ["any", "任意角色"], ["current_actor", "当前消息角色"], ["selected", "指定角色"], ["group", "指定群组内角色"],
+      ], draft.actorKind) + '</select></label><p class="support-copy actor-selector-help">' + ui.escapeHtml(ruleActorHelp(draft.actorKind)) + '</p>' + actorPicker + '</div></section>' +
+      '<section class="editor-section">' + c.sectionHeading("条件", "从完整条件库搜索复用；AI 触发由 AI 语义条件配置") +
+      '<div class="condition-reference-card"' + conditionRepair + '><button type="button" class="picker-trigger" data-action="open-condition-picker" data-editor-picker="rule-condition" data-rule-condition-picker data-picker-key="rule-condition" data-picker-selected="' +
+      ui.escapeHtml(JSON.stringify([draft.conditionId].filter(Boolean))) + '"><span>' + c.icon(draft.conditionMissing ? "sync_problem" : "schema") + '</span><span data-rule-condition-summary><strong>' +
+      ui.escapeHtml(conditionSummary) + '</strong><small>' + (draft.conditionMissing ? "重新选择可立即修复此引用" : "搜索条件名称后选择") + '</small></span>' + c.icon("chevron_right") + '</button>' +
+      (draft.condition && !draft.conditionMissing ? '<button type="button" class="text-action condition-edit-link" data-action="edit-rule-condition">查看 / 编辑所选条件</button>' : "") + '</div></section>' +
+      '<section class="editor-section result-section">' + c.sectionHeading("触发后改变的字段内容", "结果只描述触发后的字段变化与效果组激活") +
+      '<div class="rule-action-list">' + (draft.actions.length ? draft.actions.map(renderRuleAction).join("") : '<div class="compact-empty"><strong>还没有触发结果</strong><p>添加字段变化，或单独激活一个临时效果组。</p></div>') + '</div>' +
+      '<div class="editor-add-grid"><button type="button" class="button secondary" data-action="add-rule-change">' + c.icon("add") + '添加字段变化</button><button type="button" class="button secondary" data-action="add-rule-effect-activation">' + c.icon("bolt") + '激活效果组</button></div></section>' +
+      '<section class="editor-section compact-settings">' + c.sectionHeading("触发限制", "控制重复触发与执行先后") + '<div class="form-card two-field-grid"><label>冷却（小时）<input name="ruleCooldownHours" type="number" min="0" step="0.5" value="' +
+      ui.escapeHtml(draft.cooldownHours) + '"></label><label>执行顺序<input name="ruleExecutionOrder" type="number" step="1" value="' + ui.escapeHtml(draft.executionOrder) + '"></label></div></section>' +
+      error + '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary"' + (locked ? " disabled" : "") + '>' +
+      (draft.submitting ? "正在保存" : draft.mutationCommitted ? "已经提交" : draft.stale ? "请重新打开" : "保存规则") + '</button></div></form>';
+  }
+
+  function renderRuleAction(action, index) {
+    const controls = '<div class="ordered-card-actions"><span>结果 ' + (index + 1) + '</span><button type="button" class="icon-button" data-action="move-rule-action-up" data-action-index="' + index + '" aria-label="上移结果"' + (index === 0 ? " disabled" : "") + '>' + c.icon("arrow_upward") + '</button><button type="button" class="icon-button" data-action="move-rule-action-down" data-action-index="' + index + '" aria-label="下移结果"' + (index === ui.state.ruleEditorDraft.actions.length - 1 ? " disabled" : "") + '>' + c.icon("arrow_downward") + '</button><button type="button" class="icon-button danger-text" data-action="remove-rule-action" data-action-index="' + index + '" aria-label="删除结果">' + c.icon("delete") + '</button></div>';
+    if (action.kind === "activate_effect_group") {
+      return '<article class="result-card rule-activation-card" data-rule-activate-card data-action-index="' + index + '" data-action-client-id="' + ui.escapeHtml(action.clientId) + '">' + controls +
+        '<div><strong>激活临时效果组</strong><p class="support-copy">不直接写变化值；由效果组在后续匹配的字段变化中生效。</p></div>' + pickerButton({ action: "open-effect-picker", editorPicker: "rule-action-activation", key: "rule-action-activation-" + action.clientId, selected: [action.effectGroupId].filter(Boolean),
+          label: action.effect ? action.effect.name : action.effectGroupId ? "效果引用待修复" : "选择效果组", detail: action.effect ? "单独激活此效果组" : "搜索效果组名称", icon: "bolt", extra: 'data-rule-activation-effect data-action-index="' + index + '"' }) + '</article>';
+    }
+    const fieldName = action.field ? action.field.name : action.fieldId ? "字段引用待修复" : "选择状态字段";
+    const actorPicker = action.targetKind === "selected" ? pickerButton({ action: "open-actor-picker", editorPicker: "rule-action-actors", key: "rule-action-actors-" + action.clientId, selected: action.actorIds,
+      mode: "multiple", label: "指定结果角色", detail: readableSelection(action.actorItems, action.actorIds, "个角色"), icon: "person_search", extra: 'data-rule-change-actors data-action-index="' + index + '"' }) : "";
+    return '<article class="result-card rule-change-card" data-rule-change-card data-action-index="' + index + '" data-action-client-id="' + ui.escapeHtml(action.clientId) + '">' + controls +
+      pickerButton({ action: "open-field-picker", editorPicker: "rule-action-field", key: "rule-action-field-" + action.clientId, selected: [action.fieldId].filter(Boolean), label: fieldName,
+        detail: action.field ? scopeLabel(action.field.scope) : "搜索字段名称后选择", icon: "search", extra: 'data-rule-change-field data-action-index="' + index + '"' }) +
+      '<div class="rule-result-grid"><label>结果目标<select data-rule-target-kind data-action-index="' + index + '">' + selectOptions([["trigger_actor", "仅触发角色"], ["all_bound", "字段全部绑定角色"], ["selected", "指定角色"]], action.targetKind) +
+      '</select></label><label>变化值<input type="number" step="any" data-rule-delta data-action-index="' + index + '" value="' + ui.escapeHtml(action.delta) + '"></label></div>' + actorPicker +
+      '<div class="effect-import"><strong>应用临时效果</strong><p>可搜索多选；只将选中的效果组导入本条字段结果。</p>' +
+      pickerButton({ action: "open-effect-picker", editorPicker: "rule-action-effects", key: "rule-action-effects-" + action.clientId, selected: action.effectGroupIds, mode: "multiple",
+        label: action.effectGroupIds.length ? "已选择 " + action.effectGroupIds.length + " 个效果组" : "选择效果组（可选）", detail: readableSelection(action.effectItems, action.effectGroupIds, "个效果组"), icon: "bolt", extra: 'data-rule-change-effects data-action-index="' + index + '"' }) + '</div></article>';
   }
 
   function conditionEditorPage() {
@@ -355,25 +437,103 @@
   }
 
   function effectEditorPage() {
-    const entity = ui.state.selectedEntityId ? ui.state.entities.get("effectGroup:" + ui.state.selectedEntityId) : null;
-    const reasonMode = ui.state.effectReasonMode === "custom" ? "custom" : "template";
-    return '<form class="editor-page effect-editor"><section class="editor-section">' + c.sectionHeading("基础信息", "临时效果以组为单位复用") +
-      '<div class="form-card"><label>效果组名称<input value="' + ui.escapeHtml(entity ? entity.name : "新临时效果") + '"></label><label>说明<textarea rows="2">' +
-      ui.escapeHtml(entity ? entity.description : "") + "</textarea></label></div></section>" +
-      '<section class="editor-section">' + c.sectionHeading("目标字段", "先按字段设置，再决定字段内哪些角色触发") +
-      '<article class="field-effect-card"><button type="button" class="field-picker" data-action="open-field-picker" data-picker-key="effect-target-field">' + c.icon("search") + "选择目标字段</button>" +
-      '<div class="segmented-control static" style="--segments:3"><button type="button" class="active">所有绑定角色</button><button type="button">触发角色</button><button type="button">指定角色</button></div>' +
-      '<p class="support-copy">默认一个字段的所有绑定角色都生效；选择“触发角色”时，只影响本次事件中的角色。</p>' +
-      '<button type="button" class="picker-trigger compact" data-action="open-actor-picker" data-picker-key="effect-target-actors" data-picker-mode="multiple">' + c.icon("person_search") + '<span>搜索指定角色</span>' + c.icon("chevron_right") + '</button>' +
-      '<div class="operation-row"><label>计算方式<select><option>立即增减</option><option>固定修正</option><option>正向倍率</option><option>负向倍率</option><option>通用倍率</option></select></label><label>效果数值<input type="number" value="1"></label></div>' +
-      '<button type="button" class="inline-add">' + c.icon("add") + '添加计算方式</button></article><button type="button" class="button secondary full">' + c.icon("add") + "添加目标字段</button></section>" +
-      '<section class="editor-section">' + c.sectionHeading("效果原因", "原因会写入变化记录，便于回看") +
+    const draft = ui.state.effectEditorDraft;
+    if (!draft) return c.emptyState("progress_activity", "正在准备临时效果", "正在读取目标字段与计算配置。");
+    const locked = draft.submitting || draft.mutationCommitted || draft.stale;
+    const reasonMode = draft.reason.mode;
+    const legacyWarning = draft.reason.text.length > 512 ? '<p class="legacy-reason-warning" data-effect-reason-legacy-warning role="status">此旧版原因超过新版 512 字符上限；内容已完整读取，请精简后保存。</p>' : "";
+    const reasonSettings = reasonMode === "custom"
+      ? '<div class="form-card reason-settings"><label>自定义原因内容<textarea name="effectReasonText" maxlength="512" rows="3" placeholder="直接说明这次字段变化的原因">' + ui.escapeHtml(draft.reason.text) + '</textarea></label>' + legacyWarning +
+        '<p class="reason-variables" data-effect-reason-variables><strong>可用变量</strong><span>{效果组名称}</span><span>{字段名称}</span><span>{触发角色}</span></p><label>原因预览<output data-effect-reason-preview>' + ui.escapeHtml(ui.effectReasonPreview(draft)) + '</output></label></div>'
+      : '<div class="form-card reason-settings"><label>原因模板<select name="effectReasonTemplate">' + selectOptions([["general", "通用"], ["rule", "规则触发"], ["natural", "自然变化"], ["per_turn", "每轮变化"], ["ai", "AI 更新"], ["manual", "手动应用"]], draft.reason.template) +
+        '</select></label><p class="reason-variables" data-effect-reason-variables><strong>模板变量</strong><span>{效果组名称}</span><span>{字段名称}</span><span>{触发角色}</span></p><label>原因预览<output data-effect-reason-preview>' + ui.escapeHtml(ui.effectReasonPreview(draft)) + '</output></label></div>';
+    const durationExtra = draft.durationMode === "expires" ? '<label>截止时间<input name="effectExpiresAt" type="datetime-local" value="' + ui.escapeHtml(draft.expiresAt) + '"></label>' :
+      draft.durationMode === "turns" ? '<label>剩余轮次<input name="effectRemainingTurns" type="number" min="0" step="1" value="' + ui.escapeHtml(draft.remainingTurns) + '"></label>' : "";
+    const error = draft.error ? '<div class="inline-error editor-error-panel" data-effect-editor-error role="alert">' + ui.escapeHtml(draft.error) +
+      (draft.mutationCommitted ? '<button type="button" class="button secondary" data-action="reload-management-list" data-management-key="effectGroups">只重新载入列表</button>' : "") + '</div>' : "";
+    return '<form class="editor-page effect-editor" data-form="effect-editor"><section class="editor-section">' + c.sectionHeading("基础信息", "临时效果以可命名的组复用") +
+      '<div class="form-card editor-form-grid"><label>效果组名称<input name="effectName" maxlength="256" value="' + ui.escapeHtml(draft.name) + '" autocomplete="off"></label><label>说明<textarea name="effectDescription" maxlength="4096" rows="2">' + ui.escapeHtml(draft.description) +
+      '</textarea></label><label class="switch-line"><input name="effectEnabled" type="checkbox"' + (draft.enabled ? " checked" : "") + '><span>启用此效果组</span></label></div></section>' +
+      '<section class="editor-section">' + c.sectionHeading("目标字段", "先按字段分组，再设置角色与多种计算方式；同一字段只出现一次") +
+      '<div class="field-effect-list">' + (draft.fieldEffects.length ? draft.fieldEffects.map(renderFieldEffect).join("") : '<div class="compact-empty"><strong>还没有目标字段</strong><p>添加字段后，在字段卡内配置角色与计算方式。</p></div>') + '</div>' +
+      '<button type="button" class="button secondary full editor-add" data-action="add-field-effect">' + c.icon("add") + '添加目标字段</button></section>' +
+      '<section class="editor-section">' + c.sectionHeading("效果原因", "直接设置；激活时会把当时的原因解析为快照写入变化记录") +
       c.segmented([{ id: "template", label: "默认模板" }, { id: "custom", label: "自定义原因" }], reasonMode, "data-reason-mode", "原因模式") +
-      '<div id="segment-panel-reason-mode" role="tabpanel">' + (reasonMode === "custom"
-        ? '<div class="form-card reason-settings"><label>自定义原因内容<textarea rows="3" placeholder="说明这次字段变化的原因"></textarea></label><label>原因预览<output>自定义原因将写入变化记录</output></label></div>'
-        : '<div class="form-card reason-settings"><label>原因模板<select><option>规则触发</option><option>自然变化修正</option><option>每轮变化修正</option><option>AI 更新修正</option><option>手动应用</option></select></label><label>原因预览<output>由规则触发「新临时效果」</output></label></div>') + '</div></section>' +
-      '<section class="editor-section">' + c.sectionHeading("持续时间", "按小时、轮次或手动停用") + '<div class="form-card"><label>持续方式<select><option>手动停用</option><option>指定小时</option><option>指定轮次</option></select></label></div></section>' +
-      '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary" disabled>保存效果</button></div></form>';
+      '<div id="segment-panel-reason-mode" role="tabpanel" aria-label="原因预览">' + reasonSettings + '</div></section>' +
+      '<section class="editor-section">' + c.sectionHeading("持续时间", "永久有效、到截止时间、按剩余轮次，或保留到手动结束") +
+      '<div class="form-card duration-settings"><label>持续方式<select name="effectDurationMode">' + selectOptions([["permanent", "永久有效（无默认结束条件）"], ["expires", "到截止时间"], ["turns", "剩余轮次"], ["manual", "手动结束"]], draft.durationMode) +
+      '</select></label>' + durationExtra + '<p class="support-copy">“手动结束”保存为空截止时间与空轮次；运行时由用户明确停用。永久模式不写默认时长。</p></div></section>' +
+      error + '<div class="editor-submit"><button type="button" class="button secondary" data-action="go-back">取消</button><button type="submit" class="button primary"' + (locked ? " disabled" : "") + '>' +
+      (draft.submitting ? "正在保存" : draft.mutationCommitted ? "已经提交" : draft.stale ? "请重新打开" : "保存效果") + '</button></div></form>';
+  }
+
+  function renderFieldEffect(fieldEffect, fieldIndex) {
+    const field = fieldEffect.field;
+    const fieldName = field ? field.name : fieldEffect.fieldId ? "字段引用待修复" : "选择目标字段";
+    const character = !field || field.scope === "character";
+    const actorKind = character ? fieldEffect.actorKind : "all_bound";
+    const actorScopeCopy = !field ? "选择字段后会按实际作用域调整角色目标" : field.scope === "character"
+      ? "角色独立字段：默认全部绑定角色；可改为仅触发角色或指定角色。" : field.scope === "group"
+        ? "群组字段按绑定群组共享，不支持角色目标。" : field.scope === "global"
+          ? "全局字段为所有上下文共享值，不支持角色目标。" : "会话字段按绑定会话共享，不支持角色目标。";
+    const actors = character && actorKind === "selected" ? pickerButton({ action: "open-actor-picker", editorPicker: "effect-actors", key: "effect-actors-" + fieldEffect.clientId,
+      selected: fieldEffect.actorIds, mode: "multiple", label: "指定生效角色", detail: readableSelection(fieldEffect.actorItems, fieldEffect.actorIds, "个角色"), icon: "person_search",
+      extra: 'data-effect-actor-picker data-field-effect-index="' + fieldIndex + '"' }) : "";
+    const controls = '<div class="ordered-card-actions"><span>字段 ' + (fieldIndex + 1) + '</span><button type="button" class="icon-button" data-action="move-field-effect-up" data-field-effect-index="' + fieldIndex + '" aria-label="上移字段"' + (fieldIndex === 0 ? " disabled" : "") + '>' + c.icon("arrow_upward") + '</button><button type="button" class="icon-button" data-action="move-field-effect-down" data-field-effect-index="' + fieldIndex + '" aria-label="下移字段"' + (fieldIndex === ui.state.effectEditorDraft.fieldEffects.length - 1 ? " disabled" : "") + '>' + c.icon("arrow_downward") + '</button><button type="button" class="icon-button danger-text" data-action="remove-field-effect" data-field-effect-index="' + fieldIndex + '" aria-label="删除字段">' + c.icon("delete") + '</button></div>';
+    return '<article class="field-effect-card" data-field-effect-card data-field-effect-index="' + fieldIndex + '" data-field-effect-client-id="' + ui.escapeHtml(fieldEffect.clientId) + '">' + controls +
+      pickerButton({ action: "open-field-picker", editorPicker: "effect-field", key: "effect-field-" + fieldEffect.clientId, selected: [fieldEffect.fieldId].filter(Boolean), label: fieldName,
+        detail: field ? scopeLabel(field.scope) : "搜索字段名称后选择", icon: "search", extra: 'data-effect-field-picker data-field-effect-index="' + fieldIndex + '"' }) +
+      '<div class="effect-actor-scope" data-effect-actor-scope><label>字段内生效目标<select data-effect-actor-kind data-field-effect-index="' + fieldIndex + '"' + (!character ? " disabled" : "") + '>' +
+      selectOptions([["all_bound", "所有绑定角色"], ["trigger_actor", "仅触发角色"], ["selected", "指定角色"]], actorKind) + '</select></label><p class="support-copy">' + ui.escapeHtml(actorScopeCopy) + '</p>' + actors + '</div>' +
+      '<div class="effect-operation-list">' + fieldEffect.operations.map(function (operation, operationIndex) { return renderEffectOperation(operation, fieldIndex, operationIndex); }).join("") + '</div>' +
+      '<button type="button" class="inline-add" data-action="add-effect-operation" data-field-effect-index="' + fieldIndex + '">' + c.icon("add") + '添加计算方式</button></article>';
+  }
+
+  function renderEffectOperation(operation, fieldIndex, operationIndex) {
+    const immediate = operation.kind === "immediate_delta";
+    const sources = [
+      ["manual", "手动"], ["natural", "自然变化"], ["per_turn", "每轮变化"], ["rule", "规则"], ["ai", "AI 更新"],
+    ];
+    return '<article class="effect-operation-card" data-effect-operation-card data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '"><header><strong>计算方式 ' + (operationIndex + 1) + '</strong><button type="button" class="icon-button danger-text" data-action="remove-effect-operation" data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '" aria-label="删除计算方式"' + (ui.state.effectEditorDraft.fieldEffects[fieldIndex].operations.length <= 1 ? " disabled" : "") + '>' + c.icon("close") + '</button></header><div class="operation-row"><label>类型<select data-effect-operation-kind data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '">' +
+      selectOptions([["immediate_delta", "立即增减"], ["fixed_adjustment", "固定修正"], ["positive_multiplier", "正向倍率"], ["negative_multiplier", "负向倍率"], ["all_multiplier", "通用倍率"]], operation.kind) +
+      '</select></label><label>效果数值<input type="number" step="any" data-effect-operation-value data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '" value="' + ui.escapeHtml(operation.value) + '"></label></div>' +
+      '<p class="operation-explanation">' + ui.escapeHtml(operationHelp(operation.kind)) + '</p>' + (immediate ? "" : '<fieldset class="operation-sources"><legend>应用来源（可多选）</legend>' + sources.map(function (source) {
+        return '<label><input type="checkbox" data-effect-operation-source="' + source[0] + '" data-field-effect-index="' + fieldIndex + '" data-operation-index="' + operationIndex + '"' + (operation.sources.includes(source[0]) ? " checked" : "") + '><span>' + source[1] + '</span></label>';
+      }).join("") + '</fieldset>') + '</article>';
+  }
+
+  function pickerButton(options) {
+    return '<button type="button" class="picker-trigger compact" data-action="' + options.action + '" data-editor-picker="' + options.editorPicker + '" data-picker-key="' + ui.escapeHtml(options.key) + '" data-picker-mode="' + (options.mode || "single") + '" data-picker-selected="' +
+      ui.escapeHtml(JSON.stringify(options.selected || [])) + '" ' + (options.extra || "") + '><span>' + c.icon(options.icon || "search") + '</span><span><strong>' + ui.escapeHtml(options.label) + '</strong><small>' +
+      ui.escapeHtml(options.detail || "搜索名称后选择") + '</small></span>' + c.icon("chevron_right") + '</button>';
+  }
+
+  function selectOptions(options, selected) {
+    return options.map(function (option) { return '<option value="' + option[0] + '"' + (option[0] === selected ? " selected" : "") + '>' + option[1] + '</option>'; }).join("");
+  }
+
+  function readableSelection(items, ids, noun) {
+    const names = (items || []).map(function (item) { return item && item.name; }).filter(Boolean);
+    if (names.length) return names.slice(0, 3).join("、") + (ids.length > 3 ? "，另 " + (ids.length - 3) + " 项" : "");
+    return ids.length ? "已选择 " + ids.length + " " + noun + "（名称待刷新）" : "尚未选择，可搜索查找";
+  }
+
+  function ruleActorHelp(kind) {
+    return { any: "所有消息角色均可进入条件判断。", current_actor: "只让当前消息对应角色进入条件判断。", selected: "仅搜索选择的角色可触发。", group: "仅所选群组中的消息角色可触发。" }[kind] || "请选择触发范围。";
+  }
+
+  function scopeLabel(scope) {
+    return { character: "角色独立字段", group: "群组共享字段", global: "全局共享字段", chat: "会话专属字段" }[scope] || "字段作用域待确认";
+  }
+
+  function operationHelp(kind) {
+    return {
+      immediate_delta: "激活时立即增减一次；不需要选择来源。",
+      fixed_adjustment: "匹配来源每次变化时，在原变化量上追加固定数值。",
+      positive_multiplier: "只缩放匹配来源中的正向增长。",
+      negative_multiplier: "只缩放匹配来源中的负向下降。",
+      all_multiplier: "缩放匹配来源中的所有正负变化。",
+    }[kind] || "请选择计算方式。";
   }
 
   function expressionLabel(kind) {

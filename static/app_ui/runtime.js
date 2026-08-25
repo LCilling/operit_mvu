@@ -78,8 +78,12 @@
     fieldTemplateFlow: null,
     fieldTemplateImportOpener: null,
     conditionEditorDraft: null,
+    ruleEditorDraft: null,
+    effectEditorDraft: null,
     conditionDeleteDialog: null,
     conditionListRecovery: null,
+    managementDeleteDialog: null,
+    managementRecoveries: { rules: null, effectGroups: null },
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -105,8 +109,11 @@
       fields: null,
       conditions: null,
       rules: null,
+      effectGroups: null,
       fieldSequence: 0,
       conditionSequence: 0,
+      ruleSequence: 0,
+      effectSequence: 0,
       aiSequence: 0,
       stateValues: {},
     },
@@ -144,6 +151,8 @@
     getEntity,
     ensureFieldEditorDraft,
     resetFieldEditorDraft,
+    resetRuleEditorDraft,
+    resetEffectEditorDraft,
     validateCompactSnapshot,
     validateQueryResponse,
     escapeHtml,
@@ -859,6 +868,20 @@
     delete state.editorSelections["field-scope-group"];
   }
 
+  function resetRuleEditorDraft() {
+    state.ruleEditorDraft = null;
+    Object.keys(state.editorSelections).forEach(function (key) {
+      if (key.startsWith("rule-")) delete state.editorSelections[key];
+    });
+  }
+
+  function resetEffectEditorDraft() {
+    state.effectEditorDraft = null;
+    Object.keys(state.editorSelections).forEach(function (key) {
+      if (key.startsWith("effect-")) delete state.editorSelections[key];
+    });
+  }
+
   function ensureFieldEditorDraft(field) {
     const identity = field && field.id ? field.id : "__new__";
     if (state.fieldEditorDraft && state.fieldEditorDraft.identity === identity) return state.fieldEditorDraft;
@@ -1389,6 +1412,14 @@
         const condition = state.selectedEntityId ? state.entities.get("condition:" + state.selectedEntityId) : null;
         await window.MvuUi.prepareConditionEditor(condition || null);
       }
+      if (routeId === "rule-editor" && typeof window.MvuUi.prepareRuleEditor === "function") {
+        const rule = state.selectedEntityId ? state.entities.get("rule:" + state.selectedEntityId) : null;
+        await window.MvuUi.prepareRuleEditor(rule || null);
+      }
+      if (routeId === "effect-editor" && typeof window.MvuUi.prepareEffectEditor === "function") {
+        const effect = state.selectedEntityId ? state.entities.get("effectGroup:" + state.selectedEntityId) : null;
+        await window.MvuUi.prepareEffectEditor(effect || null);
+      }
     } catch (error) {
       state.routeError = {
         title: "页面数据有误",
@@ -1574,6 +1605,21 @@
     if (["createCondition", "updateCondition", "copyCondition", "toggleCondition", "deleteCondition"].includes(method)) {
       return Promise.resolve(demoMutateCondition(method, params, demo));
     }
+    if (["createRule", "updateRule", "copyRule", "toggleRule", "deleteRule"].includes(method)) {
+      return Promise.resolve(demoMutateRule(method, params, demo));
+    }
+    if (["createEffectGroup", "updateEffectGroup", "copyEffectGroup", "toggleEffectGroup", "deleteEffectGroup"].includes(method)) {
+      return Promise.resolve(demoMutateEffectGroup(method, params, demo));
+    }
+    if (method === "getRuleReferences") return Promise.resolve([]);
+    if (method === "getEffectGroupReferences") {
+      const references = demo.ruleEntities.filter(function (rule) {
+        return rule.actions.some(function (action) {
+          return action.kind === "activate_effect_group" ? action.effectGroupId === params.id : action.effectGroupIds.includes(params.id);
+        });
+      }).map(function (rule) { return { entityType: "rule", id: rule.id, name: rule.name, relation: "referenced_by" }; });
+      return Promise.resolve(demoQuery(references, { page: params.page || 1 }, 10, "id", false));
+    }
     if (method === "exportFieldTemplate") return Promise.resolve(demoExportFieldTemplate(demo, params));
     if (method === "previewFieldTemplateImport") return Promise.resolve(demoPreviewFieldTemplate(demo, params.json));
     if (method === "importFieldTemplate") return Promise.resolve(demoImportFieldTemplate(demo, params));
@@ -1633,6 +1679,146 @@
     state.demoStore.revision += 1;
     if (method === "deleteCondition") return { revision: state.demoStore.revision };
     return { revision: state.demoStore.revision, entity: JSON.parse(JSON.stringify(entity)) };
+  }
+
+  function requireDemoRevision(params) {
+    if (!Number.isSafeInteger(params.expectedRevision) || params.expectedRevision !== state.demoStore.revision) {
+      throw new Error("MVU_STALE_REVISION:" + params.expectedRevision + ":" + state.demoStore.revision);
+    }
+  }
+
+  function nextDemoEntityId(prefix, sequenceKey, occupied) {
+    let id;
+    do {
+      state.demoStore[sequenceKey] += 1;
+      id = prefix + state.demoStore[sequenceKey];
+    } while (occupied.has(id));
+    return id;
+  }
+
+  function demoMutateRule(method, params, demo) {
+    requireDemoRevision(params);
+    const draft = JSON.parse(JSON.stringify(state.demoStore.rules));
+    const now = new Date().toISOString();
+    let entity = null;
+    if (method === "createRule") {
+      const id = nextDemoEntityId("rule_demo_created_", "ruleSequence", new Set(draft.map(function (rule) { return rule.id; })));
+      entity = { ...JSON.parse(JSON.stringify(params.rule)), id, createdAt: now, updatedAt: now };
+      validateRule(entity);
+      demoValidateRuleReferences(entity, demo);
+      draft.push(entity);
+    } else {
+      const index = draft.findIndex(function (rule) { return rule.id === params.id; });
+      if (index < 0) throw new Error("MVU_RULE_NOT_FOUND:" + params.id);
+      if (method === "updateRule") {
+        entity = { ...draft[index], ...JSON.parse(JSON.stringify(params.patch || {})), id: params.id, updatedAt: now };
+        validateRule(entity);
+        demoValidateRuleReferences(entity, demo);
+        draft[index] = entity;
+      } else if (method === "toggleRule") {
+        entity = { ...draft[index], enabled: params.enabled, updatedAt: now };
+        validateRule(entity);
+        draft[index] = entity;
+      } else if (method === "copyRule") {
+        const id = nextDemoEntityId("rule_demo_copy_", "ruleSequence", new Set(draft.map(function (rule) { return rule.id; })));
+        entity = { ...JSON.parse(JSON.stringify(draft[index])), id, name: draft[index].name + " 副本", createdAt: now, updatedAt: now };
+        validateRule(entity);
+        draft.push(entity);
+      } else if (method === "deleteRule") {
+        draft.splice(index, 1);
+      }
+    }
+    state.demoStore.rules = draft;
+    state.demoStore.revision += 1;
+    if (method === "deleteRule") return { revision: state.demoStore.revision };
+    return { revision: state.demoStore.revision, entity: JSON.parse(JSON.stringify(entity)) };
+  }
+
+  function demoValidateRuleReferences(rule, demo) {
+    const conditions = new Set(demo.conditionEntities.concat(demo.pickerConditions).map(function (item) { return item.id; }));
+    const fields = new Set(demo.fields.concat(demo.pickerFields).map(function (item) { return item.id; }));
+    const actors = new Set(demo.actors.concat(demo.pickerActors).map(function (item) { return item.characterId; }));
+    const groups = new Set(demo.groups.concat(demo.pickerGroups).map(function (item) { return item.characterGroupId; }));
+    const effects = new Set(demo.effectEntities.concat(demo.pickerEffects).map(function (item) { return item.id; }));
+    if (!conditions.has(rule.conditionId)) throw new Error("MVU_RULE_CONDITION_NOT_FOUND:" + rule.conditionId);
+    if (rule.triggerActorSelector.kind === "selected" && rule.triggerActorSelector.actorIds.some(function (id) { return !actors.has(id); })) {
+      throw new Error("MVU_RULE_ACTOR_NOT_FOUND");
+    }
+    if (rule.triggerActorSelector.kind === "group" && rule.triggerActorSelector.groupIds.some(function (id) { return !groups.has(id); })) {
+      throw new Error("MVU_RULE_GROUP_NOT_FOUND");
+    }
+    rule.actions.forEach(function (action) {
+      if (action.kind === "activate_effect_group") {
+        if (!effects.has(action.effectGroupId)) throw new Error("MVU_RULE_EFFECT_GROUP_NOT_FOUND:" + action.effectGroupId);
+        return;
+      }
+      if (!fields.has(action.fieldId)) throw new Error("MVU_RULE_FIELD_NOT_FOUND:" + action.fieldId);
+      if (action.target.kind === "selected" && action.target.actorIds.some(function (id) { return !actors.has(id); })) {
+        throw new Error("MVU_RULE_TARGET_ACTOR_NOT_FOUND");
+      }
+      if (action.effectGroupIds.some(function (id) { return !effects.has(id); })) throw new Error("MVU_RULE_EFFECT_GROUP_NOT_FOUND");
+    });
+  }
+
+  function demoMutateEffectGroup(method, params, demo) {
+    requireDemoRevision(params);
+    const draft = JSON.parse(JSON.stringify(state.demoStore.effectGroups));
+    const now = new Date().toISOString();
+    let entity = null;
+    if (method === "createEffectGroup") {
+      const id = nextDemoEntityId("effect_demo_created_", "effectSequence", new Set(draft.map(function (effect) { return effect.id; })));
+      entity = { ...JSON.parse(JSON.stringify(params.effectGroup)), id, createdAt: now, updatedAt: now };
+      validateEffectGroup(entity);
+      demoValidateEffectReferences(entity, demo);
+      draft.push(entity);
+    } else {
+      const index = draft.findIndex(function (effect) { return effect.id === params.id; });
+      if (index < 0) throw new Error("MVU_EFFECT_GROUP_NOT_FOUND:" + params.id);
+      if (method === "updateEffectGroup") {
+        entity = { ...draft[index], ...JSON.parse(JSON.stringify(params.patch || {})), id: params.id, updatedAt: now };
+        validateEffectGroup(entity);
+        demoValidateEffectReferences(entity, demo);
+        draft[index] = entity;
+      } else if (method === "toggleEffectGroup") {
+        entity = { ...draft[index], enabled: params.enabled, updatedAt: now };
+        validateEffectGroup(entity);
+        draft[index] = entity;
+      } else if (method === "copyEffectGroup") {
+        const id = nextDemoEntityId("effect_demo_copy_", "effectSequence", new Set(draft.map(function (effect) { return effect.id; })));
+        entity = { ...JSON.parse(JSON.stringify(draft[index])), id, name: draft[index].name + " 副本", createdAt: now, updatedAt: now };
+        entity.fieldEffects.forEach(function (fieldEffect, indexValue) { fieldEffect.id = id + "_field_" + (indexValue + 1); });
+        validateEffectGroup(entity);
+        draft.push(entity);
+      } else if (method === "deleteEffectGroup") {
+        const referenced = state.demoStore.rules.some(function (rule) {
+          return rule.actions.some(function (action) {
+            return action.kind === "activate_effect_group" ? action.effectGroupId === params.id : action.effectGroupIds.includes(params.id);
+          });
+        });
+        if (referenced) throw new Error("MVU_EFFECT_GROUP_REFERENCED");
+        draft.splice(index, 1);
+      }
+    }
+    state.demoStore.effectGroups = draft;
+    state.demoStore.revision += 1;
+    if (method === "deleteEffectGroup") return { revision: state.demoStore.revision };
+    return { revision: state.demoStore.revision, entity: JSON.parse(JSON.stringify(entity)) };
+  }
+
+  function demoValidateEffectReferences(effect, demo) {
+    const fields = new Map(demo.fields.concat(demo.pickerFields).map(function (item) { return [item.id, item]; }));
+    const actors = new Set(demo.actors.concat(demo.pickerActors).map(function (item) { return item.characterId; }));
+    const seen = new Set();
+    effect.fieldEffects.forEach(function (fieldEffect) {
+      const field = fields.get(fieldEffect.fieldId);
+      if (!field) throw new Error("MVU_EFFECT_FIELD_NOT_FOUND:" + fieldEffect.fieldId);
+      if (seen.has(fieldEffect.fieldId)) throw new Error("MVU_EFFECT_FIELD_DUPLICATE:" + fieldEffect.fieldId);
+      seen.add(fieldEffect.fieldId);
+      if (field.scope !== "character" && fieldEffect.actorSelector.kind !== "all_bound") throw new Error("MVU_EFFECT_ACTOR_SCOPE_INVALID");
+      if (fieldEffect.actorSelector.kind === "selected" && fieldEffect.actorSelector.actorIds.some(function (id) { return !actors.has(id); })) {
+        throw new Error("MVU_EFFECT_ACTOR_NOT_FOUND");
+      }
+    });
   }
 
   function demoCopyConditionExpression(expression) {
@@ -2232,16 +2418,27 @@
               : candidate.scope === "chat" ? "chat:chat-a" : "global",
       };
     }
+    const sharedGroupField = {
+      ...field, id: "shared-group-value", name: "共享群组值", description: "按群组共享的演示字段",
+      scope: "group", bindingIds: ["group-a", "group-b"], order: 90,
+      stages: stages.map(function (item) { return { ...item, id: item.id + "-shared-group" }; }),
+    };
+    const globalField = {
+      ...field, id: "global-shared-value", name: "全局共享值", description: "所有上下文读取同一值",
+      scope: "global", bindingIds: [], order: 91,
+      stages: stages.map(function (item) { return { ...item, id: item.id + "-global" }; }),
+    };
     const initialFields = [field].concat(demoFields);
     if (!state.demoStore.fields) state.demoStore.fields = JSON.parse(JSON.stringify(initialFields));
     const allFields = state.demoStore.fields.map(projectFieldForDemo);
     if (!state.demoStore.rules) state.demoStore.rules = JSON.parse(JSON.stringify(ruleEntities.concat(demoRuleEntities)));
     if (!state.demoStore.conditions) state.demoStore.conditions = JSON.parse(JSON.stringify(conditionEntities.concat(demoConditionEntities)));
+    if (!state.demoStore.effectGroups) state.demoStore.effectGroups = JSON.parse(JSON.stringify(effectEntities.concat(demoEffectEntities)));
     const allRuleEntities = state.demoStore.rules.map(function (rule) { return JSON.parse(JSON.stringify(rule)); });
     const allConditionEntities = state.demoStore.conditions.map(function (condition) { return JSON.parse(JSON.stringify(condition)); });
-    const allEffectEntities = effectEntities.concat(demoEffectEntities);
+    const allEffectEntities = state.demoStore.effectGroups.map(function (effect) { return JSON.parse(JSON.stringify(effect)); });
     const allRecords = records.concat(demoRecords);
-    const pickerFields = Array.from({ length: 96 }, function (_value, index) {
+    const pickerFields = [sharedGroupField, globalField].concat(Array.from({ length: 96 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(3, "0");
       return {
         ...field,
@@ -2252,7 +2449,7 @@
         stages: stages.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }),
         order: index,
       };
-    }).map(projectFieldForDemo);
+    })).map(projectFieldForDemo);
     const pickerConditions = Array.from({ length: 96 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(3, "0");
       return { ...conditionEntities[0], id: "picker-condition-" + ordinal, name: "游标条件 " + ordinal };
