@@ -79,6 +79,11 @@ import {
   EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
   EFFECT_REASON_SOURCE_MAX_LENGTH,
 } from "../mvu/app/model-v3";
+import {
+  isBoundedConditionStringArray,
+  isGregorianCalendarDate,
+  isGregorianRepeatingDate,
+} from "../mvu/app/validation";
 import type {
   BackgroundModelProbeResult,
   SystemModelApi,
@@ -1212,20 +1217,23 @@ function parseConditionPredicate(value: unknown): ConditionPredicate {
       return { kind, senders: parseSenderArray(record.senders) };
     case "actor":
       assertKeys(record, ["kind", "actorIds"], [], "MVU_CONDITION_PREDICATE_INVALID");
-      return { kind, actorIds: parseBoundedStringArray(record.actorIds, "MVU_CONDITION_PREDICATE_INVALID") };
+      return { kind, actorIds: parseConditionStringArray(record.actorIds) };
     case "group":
       assertKeys(record, ["kind", "groupIds"], [], "MVU_CONDITION_PREDICATE_INVALID");
-      return { kind, groupIds: parseBoundedStringArray(record.groupIds, "MVU_CONDITION_PREDICATE_INVALID") };
-    case "concrete_date":
+      return { kind, groupIds: parseConditionStringArray(record.groupIds) };
+    case "concrete_date": {
       assertKeys(record, ["kind", "dates"], [], "MVU_CONDITION_PREDICATE_INVALID");
-      return { kind, dates: parseBoundedStringArray(record.dates, "MVU_CONDITION_PREDICATE_INVALID") };
-    case "repeating_date":
+      const dates = parseConditionStringArray(record.dates);
+      if (!dates.every(isGregorianCalendarDate)) fail("MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, dates };
+    }
+    case "repeating_date": {
       assertKeys(record, ["kind", "month", "day"], [], "MVU_CONDITION_PREDICATE_INVALID");
-      return {
-        kind,
-        month: requireNumber(record, "month", "MVU_CONDITION_PREDICATE_INVALID"),
-        day: requireNumber(record, "day", "MVU_CONDITION_PREDICATE_INVALID"),
-      };
+      const month = requireNumber(record, "month", "MVU_CONDITION_PREDICATE_INVALID");
+      const day = requireNumber(record, "day", "MVU_CONDITION_PREDICATE_INVALID");
+      if (!isGregorianRepeatingDate(month, day)) fail("MVU_CONDITION_PREDICATE_INVALID");
+      return { kind, month, day };
+    }
     case "ai_semantic":
       assertKeys(record, ["kind", "id", "triggerType", "requirement", "minimumConfidence"], [], "MVU_CONDITION_PREDICATE_INVALID");
       return {
@@ -1244,6 +1252,11 @@ function parseBoundedStringArray(value: unknown, code: string): string[] {
   const entries = requireStringArray(value, code);
   if (entries.length > 100 || entries.some((entry) => entry.length > 256)) fail(code);
   return entries;
+}
+
+function parseConditionStringArray(value: unknown): string[] {
+  if (!isBoundedConditionStringArray(value)) fail("MVU_CONDITION_PREDICATE_INVALID");
+  return value;
 }
 
 function parseSenderArray(value: unknown): Array<"user" | "character"> {

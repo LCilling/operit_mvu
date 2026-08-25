@@ -3,11 +3,12 @@
 Date: 2026-08-26
 Branch: `codex/mvu-v3-complete-redesign`
 Original commit: `a1bb95c feat: complete condition library editor`
-Follow-up commit message: `fix: harden condition editor UX`
+First follow-up: `95d5cf0 fix: harden condition editor UX`
+Second follow-up message: `fix: align condition production contract`
 
 ## Outcome
 
-Task 9C remains entirely under Rules → 条件设定. No root navigation item, settings window, rule/effect editor feature, model/parser, package/version, or artifact change was introduced.
+Task 9C remains entirely under Rules → 条件设定. No root navigation item, settings window, rule/effect editor feature, package/version, or artifact change was introduced. The second follow-up changes only the authorized production condition boundary in `validation.ts`/`ipc.ts`; it does not alter rule/effect editing or model-budget behavior.
 
 The condition library retains server-owned search and ten-row pagination with explicit `显示 x–y / 共 n`. Rows expose readable expression, enabled and reference status, whole-row view/edit, toggle, copy, and delete actions. Create/update/copy/toggle/delete use real condition IPC calls and exact revisions; Demo implements the same strict, atomic flow.
 
@@ -29,6 +30,13 @@ The recursive editor renders AND, OR, NOT, and all 14 production predicates as e
 8. A stale list mutation loads the latest authoritative revision and leaves a persistent recovery panel that prevents accidental repeat until the user explicitly rechecks the list.
 9. The focused suite now parameterizes all 14 predicate cards through DOM entry, mutation payload, commit, and authoritative reload. It also covers reference retry, modal keyboard behavior, picker hydration/limit, and 130% picker pressure.
 
+## Production-contract alignment
+
+1. One pure validation implementation now owns strict Gregorian dates and repeating month/day limits. IPC and `assertMvuDatasetV3` both reject `2026-02-31`, `1900-02-29`, and February 30/31; both accept `2000-02-29` and repeating February 29. Error codes remain `MVU_CONDITION_PREDICATE_INVALID` at IPC and the existing predicate-specific `MVU_V3_CONDITION_*_INVALID` codes at dataset validation.
+2. Actor IDs, group IDs, and concrete dates share the production limit of 100 items and 256 code units per non-empty item in IPC, dataset assertion, and signed full-v3 import. Exactly 100 is accepted and 101 is rejected. Duplicate entries remain accepted to preserve the pre-existing IPC contract, and dataset validation now matches it exactly.
+3. A condition editor reference result carries `checkedRevision`. Any later snapshot revision invalidates the old result immediately, shows `影响范围未知`, blocks save, and starts a race-safe automatic recheck. The stale-save test proves the full sequence: one reference at revision 7, external change to two references at revision 8, blocked save while unknown, authoritative two-reference result, then update with `expectedRevision: 8`.
+4. A stale zero-reference delete now closes the obsolete confirmation, reloads the authoritative snapshot/list, and leaves a persistent `重新载入 / 重新检查` recovery panel. Row mutations remain disabled, so the delete cannot be repeated accidentally.
+
 ## TDD evidence
 
 Review fixes were test-first and observed failing before implementation:
@@ -38,19 +46,22 @@ Review fixes were test-first and observed failing before implementation:
 - Stale recovery RED: 2/3 focused tests passed; the stale list case timed out waiting for a persistent recovery entry.
 - Repeating-date copy RED: 0/1 passed until the visible Gregorian/leap-day explanation was added beside the month/day controls.
 - Hydrated-picker cache RED: 0/1 passed when direct confirmation duplicated the display ID; the display-only label is now stripped before the authoritative cache update.
+- Production contract RED: 0/4 passed. IPC accepted impossible calendar dates, dataset validation accepted impossible dates and 101-item arrays, and a re-signed full-v3 import bypassed both boundaries.
+- Revision/delete recovery RED: 29/31 passed. Reference results lacked `checkedRevision`, and stale delete timed out without a persistent list recovery entry.
 
-Final verification:
+Final verification after the second follow-up:
 
-- `node --test tests/ui-task9-condition-dom.test.cjs`: 29/29 passed.
+- `node --test tests/ui-task9-condition-dom.test.cjs`: 31/31 passed, including live Chromium 320px/130% editor and opened-picker pressure checks.
+- `node --test tests/condition-contract-boundary.test.mjs`: 4/4 passed.
+- Condition/full-backup/query/migration focused Node regression: 82/82 passed.
 - `node --test tests/ui-task9-field-template-dom.test.cjs`: 20/20 passed.
-- `node --test tests/ui-shell.test.mjs`: 48/48 passed; `node tests/ui-task8-dom-behavior.cjs`: 4/4 passed.
-- `node scripts/audit-v3-ui.mjs`: PASS, seven modules and exactly four roots.
-- Syntax checks: `app.js`, `pages-rules.js`, `runtime.js`, and `audit-v3-ui.mjs` passed.
+- `node --test tests/field-template.test.mjs tests/ui-shell.test.mjs`: 77/77 passed; `node --test tests/ui-task8-dom-behavior.cjs`: 4/4 passed.
+- `pnpm run audit`: PASS, including v3 UI seven modules and exactly four roots.
 - `pnpm run typecheck`: PASS.
-- `pnpm check`: an earlier full run passed with 271/271 v3 tests and 4/4 DOM gates. A final rerun after the shared worktree's out-of-scope `tests/model-budget.test.mjs` changed passed 260 in-scope v3 tests but failed that single concurrent test because it expects a `state-prompt` export absent from the concurrent build. That file was neither modified nor staged by Task 9C.
-- Committed Node regression constructed with `git ls-files tests/*.test.mjs` and explicitly excluding the concurrent `tests/model-budget.test.mjs`: 260/260 passed across 13 files.
-- `pnpm build`: PASS; `dist/app.html` generated successfully.
-- `git diff --check`: PASS before staging and commit.
+- `pnpm check`: one full run passed with 282/282 v3 tests and 4/4 DOM gates. A final rerun after another concurrent update finished 281/282: its only failure was the forbidden/out-of-scope `tests/record-store.test.mjs:1078` with `MVU_NATURAL_CLOCK_REVERSED:field_affinity`. Task 9C files were absent from that failure stack and the external test/source files were neither modified nor staged here.
+- Tracked Node regression excluding only the three concurrently modified test files (`model-budget.test.mjs`, `query.test.mjs`, `record-store.test.mjs`) plus the new condition contract suite: 185/185 passed.
+- `pnpm run build`: PASS; `dist/app.html` generated successfully.
+- `git diff --check` for all eight allowed follow-up files: PASS. The global check reports only the concurrent `task-10b-model-budget-report.md:47` EOF blank line, which remains untouched and unstaged.
 
 ## 320px and 130% pressure evidence
 
@@ -72,6 +83,9 @@ The editor retained 14px/21px at normal scale and 18.2px/27.3px at 130%, with `R
 - `static/app_ui/runtime.js`
 - `static/app_ui/styles.css`
 - `scripts/audit-v3-ui.mjs`
+- `src/mvu/app/validation.ts`
+- `src/shared/ipc.ts`
+- `tests/condition-contract-boundary.test.mjs`
 - `tests/ui-task9-condition-dom.test.cjs`
 - `.superpowers/sdd/2026-08-25-operit-mvu-v3-complete-redesign/task-9c-condition-ui-report.md`
 
@@ -81,3 +95,4 @@ The editor retained 14px/21px at normal scale and 18.2px/27.3px at 130%, with `R
 
 - Chromium verifies the repository's real 320px/130% pressure fixture, but physical Android WebViews may still differ in vendor font metrics.
 - Reference search remains intentionally bounded to the currently loaded server page; navigation provides the next/previous authoritative pages without creating an unbounded directory in the DOM.
+- Condition actor/group/date arrays intentionally preserve the production IPC's duplicate-entry policy; this follow-up aligns every boundary but does not introduce a new uniqueness rule.

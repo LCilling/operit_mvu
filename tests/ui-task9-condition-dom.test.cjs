@@ -669,6 +669,95 @@ test("stale condition save reloads the latest revision while preserving the draf
   assert.equal(window.MvuUi.state.demoLastRequests.createCondition.expectedRevision, 8);
 });
 
+test("shared references are revision-bound and stale save waits for an automatic authoritative recheck", async (t) => {
+  const window = await createApp("condition-library");
+  t.after(() => window.close());
+  const { document } = window;
+  window.MvuUi.state.selectedEntityId = "condition-1";
+  window.MvuUi.resetConditionEditorDraft();
+  await window.MvuUi.navigate("condition-editor");
+  await waitFor(() => window.MvuUi.state.conditionEditorDraft?.references?.totalCount === 1,
+    "initial shared reference was not loaded");
+  assert.equal(window.MvuUi.state.conditionEditorDraft.references.checkedRevision, 7,
+    "reference result was not bound to the inspected snapshot revision");
+
+  input(window, '[name="conditionDescription"]', "保留到修订 8 的草稿");
+  const template = plain(window.MvuUi.state.demoStore.rules[0]);
+  window.MvuUi.state.demoStore.rules.push({
+    ...template,
+    id: "rule-external-reference-2",
+    name: "外部新增受影响规则",
+    conditionId: "condition-1",
+  });
+
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let releaseFreshReferences;
+  const freshReferenceGate = new Promise((resolve) => { releaseFreshReferences = resolve; });
+  const updateRequests = [];
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "updateCondition") updateRequests.push(plain(params));
+    if (method === "getConditionReferences" && window.MvuUi.state.snapshot.revision === 8) {
+      await freshReferenceGate;
+    }
+    return originalCall(method, params);
+  };
+  window.MvuUi.state.demoStore.revision = 8;
+
+  submit(window);
+  await waitFor(() => window.MvuUi.state.snapshot.revision === 8, "stale save did not reload revision 8");
+  await waitFor(() => /影响范围未知/.test(document.querySelector("[data-condition-shared-refs]").textContent),
+    "old revision references remained visible during authoritative recheck");
+  assert.equal(window.MvuUi.state.conditionEditorDraft.references, null);
+  submit(window);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(updateRequests.length, 1, "save was repeated while revision 8 references were unknown");
+
+  releaseFreshReferences();
+  await waitFor(() => window.MvuUi.state.conditionEditorDraft?.references?.checkedRevision === 8 &&
+    window.MvuUi.state.conditionEditorDraft.references.totalCount === 2,
+  "revision 8 references were not automatically rechecked");
+  assert.match(document.querySelector("[data-condition-shared-refs]").textContent, /共 2 条规则引用/);
+  submit(window);
+  await waitFor(() => window.MvuUi.state.route === "condition-library", "revision-bound retry did not save");
+  assert.equal(updateRequests.length, 2);
+  assert.equal(updateRequests[1].expectedRevision, 8);
+  assert.equal(updateRequests[1].patch.description, "保留到修订 8 的草稿");
+});
+
+test("stale delete closes the obsolete dialog and leaves persistent list recovery without repeating delete", async (t) => {
+  const window = await createApp("condition-library");
+  t.after(() => window.close());
+  const { document } = window;
+  input(window, "[data-list-search-route='condition-library']", "演示条件 20");
+  await waitFor(() => document.querySelector("[data-condition-row='demo-condition-20']"), "condition search did not finish");
+  click(window, "[data-condition-row='demo-condition-20'] [data-action='delete-condition']");
+  await waitFor(() => document.querySelector("[data-action='confirm-condition-delete']"), "zero-reference delete confirmation did not load");
+
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let deleteCalls = 0;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "deleteCondition") deleteCalls += 1;
+    return originalCall(method, params);
+  };
+  window.MvuUi.state.demoStore.revision = 8;
+  click(window, "[data-action='confirm-condition-delete']");
+
+  await waitFor(() => document.querySelector("[data-condition-list-recovery]"), "stale delete did not enter persistent list recovery");
+  assert.equal(document.querySelector(".condition-reference-dialog"), null, "obsolete delete dialog stayed open");
+  const recovery = document.querySelector("[data-condition-list-recovery]");
+  assert.match(recovery.textContent, /删除.*未提交|修订冲突/);
+  assert.match(recovery.querySelector('[data-action="reload-condition-library"]').textContent, /重新载入.*重新检查/);
+  assert.equal(window.MvuUi.state.snapshot.revision, 8);
+  assert.ok(window.MvuUi.state.demoStore.conditions.some((condition) => condition.id === "demo-condition-20"));
+  assert.equal(document.querySelector("[data-condition-row='demo-condition-20'] [data-action='delete-condition']").disabled, true);
+  click(window, "[data-condition-row='demo-condition-20'] [data-action='delete-condition']");
+  assert.equal(deleteCalls, 1, "stale delete repeated while recovery was pending");
+
+  click(window, '[data-action="reload-condition-library"]');
+  await waitFor(() => !document.querySelector("[data-condition-list-recovery]"), "stale delete recovery did not clear after reload");
+  assert.equal(deleteCalls, 1);
+});
+
 test("many referenced rules stay in a searchable paged delete dialog and remain blocked", async (t) => {
   const window = await createApp("condition-library");
   t.after(() => window.close());

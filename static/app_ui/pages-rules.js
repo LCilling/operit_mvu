@@ -38,10 +38,11 @@
     const rows = page.items.length ? '<div class="compact-list condition-list">' + page.items.map(conditionRow).join("") + "</div>" :
       c.emptyState("inbox", "还没有条件库", "创建后会显示在这里。");
     const recovery = ui.state.conditionListRecovery;
+    const staleRecovery = recovery && (recovery.kind === "stale" || recovery.kind === "stale-delete");
     const recoveryPanel = recovery ? '<section class="condition-list-recovery" data-condition-list-recovery role="alert"><span>' + c.icon("sync_problem") +
-      '</span><div><strong>' + (recovery.kind === "stale" ? "检测到修订冲突" : "条件操作已经提交") + '</strong><p>' + ui.escapeHtml(recovery.error || "列表刷新失败，请重新载入权威数据。") +
+      '</span><div><strong>' + (recovery.kind === "stale-delete" ? "删除前数据已变化" : staleRecovery ? "检测到修订冲突" : "条件操作已经提交") + '</strong><p>' + ui.escapeHtml(recovery.error || "列表刷新失败，请重新载入权威数据。") +
       '</p></div><button type="button" class="button secondary" data-action="reload-condition-library"' + (recovery.loading ? " disabled" : "") +
-      '>' + (recovery.loading ? "正在载入" : recovery.kind === "stale" ? "重新核对列表" : "只重新载入") + "</button></section>" : "";
+      '>' + (recovery.loading ? "正在载入" : recovery.kind === "stale-delete" ? "重新载入 / 重新检查" : staleRecovery ? "重新核对列表" : "只重新载入") + "</button></section>" : "";
     return '<div class="library-page">' + c.sectionHeading("条件库", "可复用、可查看引用的触发条件",
       '<button type="button" class="text-action" data-new-entity="condition">' + c.icon("add") + "新增条件</button>") +
       '<label class="search-field full">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) +
@@ -196,16 +197,22 @@
   function renderSharedConditionReferences(draft) {
     if (!draft.id) return "";
     const response = draft.references;
-    const unknown = Boolean(draft.referenceError || (!response && !draft.referenceLoading));
+    const snapshotRevision = ui.state.snapshot && ui.state.snapshot.revision;
+    const authoritative = Boolean(response && response.checkedRevision === snapshotRevision);
+    const unknown = !authoritative;
+    const unknownMessage = draft.referenceError || (draft.referenceLoading
+      ? "正在按最新数据修订重新检查规则引用"
+      : "尚未完成当前数据修订的引用检查");
     const error = unknown ? '<div class="condition-reference-unknown" role="alert"><p class="inline-error">影响范围未知。' +
-      ui.escapeHtml(draft.referenceError || "尚未完成引用检查") + '</p><button type="button" class="button secondary" data-action="retry-condition-references">重试引用检查</button></div>' : "";
-    const items = response && Array.isArray(response.items) ? response.items : [];
+      ui.escapeHtml(unknownMessage) + '</p><button type="button" class="button secondary" data-action="retry-condition-references"' +
+      (draft.referenceLoading ? " disabled" : "") + '>重试引用检查</button></div>' : "";
+    const items = authoritative && Array.isArray(response.items) ? response.items : [];
     const list = unknown ? "" : items.length ? '<ul>' + items.map(function (reference) {
       return '<li><strong>' + ui.escapeHtml(reference.name) + '</strong><small>' + ui.escapeHtml(reference.id) + "</small></li>";
     }).join("") + "</ul>" : '<p class="support-copy">当前没有规则引用，保存只影响此条件本身。</p>';
     return '<section class="editor-section condition-shared-refs" data-condition-shared-refs>' +
-      c.sectionHeading("受影响的规则", unknown ? "影响范围未知，请重试后再保存" : response ? "编辑前已检查：共 " + response.totalCount + " 条规则引用" : "正在检查共享引用") +
-      '<div class="condition-reference-panel">' + error + list + (response && response.hasMore
+      c.sectionHeading("受影响的规则", unknown ? "影响范围未知，检查完成前不能保存" : "编辑前已检查：共 " + response.totalCount + " 条规则引用") +
+      '<div class="condition-reference-panel">' + error + list + (authoritative && response.hasMore
         ? '<p class="support-copy">引用较多，可在删除检查中分页搜索查看。</p>' : "") + "</div></section>";
   }
 
