@@ -25,6 +25,9 @@ import { assertMvuDataset, assertMvuDatasetV3 } from "./validation";
 
 const V2_FILE_NAME = "operit_mvu.dataset.v2.json";
 const V3_FILE_NAME = "operit_mvu.dataset.v3.json";
+const COMPATIBILITY_RECORD_LIMIT = 500;
+const runtimePathTails = new Map<string, Promise<void>>();
+const runtimeRecoveryRequired = new Set<string>();
 
 export interface V3MvuStoreSnapshot {
   revision: number;
@@ -76,7 +79,7 @@ export class V3MvuStore implements MvuStore {
   private readonly now: () => number;
   private readonly records: SegmentedRecordStore;
   private initialization: Promise<MigrationStatus> | undefined;
-  private operationTail: Promise<void> = Promise.resolve();
+  private retryInFlight: Promise<MigrationStatus> | undefined;
 
   constructor(options: V3MvuStoreOptions) {
     this.getConfigDir = options.getConfigDir;
@@ -92,7 +95,7 @@ export class V3MvuStore implements MvuStore {
 
   initialize(): Promise<MigrationStatus> {
     if (this.initialization === undefined) {
-      this.initialization = this.initializeAttempt(false);
+      this.initialization = this.enqueuePath(() => this.initializeAttempt(false));
     }
     return this.initialization;
   }
@@ -102,16 +105,27 @@ export class V3MvuStore implements MvuStore {
   }
 
   async retryMigration(): Promise<MigrationStatus> {
-    await this.initialize();
-    const retry = this.enqueue(() => this.initializeAttempt(true));
+    if (this.retryInFlight !== undefined) return this.retryInFlight;
+    const status = await this.initialize();
+    if (this.retryInFlight !== undefined) return this.retryInFlight;
+    if (status.mode !== "v2_compat") {
+      throw new Error("MVU_V3_MIGRATION_RETRY_NOT_ALLOWED");
+    }
+    if (this.retryInFlight !== undefined) return this.retryInFlight;
+    const retry = this.enqueuePath(() => this.initializeAttempt(true));
+    this.retryInFlight = retry;
     this.initialization = retry;
-    return retry;
+    try {
+      return await retry;
+    } finally {
+      if (this.retryInFlight === retry) this.retryInFlight = undefined;
+    }
   }
 
   async readV3(): Promise<V3MvuStoreSnapshot> {
     const status = await this.initialize();
     if (status.mode !== "v3") throw new V3UnavailableError(status);
-    return this.enqueue(() => this.loadV3());
+    return this.enqueuePath(() => this.loadV3Config());
   }
 
   async transactV3(
@@ -121,8 +135,9 @@ export class V3MvuStore implements MvuStore {
   ): Promise<V3MvuStoreSnapshot> {
     const status = await this.initialize();
     if (status.mode !== "v3") throw new V3UnavailableError(status);
-    return this.enqueue(async () => {
-      const current = await this.loadV3();
+    return this.enqueuePath(async () => {
+      const current = await this.loadV3Config();
+      await this.recoverIfRequired(current);
       return this.commitLoaded(current, expectedRevision, next, {
         kind: "append",
         records: newRecords,
@@ -138,9 +153,9 @@ export class V3MvuStore implements MvuStore {
   async read(): Promise<MvuStoreSnapshot> {
     const status = await this.initialize();
     if (status.mode === "v2_compat") return this.legacyStore.read();
-    return this.enqueue(async () => {
-      const current = await this.loadV3();
-      const committedRecords = await this.readAllRecords(current.dataset);
+    return this.enqueuePath(async () => {
+      const current = await this.loadV3Config();
+      const committedRecords = await this.readCompatibilityRecords(current.dataset);
       return compatibilitySnapshot(current.dataset, committedRecords);
     });
   }
@@ -148,12 +163,13 @@ export class V3MvuStore implements MvuStore {
   async transact(expectedRevision: number, next: MvuDataset): Promise<MvuStoreSnapshot> {
     const status = await this.initialize();
     if (status.mode === "v2_compat") return this.legacyStore.transact(expectedRevision, next);
-    return this.enqueue(async () => {
-      const current = await this.loadV3();
+    return this.enqueuePath(async () => {
+      const current = await this.loadV3Config();
+      await this.recoverIfRequired(current);
       if (current.revision !== expectedRevision) {
         throw new StaleRevisionError(expectedRevision, current.revision);
       }
-      const currentRecords = await this.readAllRecords(current.dataset);
+      const currentRecords = await this.readCompatibilityRecords(current.dataset);
       const projected = compatibilityDataset(current.dataset, currentRecords);
       assertMvuDataset(next);
       const merged = mergeCompatibilityDataset(current.dataset, projected, next, this.now());
@@ -164,7 +180,7 @@ export class V3MvuStore implements MvuStore {
         merged,
         recordMutation,
       );
-      return compatibilitySnapshot(committed.dataset, next.records);
+      return compatibilitySnapshot(committed.dataset, next.records.slice(-COMPATIBILITY_RECORD_LIMIT));
     });
   }
 
@@ -172,19 +188,19 @@ export class V3MvuStore implements MvuStore {
     try {
       const configDir = this.configDir();
       const v3Path = this.v3Path(configDir);
-      if (!forceRebuild && await this.files.exists(v3Path)) {
-        await this.loadV3();
-        return { mode: "v3", source: "existing" };
+      if (await this.files.exists(v3Path)) {
+        try {
+          const existing = await this.loadV3Config();
+          await this.records.validateAndRepair(existing.dataset.recordManifest, existing.revision);
+          runtimeRecoveryRequired.delete(v3Path);
+          return { mode: "v3", source: "existing" };
+        } catch (error) {
+          if (!forceRebuild) throw error;
+        }
       }
 
-      if (forceRebuild) {
-        if (await this.files.exists(v3Path)) await this.files.deleteFile(v3Path);
-        const temporaryPath = `${v3Path}.tmp`;
-        if (await this.files.exists(temporaryPath)) await this.files.deleteFile(temporaryPath);
-        if (await this.files.exists(this.records.directoryPath())) {
-          await this.files.deleteFile(this.records.directoryPath());
-        }
-      } else if (await this.files.exists(this.records.directoryPath())) {
+      if (!forceRebuild && !(await this.files.exists(v3Path)) &&
+        await this.files.exists(this.records.directoryPath())) {
         // With no committed v3 config, every record path is an interrupted migration artifact.
         await this.files.deleteFile(this.records.directoryPath());
       }
@@ -197,7 +213,11 @@ export class V3MvuStore implements MvuStore {
       assertMvuDataset(legacySnapshot.dataset);
       const migration = migrateDatasetV2ToV3(legacySnapshot.dataset, this.now());
       validateMigrationResult(legacySnapshot.dataset, migration);
+      if (!Number.isSafeInteger(migration.dataset.revision + 1)) {
+        throw new Error("MVU_V3_REVISION_OVERFLOW");
+      }
       const commitRevision = migration.dataset.revision + 1;
+      runtimeRecoveryRequired.add(v3Path);
       const staged = await this.records.stageReplace(
         createEmptyRecordManifest(),
         migration.records,
@@ -209,6 +229,7 @@ export class V3MvuStore implements MvuStore {
       assertMvuDatasetV3(committed);
       await this.records.validateAndRepair(committed.recordManifest, committed.revision);
       await this.persistConfig(v3Path, committed);
+      runtimeRecoveryRequired.delete(v3Path);
       return {
         mode: "v3",
         source: hasV2 ? "migrated" : "initialized",
@@ -222,13 +243,12 @@ export class V3MvuStore implements MvuStore {
     }
   }
 
-  private async loadV3(): Promise<V3MvuStoreSnapshot> {
+  private async loadV3Config(): Promise<V3MvuStoreSnapshot> {
     const path = this.v3Path(this.configDir());
     if (!(await this.files.exists(path))) throw new Error("MVU_V3_CONFIG_MISSING");
     const raw = await this.files.readText(path);
     const parsed = JSON.parse(raw) as unknown;
     assertMvuDatasetV3(parsed);
-    await this.records.validateAndRepair(parsed.recordManifest, parsed.revision);
     return { revision: parsed.revision, dataset: klona(parsed) };
   }
 
@@ -244,7 +264,12 @@ export class V3MvuStore implements MvuStore {
     if (JSON.stringify(next.recordManifest) !== JSON.stringify(current.dataset.recordManifest)) {
       throw new Error("MVU_V3_RECORD_MANIFEST_IS_STORE_OWNED");
     }
+    if (!Number.isSafeInteger(current.revision + 1)) {
+      throw new Error("MVU_V3_REVISION_OVERFLOW");
+    }
     const commitRevision = current.revision + 1;
+    const configPath = this.v3Path(this.configDir());
+    runtimeRecoveryRequired.add(configPath);
     const staged = recordMutation.kind === "append"
       ? await this.records.stageAppend(current.dataset.recordManifest, recordMutation.records, commitRevision)
       : await this.records.stageReplace(current.dataset.recordManifest, recordMutation.records, commitRevision);
@@ -252,42 +277,39 @@ export class V3MvuStore implements MvuStore {
     committed.revision = commitRevision;
     committed.recordManifest = staged.manifest;
     assertMvuDatasetV3(committed);
-    await this.records.validateAndRepair(committed.recordManifest, committed.revision);
-    await this.persistConfig(this.v3Path(this.configDir()), committed);
-    if (recordMutation.kind === "replace") {
-      try {
-        await this.records.deleteSegments(current.dataset.recordManifest);
-      } catch (error) {
-        console.error("MVU orphaned replaced record cleanup failed", error);
-      }
-    }
+    await this.persistConfig(configPath, committed);
+    runtimeRecoveryRequired.delete(configPath);
     return { revision: committed.revision, dataset: klona(committed) };
   }
 
-  private async readAllRecords(dataset: MvuDatasetV3): Promise<DataChangeRecord[]> {
+  private async readCompatibilityRecords(dataset: MvuDatasetV3): Promise<DataChangeRecord[]> {
     if (dataset.recordManifest.recordCount === 0) return [];
-    return (await this.records.queryRecords(dataset.recordManifest, {
+    const records = (await this.records.queryRecords(dataset.recordManifest, {
       offset: 0,
-      limit: dataset.recordManifest.recordCount,
-      direction: "asc",
+      limit: Math.min(COMPATIBILITY_RECORD_LIMIT, dataset.recordManifest.recordCount),
+      direction: "desc",
     })).items;
+    records.reverse();
+    return records;
   }
 
   private async persistConfig(path: string, dataset: MvuDatasetV3): Promise<void> {
     const configDir = this.configDir();
     if (!(await this.files.exists(configDir))) await this.files.mkdir(configDir);
-    const temporaryPath = `${path}.tmp`;
+    const temporaryPath = `${path}.tmp.${nextTransactionId()}`;
     await this.files.writeText(temporaryPath, JSON.stringify(dataset, null, 2));
-    await this.files.move(temporaryPath, path);
+    await this.files.replaceAtomically(temporaryPath, path);
   }
 
-  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.operationTail.then(operation, operation);
-    this.operationTail = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  private async recoverIfRequired(current: V3MvuStoreSnapshot): Promise<void> {
+    const path = this.v3Path(this.configDir());
+    if (!runtimeRecoveryRequired.has(path)) return;
+    await this.records.validateAndRepair(current.dataset.recordManifest, current.revision);
+    runtimeRecoveryRequired.delete(path);
+  }
+
+  private enqueuePath<T>(operation: () => Promise<T>): Promise<T> {
+    return enqueueRuntimePath(this.v3Path(this.configDir()), operation);
   }
 
   private configDir(): string {
@@ -471,7 +493,7 @@ function mergeCompatibilityDataset(
       merged.rules = reconciled.rules;
     }
     if (temporaryEffectsChanged) {
-      const reconciled = reconcileCompatibilityEffects(current, projected, next, migrated);
+      const reconciled = reconcileCompatibilityEffects(current, projected, next, migrated, now);
       merged.effectGroups = reconciled.effectGroups;
       merged.activeEffects = reconciled.activeEffects;
     }
@@ -505,56 +527,87 @@ function reconcileCompatibilityRules(
     if (!projectedById.has(id)) touchedRuleIds.add(id);
   }
 
-  const replacementRules = new Map<string, MvuDatasetV3["rules"][number]>();
-  const replacementConditions = new Map<string, MvuDatasetV3["conditions"][number]>();
-  const removedConditionIds = new Set<string>();
+  const rules = current.rules.map((rule) => klona(rule));
+  const conditions = current.conditions.map((condition) => klona(condition));
+  const projectedEffectIds = new Set(projected.temporaryEffects.map((effect) => effect.id));
   for (const id of touchedRuleIds) {
     const currentRule = currentRulesById.get(id);
-    if (currentRule !== undefined && projectedById.has(id)) {
-      removedConditionIds.add(currentRule.conditionId);
-    } else if (currentRule !== undefined) {
+    const projectedRule = projectedById.get(id);
+    if (currentRule !== undefined && projectedRule === undefined) {
       throw new Error(`MVU_V3_COMPAT_RULE_ID_CONFLICT:${id}`);
     }
-    if (!nextById.has(id)) continue;
+    const nextRule = nextById.get(id);
+    if (nextRule === undefined) {
+      const index = rules.findIndex((rule) => rule.id === id);
+      if (index >= 0) rules.splice(index, 1);
+      continue;
+    }
     const migratedRule = migratedRulesById.get(id);
     if (migratedRule === undefined) throw new Error(`MVU_V3_COMPAT_RULE_MIGRATION_MISSING:${id}`);
     const migratedCondition = migratedConditionsById.get(migratedRule.conditionId);
     if (migratedCondition === undefined) {
       throw new Error(`MVU_V3_COMPAT_CONDITION_MIGRATION_MISSING:${migratedRule.conditionId}`);
     }
-    const conditionId = currentRule?.conditionId ?? migratedRule.conditionId;
-    if (currentRule === undefined && current.conditions.some((condition) => condition.id === conditionId)) {
-      throw new Error(`MVU_V3_COMPAT_CONDITION_ID_CONFLICT:${conditionId}`);
+    if (currentRule === undefined || projectedRule === undefined) {
+      const conditionId = uniqueConditionId(migratedRule.conditionId, conditions);
+      rules.push({ ...klona(migratedRule), conditionId });
+      conditions.push({ ...klona(migratedCondition), id: conditionId });
+      continue;
     }
-    replacementRules.set(id, { ...klona(migratedRule), conditionId });
-    replacementConditions.set(conditionId, { ...klona(migratedCondition), id: conditionId });
-  }
 
-  const rules = current.rules.flatMap((rule) => {
-    if (!touchedRuleIds.has(rule.id)) return [klona(rule)];
-    const replacement = replacementRules.get(rule.id);
-    replacementRules.delete(rule.id);
-    return replacement === undefined ? [] : [replacement];
-  });
-  for (const rule of next.autoRules) {
-    const replacement = replacementRules.get(rule.id);
-    if (replacement !== undefined) {
-      rules.push(replacement);
-      replacementRules.delete(rule.id);
-    }
-  }
+    const patched = klona(currentRule);
+    patched.name = nextRule.name;
+    patched.description = nextRule.description;
+    patched.enabled = nextRule.enabled;
+    patched.cooldownHours = nextRule.cooldownMs / 3_600_000;
+    patched.executionOrder = nextRule.order;
+    patched.updatedAt = migratedRule.updatedAt;
+    patched.actions = currentRule.actions.map((action, index) => {
+      if (action.kind !== "change_field") return klona(action);
+      const desired = migratedRule.actions[index];
+      if (desired === undefined || desired.kind !== "change_field") {
+        throw new Error(`MVU_V3_COMPAT_RULE_ACTION_MISSING:${id}:${index}`);
+      }
+      const hiddenEffectGroupIds = action.effectGroupIds.filter((effectGroupId) =>
+        !projectedEffectIds.has(legacyEffectId(effectGroupId)));
+      return {
+        ...klona(action),
+        fieldId: desired.fieldId,
+        delta: desired.delta,
+        effectGroupIds: uniqueStrings([
+          ...hiddenEffectGroupIds,
+          ...desired.effectGroupIds,
+        ]),
+      };
+    });
 
-  const referencedConditionIds = new Set(rules.map((rule) => rule.conditionId));
-  const conditions = current.conditions.flatMap((condition) => {
-    const replacement = replacementConditions.get(condition.id);
-    if (replacement !== undefined) {
-      replacementConditions.delete(condition.id);
-      return [replacement];
+    if (JSON.stringify(projectedRule.condition) !== JSON.stringify(nextRule.condition)) {
+      const currentConditionIndex = conditions.findIndex((condition) =>
+        condition.id === currentRule.conditionId);
+      if (currentConditionIndex < 0) {
+        throw new Error(`MVU_V3_COMPAT_CONDITION_NOT_FOUND:${currentRule.conditionId}`);
+      }
+      const shared = current.rules.some((rule) =>
+        rule.id !== currentRule.id && rule.conditionId === currentRule.conditionId);
+      const updatedCondition = klona(conditions[currentConditionIndex]);
+      updatedCondition.expression = klona(migratedCondition.expression);
+      updatedCondition.updatedAt = migratedCondition.updatedAt;
+      if (shared) {
+        updatedCondition.id = uniqueConditionId(
+          `${currentRule.conditionId}_${currentRule.id}`,
+          conditions,
+        );
+        conditions.push(updatedCondition);
+        patched.conditionId = updatedCondition.id;
+      } else {
+        conditions[currentConditionIndex] = updatedCondition;
+      }
     }
-    if (removedConditionIds.has(condition.id) && !referencedConditionIds.has(condition.id)) return [];
-    return [klona(condition)];
-  });
-  conditions.push(...replacementConditions.values());
+
+    const currentRuleIndex = rules.findIndex((rule) => rule.id === id);
+    if (currentRuleIndex < 0) throw new Error(`MVU_V3_COMPAT_RULE_NOT_FOUND:${id}`);
+    rules[currentRuleIndex] = patched;
+  }
   return { conditions, rules };
 }
 
@@ -563,6 +616,7 @@ function reconcileCompatibilityEffects(
   projected: MvuDataset,
   next: MvuDataset,
   migrated: MvuDatasetV3,
+  now: number,
 ): Pick<MvuDatasetV3, "effectGroups" | "activeEffects"> {
   const projectedById = new Map(projected.temporaryEffects.map((effect) => [effect.id, effect]));
   const nextById = new Map(next.temporaryEffects.map((effect) => [effect.id, effect]));
@@ -584,13 +638,12 @@ function reconcileCompatibilityEffects(
     if (!projectedById.has(id)) touchedEffectIds.add(id);
   }
 
-  const touchedGroupIds = new Set<string>();
-  const replacementGroups = new Map<string, MvuDatasetV3["effectGroups"][number]>();
-  const replacementInstances: MvuDatasetV3["activeEffects"] = [];
+  const effectGroups = current.effectGroups.map((group) => klona(group));
+  let activeEffects = current.activeEffects.map((instance) => klona(instance));
   for (const id of touchedEffectIds) {
-    const currentGroup = projectedById.has(id) ? currentGroupsByLegacyId.get(id) : undefined;
-    if (currentGroup !== undefined) touchedGroupIds.add(currentGroup.id);
-    else if (currentGroupsByLegacyId.has(id)) {
+    const projectedEffect = projectedById.get(id);
+    const currentGroup = projectedEffect === undefined ? undefined : currentGroupsByLegacyId.get(id);
+    if (currentGroup === undefined && currentGroupsByLegacyId.has(id)) {
       throw new Error(`MVU_V3_COMPAT_EFFECT_ID_CONFLICT:${id}`);
     }
 
@@ -602,48 +655,89 @@ function reconcileCompatibilityEffects(
           : action.effectGroupIds.includes(currentGroup.id)))) {
         throw new Error(`MVU_V3_COMPAT_EFFECT_IN_USE:${id}`);
       }
+      if (currentGroup !== undefined) {
+        const groupIndex = effectGroups.findIndex((group) => group.id === currentGroup.id);
+        if (groupIndex >= 0) effectGroups.splice(groupIndex, 1);
+        activeEffects = activeEffects.filter((instance) => instance.definitionId !== currentGroup.id);
+      }
       continue;
     }
 
     const migratedGroup = migratedGroupsByLegacyId.get(id);
     if (migratedGroup === undefined) throw new Error(`MVU_V3_COMPAT_EFFECT_MIGRATION_MISSING:${id}`);
-    const groupId = currentGroup?.id ?? migratedGroup.id;
-    replacementGroups.set(groupId, { ...klona(migratedGroup), id: groupId });
     const migratedInstances = migrated.activeEffects.filter((instance) =>
       instance.definitionId === migratedGroup.id);
-    const currentInstances = currentGroup === undefined
-      ? []
-      : current.activeEffects.filter((instance) => instance.definitionId === currentGroup.id);
-    for (const [index, instance] of migratedInstances.entries()) {
-      const replacement = { ...klona(instance), definitionId: groupId };
-      if (currentInstances[index] !== undefined) replacement.id = currentInstances[index].id;
-      if (currentGroup === undefined && current.activeEffects.some((candidate) => candidate.id === replacement.id)) {
-        throw new Error(`MVU_V3_COMPAT_ACTIVE_EFFECT_ID_CONFLICT:${replacement.id}`);
+    if (currentGroup === undefined || projectedEffect === undefined) {
+      if (effectGroups.some((group) => group.id === migratedGroup.id)) {
+        throw new Error(`MVU_V3_COMPAT_EFFECT_ID_CONFLICT:${id}`);
       }
-      replacementInstances.push(replacement);
+      effectGroups.push(klona(migratedGroup));
+      for (const instance of migratedInstances) {
+        if (activeEffects.some((candidate) => candidate.id === instance.id)) {
+          throw new Error(`MVU_V3_COMPAT_ACTIVE_EFFECT_ID_CONFLICT:${instance.id}`);
+        }
+        activeEffects.push(klona(instance));
+      }
+      continue;
     }
-  }
 
-  const effectGroups = current.effectGroups.flatMap((group) => {
-    if (!touchedGroupIds.has(group.id)) return [klona(group)];
-    const replacement = replacementGroups.get(group.id);
-    replacementGroups.delete(group.id);
-    return replacement === undefined ? [] : [replacement];
-  });
-  for (const effect of next.temporaryEffects) {
-    const migratedGroup = migratedGroupsByLegacyId.get(effect.id);
-    if (migratedGroup === undefined) continue;
-    const replacement = replacementGroups.get(migratedGroup.id);
-    if (replacement !== undefined) {
-      effectGroups.push(replacement);
-      replacementGroups.delete(migratedGroup.id);
+    const groupIndex = effectGroups.findIndex((group) => group.id === currentGroup.id);
+    if (groupIndex < 0) throw new Error(`MVU_V3_COMPAT_EFFECT_NOT_FOUND:${id}`);
+    const patchedGroup = klona(currentGroup);
+    patchedGroup.fieldEffects = patchedGroup.fieldEffects.map((fieldEffect) => ({
+      ...fieldEffect,
+      operations: fieldEffect.operations.map((operation) => {
+        if (operation.kind !== "fixed_adjustment" && operation.kind !== "all_multiplier") {
+          return operation;
+        }
+        return {
+          ...operation,
+          kind: nextEffect.mode === "additive" ? "fixed_adjustment" as const : "all_multiplier" as const,
+          value: nextEffect.value,
+        };
+      }),
+    }));
+    patchedGroup.updatedAt = migratedGroup.updatedAt;
+
+    const expirySettlement = projectedEffect.enabled && !nextEffect.enabled &&
+      projectedEffect.expiresAt !== null && projectedEffect.expiresAt <= now &&
+      sameEffectExceptEnabled(projectedEffect, nextEffect);
+    if (expirySettlement) {
+      activeEffects = activeEffects.filter((instance) =>
+        instance.definitionId !== currentGroup.id || instance.duration.expiresAt === null ||
+        Date.parse(instance.duration.expiresAt) > now);
+    } else {
+      const directSettlement = projectedEffect.enabled && !nextEffect.enabled &&
+        sameEffectInstanceProjection(projectedEffect, nextEffect);
+      if (directSettlement) {
+        activeEffects = activeEffects.filter((instance) =>
+          instance.definitionId !== currentGroup.id);
+      } else if (!sameEffectInstanceProjection(projectedEffect, nextEffect)) {
+        const currentInstances = activeEffects.filter((instance) =>
+          instance.definitionId === currentGroup.id);
+        if (currentInstances.length !== 1 || migratedInstances.length !== 1) {
+          throw new Error(`MVU_V3_COMPAT_EFFECT_INSTANCES_AMBIGUOUS:${id}`);
+        }
+        const currentInstance = currentInstances[0];
+        const migratedInstance = migratedInstances[0];
+        const replacement = {
+          ...klona(currentInstance),
+          resolvedTargets: klona(migratedInstance.resolvedTargets),
+          duration: klona(migratedInstance.duration),
+          reason: klona(migratedInstance.reason),
+        };
+        const instanceIndex = activeEffects.findIndex((instance) => instance.id === currentInstance.id);
+        if (!nextEffect.enabled && replacement.duration.remainingTurns === 0) {
+          activeEffects.splice(instanceIndex, 1);
+        } else {
+          activeEffects[instanceIndex] = replacement;
+        }
+      } else if (projectedEffect.enabled !== nextEffect.enabled) {
+        throw new Error(`MVU_V3_COMPAT_EFFECT_ACTIVATION_AMBIGUOUS:${id}`);
+      }
     }
+    effectGroups[groupIndex] = patchedGroup;
   }
-
-  const activeEffects = current.activeEffects
-    .filter((instance) => !touchedGroupIds.has(instance.definitionId))
-    .map((instance) => klona(instance));
-  activeEffects.push(...replacementInstances);
   return { effectGroups, activeEffects };
 }
 
@@ -688,6 +782,47 @@ function uniqueTargets(targets: DataTemporaryEffect["targets"]): DataTemporaryEf
   });
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
+function uniqueConditionId(
+  preferred: string,
+  conditions: readonly MvuDatasetV3["conditions"][number][],
+): string {
+  const ids = new Set(conditions.map((condition) => condition.id));
+  if (!ids.has(preferred)) return preferred;
+  let suffix = 2;
+  while (ids.has(`${preferred}_${suffix}`)) suffix += 1;
+  return `${preferred}_${suffix}`;
+}
+
+function sameEffectExceptEnabled(left: DataTemporaryEffect, right: DataTemporaryEffect): boolean {
+  const leftComparable = { ...left, enabled: true };
+  const rightComparable = { ...right, enabled: true };
+  return JSON.stringify(leftComparable) === JSON.stringify(rightComparable);
+}
+
+function sameEffectInstanceProjection(left: DataTemporaryEffect, right: DataTemporaryEffect): boolean {
+  return JSON.stringify({
+    targets: left.targets,
+    expiresAt: left.expiresAt,
+    remainingTurns: left.remainingTurns,
+    reasonMode: left.reasonMode,
+    reasonTemplate: left.reasonTemplate,
+    reason: left.reason,
+    createdAt: left.createdAt,
+  }) === JSON.stringify({
+    targets: right.targets,
+    expiresAt: right.expiresAt,
+    remainingTurns: right.remainingTurns,
+    reasonMode: right.reasonMode,
+    reasonTemplate: right.reasonTemplate,
+    reason: right.reason,
+    createdAt: right.createdAt,
+  });
+}
+
 function structuredMigrationError(error: unknown): MigrationError {
   const message = error instanceof Error ? error.message : String(error);
   const separator = message.indexOf(":");
@@ -695,4 +830,26 @@ function structuredMigrationError(error: unknown): MigrationError {
     code: (separator < 0 ? message : message.slice(0, separator)) || "MVU_V3_MIGRATION_FAILED",
     message,
   };
+}
+
+function enqueueRuntimePath<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const previous = runtimePathTails.get(path) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  runtimePathTails.set(path, tail);
+  void tail.finally(() => {
+    if (runtimePathTails.get(path) === tail) runtimePathTails.delete(path);
+  });
+  return run;
+}
+
+let transactionSequence = 0;
+
+function nextTransactionId(): string {
+  transactionSequence += 1;
+  if (!Number.isSafeInteger(transactionSequence)) transactionSequence = 1;
+  return `${Date.now().toString(36)}_${transactionSequence.toString(36)}`;
 }

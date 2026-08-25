@@ -134,6 +134,11 @@ function installProductionHost(t, files, hostSnapshot, modelCalls, registrations
         await files.move(source, destination);
         return successful("move", destination);
       },
+      async replaceAtomically(source, destination) {
+        fileCalls.push({ operation: "replaceAtomically", source, destination });
+        await files.replaceAtomically(source, destination);
+        return successful("replaceAtomically", destination);
+      },
       async deleteFile(path, recursive, environment) {
         fileCalls.push({ operation: "deleteFile", path, recursive, environment });
         await files.deleteFile(path);
@@ -274,7 +279,7 @@ test("commits records and configuration together and rejects a stale CAS revisio
   );
 });
 
-test("a failed config move leaves state and records uncommitted, then restart repairs and retries", async () => {
+test("a failed atomic config replace leaves state and records uncommitted, then restart repairs and retries", async () => {
   const { files } = filesWithV2();
   const firstStore = v3Store(files);
   await firstStore.initialize();
@@ -285,11 +290,11 @@ test("a failed config move leaves state and records uncommitted, then restart re
     startedAt: Math.floor(NOW / HOUR) * HOUR - HOUR,
     messageCount: 7,
   }];
-  files.failNext("move", ({ destination }) => destination === V3_PATH);
+  files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
 
   await assert.rejects(
     firstStore.transactV3(before.revision, interrupted, [changeRecord(1)]),
-    /FAKE_MOVE_FAILED/,
+    /FAKE_REPLACEATOMICALLY_FAILED/,
   );
 
   const restarted = v3Store(files);
@@ -340,22 +345,33 @@ test("failed migration retains structured v2 compatibility and a clean retry suc
   const legacy = legacyDatasetFixture();
   legacy.records = [changeRecord(1)];
   const { files, serialized } = filesWithV2(legacy);
-  files.failNext("move", ({ destination }) => destination === V3_PATH);
+  files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
   const store = v3Store(files, legacy);
 
   const failed = await store.initialize();
 
   assert.equal(failed.mode, "v2_compat");
   assert.equal(typeof failed.error.code, "string");
-  assert.match(failed.error.message, /FAKE_MOVE_FAILED/);
+  assert.match(failed.error.message, /FAKE_REPLACEATOMICALLY_FAILED/);
   assert.equal((await store.read()).dataset.formatVersion, 2);
   assert.equal(files.snapshot()[V2_PATH], serialized);
+  const failedSegmentBytes = files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`];
+  assert.equal(typeof failedSegmentBytes, "string");
 
   const retried = await store.retryMigration();
   assert.equal(retried.mode, "v3");
   assert.equal(retried.source, "migrated");
   assert.equal(files.snapshot()[V2_PATH], serialized);
   assert.equal((await store.queryRecords({ offset: 0, limit: 10 })).totalCount, 1);
+  const migratedV3 = (await store.readV3()).dataset;
+  assert.deepEqual(migratedV3.recordManifest.segments.map(({ fileName }) => fileName), [
+    "segment-000002.jsonl",
+  ]);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], failedSegmentBytes);
+  const stagingPaths = files.operations()
+    .filter((operation) => operation.operation === "writeText" && operation.path.startsWith(`${V3_PATH}.tmp.`))
+    .map(({ path }) => path);
+  assert.equal(new Set(stagingPaths).size, 2);
 });
 
 test("each invalid v3 reference and committed count falls back without overwriting either dataset", async () => {
@@ -722,14 +738,46 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
     .flatMap(([, content]) => content.trim().split("\n").filter(Boolean).map(JSON.parse));
   assert.equal(storedLines.length, 7);
   assert.equal(storedLines.every((line) => line.commitRevision === committed.revision), true);
-  assert.equal(fileCalls.filter((call) => call.operation === "move" && call.destination === V3_PATH).length, 1);
+  assert.equal(fileCalls.filter((call) =>
+    call.operation === "replaceAtomically" && call.destination === V3_PATH).length, 1);
+  assert.equal(fileCalls.some((call) => call.operation === "move" && call.destination === V3_PATH), false);
   assert.equal(fileCalls.some((call) => call.operation === "write" && call.append === true), true);
+
+  const committedConfigBytes = files.snapshot()[V3_PATH];
+  const failureCallStart = fileCalls.length;
+  files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
+  await assert.rejects(registrations.chat.function({
+    eventName: "message_persisted",
+    eventPayload: {
+      chatId: "chat_main",
+      messageId: "message_production_hook_interrupted",
+      variantId: null,
+      actorCharacterCardId: "T",
+      characterGroupId: null,
+      actorName: "T",
+      isComplete: true,
+      timestamp: NOW + 1,
+      sender: "ai",
+      content: "An interrupted production event",
+    },
+  }), /FAKE_REPLACEATOMICALLY_FAILED/);
+  assert.equal(files.snapshot()[V3_PATH], committedConfigBytes);
+  assert.equal((await seedStore.readV3()).revision, committed.revision);
+  assert.equal((await seedStore.queryRecords({ offset: 0, limit: 20 })).totalCount, 7);
+  const failedProductionCalls = fileCalls.slice(failureCallStart);
+  const appendIndex = failedProductionCalls.findIndex((call) =>
+    call.operation === "write" && call.append === true);
+  const atomicIndex = failedProductionCalls.findIndex((call) =>
+    call.operation === "replaceAtomically" && call.destination === V3_PATH);
+  assert.equal(appendIndex >= 0 && atomicIndex > appendIndex, true);
 
   const productionReader = createRuntime({ getConfigDir: () => CONFIG_DIR });
   assert.equal((await productionReader.initialize()).mode, "v3");
   const queried = await productionReader.store.queryRecords({ offset: 0, limit: 10, direction: "asc" });
   assert.equal(queried.items.length, 7);
-  assert.equal(fileCalls.some((call) => call.operation === "readPart"), true);
+  assert.equal(fileCalls.some((call) => call.operation === "readPart"), false);
+  assert.equal(fileCalls.some((call) =>
+    call.operation === "read" && call.path.startsWith(`${RECORD_DIRECTORY}/segment-`)), true);
   const compatibility = await productionReader.snapshot({
     chatId: "chat_main", actorId: "T", groupId: null, actorName: "T",
   });

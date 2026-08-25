@@ -580,7 +580,7 @@ function validatePendingBootstrapFields(
 
 export function assertMvuDataset(value: unknown): asserts value is MvuDataset {
   if (!isRecord(value) || value.formatVersion !== 2 || !isFiniteNumber(value.createdAt) ||
-    !isFiniteNumber(value.revision) || !Number.isInteger(value.revision) || value.revision < 0 ||
+    !isFiniteNumber(value.revision) || !Number.isSafeInteger(value.revision) || value.revision < 0 ||
     !Array.isArray(value.fields) || !Array.isArray(value.rules) || !Array.isArray(value.autoRules) ||
     !Array.isArray(value.pendingBootstrapFieldIds) ||
     !value.pendingBootstrapFieldIds.every((entry) => typeof entry === "string") ||
@@ -655,7 +655,7 @@ export function assertMvuDataset(value: unknown): asserts value is MvuDataset {
  */
 export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV3 {
   if (!isRecord(value) || value.formatVersion !== 3 || !isIsoTimestamp(value.createdAt) ||
-    !isFiniteNumber(value.revision) || !Number.isInteger(value.revision) || value.revision < 0 ||
+    !isFiniteNumber(value.revision) || !Number.isSafeInteger(value.revision) || value.revision < 0 ||
     !Array.isArray(value.fields) ||
     !Array.isArray(value.linkRules) || !Array.isArray(value.conditions) ||
     !Array.isArray(value.rules) || !Array.isArray(value.effectGroups) ||
@@ -767,8 +767,8 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
 
 function assertRecordManifestShape(value: unknown): void {
   if (!isRecord(value) || !Array.isArray(value.segments) ||
-    !isFiniteNumber(value.recordCount) || !Number.isInteger(value.recordCount) || value.recordCount < 0 ||
-    !isFiniteNumber(value.nextSegmentIndex) || !Number.isInteger(value.nextSegmentIndex) ||
+    !isFiniteNumber(value.recordCount) || !Number.isSafeInteger(value.recordCount) || value.recordCount < 0 ||
+    !isFiniteNumber(value.nextSegmentIndex) || !Number.isSafeInteger(value.nextSegmentIndex) ||
     value.nextSegmentIndex < 1) {
     fail("MVU_V3_RECORD_MANIFEST_INVALID");
   }
@@ -776,17 +776,20 @@ function assertRecordManifestShape(value: unknown): void {
   let previousIndex = 0;
   for (let position = 0; position < value.segments.length; position += 1) {
     const segment = value.segments[position];
-    if (!isRecord(segment) || !isFiniteNumber(segment.index) || !Number.isInteger(segment.index) ||
+    if (!isRecord(segment) || !isFiniteNumber(segment.index) || !Number.isSafeInteger(segment.index) ||
       segment.index <= previousIndex ||
       segment.fileName !== `segment-${String(segment.index).padStart(6, "0")}.jsonl` ||
-      !isFiniteNumber(segment.committedLineCount) || !Number.isInteger(segment.committedLineCount) ||
+      !isFiniteNumber(segment.committedLineCount) || !Number.isSafeInteger(segment.committedLineCount) ||
       segment.committedLineCount < 1 || segment.committedLineCount > 500 ||
       (position < value.segments.length - 1 && segment.committedLineCount !== 500) ||
       !isFiniteNumber(segment.firstOccurredAt) || !isFiniteNumber(segment.lastOccurredAt) ||
       segment.firstOccurredAt > segment.lastOccurredAt ||
-      !isFiniteNumber(segment.firstRevision) || !Number.isInteger(segment.firstRevision) || segment.firstRevision < 0 ||
-      !isFiniteNumber(segment.lastRevision) || !Number.isInteger(segment.lastRevision) ||
+      !isFiniteNumber(segment.firstRevision) || !Number.isSafeInteger(segment.firstRevision) || segment.firstRevision < 0 ||
+      !isFiniteNumber(segment.lastRevision) || !Number.isSafeInteger(segment.lastRevision) ||
       segment.lastRevision < segment.firstRevision) {
+      fail("MVU_V3_RECORD_MANIFEST_INVALID");
+    }
+    if (!Number.isSafeInteger(total + segment.committedLineCount)) {
       fail("MVU_V3_RECORD_MANIFEST_INVALID");
     }
     total += segment.committedLineCount;

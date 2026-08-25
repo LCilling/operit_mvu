@@ -114,11 +114,13 @@ export function largeDatasetFixture() {
 }
 
 /** Map-backed implementation of the complete MvuFileApi contract. */
-export function createFakeMvuFileApi(initialFiles = {}) {
+export function createFakeMvuFileApi(initialFiles = {}, options = {}) {
   const files = new Map(Object.entries(initialFiles));
   const directories = new Set();
   const failures = [];
+  const barriers = [];
   const operations = [];
+  const partialReadLineLimit = options.partialReadLineLimit ?? Number.POSITIVE_INFINITY;
 
   function failIfRequested(operation, details) {
     const index = failures.findIndex((failure) =>
@@ -134,6 +136,15 @@ export function createFakeMvuFileApi(initialFiles = {}) {
     return content;
   }
 
+  async function waitAtBarrier(operation, details) {
+    const index = barriers.findIndex((barrier) =>
+      barrier.operation === operation && barrier.matches(details));
+    if (index < 0) return;
+    const [barrier] = barriers.splice(index, 1);
+    barrier.enteredResolve();
+    await barrier.releasePromise;
+  }
+
   const api = {
     async exists(path) {
       failIfRequested("exists", { path });
@@ -143,6 +154,7 @@ export function createFakeMvuFileApi(initialFiles = {}) {
     async readText(path) {
       failIfRequested("readText", { path });
       operations.push({ operation: "readText", path });
+      await waitAtBarrier("readText", { path });
       return requireFile(path);
     },
     async readTextPart(path, startLine, endLine) {
@@ -154,21 +166,41 @@ export function createFakeMvuFileApi(initialFiles = {}) {
       }
       const lines = requireFile(path).replace(/\r\n/g, "\n").split("\n");
       if (lines.at(-1) === "") lines.pop();
-      return lines.slice(startLine - 1, endLine).join("\n");
+      const selected = lines.slice(startLine - 1, endLine);
+      const truncated = selected.length > partialReadLineLimit;
+      const visible = selected.slice(0, partialReadLineLimit);
+      const width = Math.max(3, String(endLine).length);
+      const decorated = visible.map((line, offset) =>
+        `${String(startLine + offset).padStart(width, " ")}| ${line}`);
+      if (truncated) decorated.push("... (file content truncated) ...");
+      return decorated.join("\n");
     },
     async writeText(path, content) {
       failIfRequested("writeText", { path, content });
       operations.push({ operation: "writeText", path, content });
+      await waitAtBarrier("writeText", { path, content });
       files.set(path, content);
     },
     async appendText(path, content) {
       failIfRequested("appendText", { path, content });
       operations.push({ operation: "appendText", path, content });
+      await waitAtBarrier("appendText", { path, content });
       files.set(path, (files.get(path) ?? "") + content);
+      failIfRequested("appendTextAfterWrite", { path, content });
     },
     async move(source, destination) {
       failIfRequested("move", { source, destination });
       operations.push({ operation: "move", source, destination });
+      await waitAtBarrier("move", { source, destination });
+      const content = requireFile(source);
+      files.set(destination, content);
+      failIfRequested("moveAfterCopy", { source, destination });
+      files.delete(source);
+    },
+    async replaceAtomically(source, destination) {
+      failIfRequested("replaceAtomically", { source, destination });
+      operations.push({ operation: "replaceAtomically", source, destination });
+      await waitAtBarrier("replaceAtomically", { source, destination });
       const content = requireFile(source);
       files.set(destination, content);
       files.delete(source);
@@ -190,6 +222,21 @@ export function createFakeMvuFileApi(initialFiles = {}) {
     },
     failNext(operation, matches = () => true, error = new Error(`FAKE_${operation.toUpperCase()}_FAILED`)) {
       failures.push({ operation, matches, error });
+    },
+    pauseNext(operation, matches = () => true) {
+      let enteredResolve;
+      let releaseResolve;
+      const entered = new Promise((resolve) => {
+        enteredResolve = resolve;
+      });
+      const releasePromise = new Promise((resolve) => {
+        releaseResolve = resolve;
+      });
+      barriers.push({ operation, matches, enteredResolve, releasePromise });
+      return { entered, release: releaseResolve };
+    },
+    clearOperations() {
+      operations.length = 0;
     },
     operations() {
       return structuredClone(operations);
