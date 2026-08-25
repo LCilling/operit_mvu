@@ -112,3 +112,10 @@ Task 6: review fix round complete (c36bf63 + 6845819 + e03e03e + afa36f8; 113/11
 Task 6: review fix round 2 complete (`c63b8d8`; query 35/35, full 131/131; exact filter fingerprints, 64 KiB legacy-safe compact snapshot, formal 15-operation CAS matrix; `pnpm run check` and `git diff --check` PASS). Pending fresh independent re-review; Task 7 monolith remains untouched.
 Task 6: final identity-preservation fix complete (`d2b957f`; query 38/38, full 134/134; exact IDs/references/timestamps/colors, atomic 2 KiB URI handling, 64 KiB cardinality reduction with `snapshotTruncated`/`returnedCount`; `pnpm run check` and `git diff --check` PASS). Task 7 monolith remains untouched.
 Task 6: complete (final independent review clean; 134/134; bounded query/IPC contracts sealed).
+
+Task 7: base ab6d927 (Task 6 final review closeout).
+Task 7: TDD RED confirmed (33 initial shell violations; focused regressions for delegated route collision, segmented font size, cache invalidation, background bounds, drawer isolation, and child-editor entry actions).
+Task 7: implementation complete (`2c2ccb1`; seven modules, four roots, compact snapshot adapter, normal-flow bottom layout, fixed-range stage/trend visuals, uniform 12px detail stack).
+Task 7: local 393×852 visual pass clean after one interaction fix — group selector 1 / actor selector 0 in group mode; four bottom items; static nav; 11.99px card gaps; action/nav overlap 0; transparent back target.
+Task 7: verification clean (`pnpm run build:web`, `pnpm run check`, 134/134, `git diff --check`; Impeccable detector `[]`).
+Task 7: complete pending independent review; Task 8 owns live search/pagination/pickers and Task 9 owns complete editor mutations.
