@@ -133,7 +133,7 @@ namespace Tools.Files {
 
 该标记是机器可判定的兼容契约，不得翻译、改变空白或混入普通正文行。`FilePartContentData.startLine`、`endLine` 和 `totalLines` 继续描述请求及文件行范围，不能代替截断标记；当前返回结构尚无独立的 `truncated` 布尔字段。
 
-`operit_mvu` 的正常记录查询以最多 32 行调用 `readPart`。发现上述标记时，插件会放弃该次不完整结果，并仅针对当前记录段回退到官方 `Tools.Files.read` 完整读取一次，以兼容超长历史单行，避免产生部分 JSON 或递归数百次读取。未来若宿主为 `FilePartContentData` 增加结构化 `truncated: boolean`，应保留本标记至少一个兼容周期。
+`operit_mvu` 的正常记录查询以最多 32 行调用 `readPart`。发现上述标记时，插件会放弃该次不完整结果，并对当前行区间做有界二分，再次调用同一官方接口；32 行的初始区间最多拆分 5 层。插件不会回退到整文件读取，也不会解析部分 JSON。单条持久化记录最多允许 32,000 个 UTF-16 代码单元：新写入会在提交前校验，既有超长单行会明确报错。未来若宿主为 `FilePartContentData` 增加结构化 `truncated: boolean`，应保留本标记至少一个兼容周期。
 
 主要文件：
 

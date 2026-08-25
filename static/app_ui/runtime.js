@@ -34,6 +34,7 @@
   const PICKER_WINDOW_MAX_ROWS = 24;
   const PICKER_RETAINED_PAGE_LIMIT = 128;
   const AUXILIARY_NATIVE_CONCURRENCY = 2;
+  const AUXILIARY_QUEUE_TIMEOUT_MS = 5_000;
   const MODEL_BUDGET_DIAGNOSTIC_LIMIT = 32;
   const MODEL_BUDGET_DIAGNOSTIC_MAX_CODE_POINTS = 256;
   const QUERY_RESPONSE_POLICIES = {
@@ -130,6 +131,8 @@
   };
 
   const native = createNativeBridge();
+  let snapshotRequestSequence = 0;
+  let entityCacheGeneration = 0;
   window.MvuUi = {
     state,
     native,
@@ -177,6 +180,7 @@
   function createNativeBridge() {
     const pending = new Map();
     const auxiliaryQueue = [];
+    const auxiliaryPending = new Map();
     let auxiliaryActive = 0;
     let sequence = 0;
     window.__mvuResolve = function (callbackId, value) {
@@ -221,11 +225,26 @@
           }
         });
       },
-      callAuxiliary(method, params) {
-        return new Promise(function (resolve, reject) {
-          auxiliaryQueue.push({ method, params, resolve, reject });
+      callAuxiliary(method, params, dedupeIdentity) {
+        const key = method + "\u0000" + JSON.stringify(params || {}) + "\u0000" +
+          String(dedupeIdentity === undefined ? "" : dedupeIdentity);
+        const existing = auxiliaryPending.get(key);
+        if (existing) return existing;
+        const promise = new Promise(function (resolve, reject) {
+          const request = { method, params, resolve, reject, started: false, timer: 0 };
+          request.timer = window.setTimeout(function () {
+            if (request.started) return;
+            const index = auxiliaryQueue.indexOf(request);
+            if (index >= 0) auxiliaryQueue.splice(index, 1);
+            reject(new Error("MVU_AUXILIARY_QUEUE_TIMEOUT"));
+          }, AUXILIARY_QUEUE_TIMEOUT_MS);
+          auxiliaryQueue.push(request);
           pumpAuxiliaryQueue();
+        }).finally(function () {
+          if (auxiliaryPending.get(key) === promise) auxiliaryPending.delete(key);
         });
+        auxiliaryPending.set(key, promise);
+        return promise;
       },
     };
     return bridge;
@@ -233,6 +252,8 @@
     function pumpAuxiliaryQueue() {
       while (auxiliaryActive < AUXILIARY_NATIVE_CONCURRENCY && auxiliaryQueue.length > 0) {
         const request = auxiliaryQueue.shift();
+        request.started = true;
+        window.clearTimeout(request.timer);
         auxiliaryActive += 1;
         bridge.call(request.method, request.params).then(request.resolve, request.reject).finally(function () {
           auxiliaryActive -= 1;
@@ -969,7 +990,12 @@
   }
 
   async function loadSnapshot(request) {
+    const requestToken = ++snapshotRequestSequence;
     const snapshot = validateCompactSnapshot(await native.call("snapshot", request || {}));
+    if (requestToken !== snapshotRequestSequence) {
+      throw new Error("MVU_SNAPSHOT_REQUEST_SUPERSEDED");
+    }
+    entityCacheGeneration += 1;
     const previousRevision = state.snapshot === null ? null : state.snapshot.revision;
     const previousContext = state.snapshot === null ? "" : contextIdentity(state.snapshot.activeContext);
     const nextContext = contextIdentity(snapshot.activeContext);
@@ -1015,14 +1041,20 @@
     };
   }
 
-  async function projectCharacterContext(bindingIds) {
+  async function projectCharacterContext(options) {
     const context = state.snapshot && state.snapshot.activeContext;
     if (!context || context.actorId || !context.groupId) return false;
-    await loadDirectory(context.groupId);
-    const bindings = Array.isArray(bindingIds) ? new Set(bindingIds) : null;
-    const eligible = state.directory.actors.filter(function (actor) {
-      return bindings === null || bindings.has(actor.characterId);
-    });
+    const fieldId = options && options.fieldId;
+    let eligible;
+    if (fieldId) {
+      const response = await query("queryActors", {
+        filters: { groupId: context.groupId, fieldId },
+      }, "actors");
+      eligible = response.items;
+    } else {
+      await loadDirectory(context.groupId);
+      eligible = state.directory.actors;
+    }
     const eligibleIds = eligible.map(function (actor) { return actor.characterId; });
     const actorId = eligibleIds.includes(state.lastActorId) ? state.lastActorId : eligibleIds[0];
     if (!actorId) return false;
@@ -1445,11 +1477,27 @@
       response.items.forEach(function (field) { state.entities.set("field:" + field.id, field); });
       response.items.forEach(function (field) { state.bindingLabels.set(field.id, field.bindingDisplay); });
     }
-    if (policy.key === "rules") await hydrateRuleLabels(response.items);
-    if (policy.key === "conditions" && typeof window.MvuUi.hydrateConditionRows === "function") {
-      await window.MvuUi.hydrateConditionRows(response.items);
-    }
+    scheduleManagementHydration(routeId, policy, response.items, view, requestToken);
     return response;
+  }
+
+  function scheduleManagementHydration(routeId, policy, items, view, requestToken) {
+    const isCurrent = function () {
+      return state.route === routeId && state.listViews[policy.key] === view && view.requestToken === requestToken;
+    };
+    let task = null;
+    if (policy.key === "rules") task = hydrateRuleLabels(items, isCurrent);
+    if (policy.key === "conditions" && typeof window.MvuUi.hydrateConditionRows === "function") {
+      task = window.MvuUi.hydrateConditionRows(items, isCurrent);
+    }
+    if (!task) return;
+    void Promise.resolve(task).then(function () {
+      if (isCurrent() && typeof window.MvuUi.patchManagementList === "function") {
+        window.MvuUi.patchManagementList(routeId);
+      }
+    }, function () {
+      // Auxiliary labels are best-effort; the authoritative list remains usable.
+    });
   }
 
   async function hydrateFieldBindingLabels(fields) {
@@ -1481,7 +1529,7 @@
     }));
   }
 
-  async function hydrateRuleLabels(rules) {
+  async function hydrateRuleLabels(rules, isCurrent) {
     await Promise.all(rules.map(async function (rule) {
       const selector = rule.triggerActorSelector;
       let actor = selector.kind === "any" ? "任意角色" : selector.kind === "current_actor" ? "当前消息角色" : "未绑定角色";
@@ -1516,7 +1564,7 @@
       } catch (_error) {
         actions = rule.actions.length + " 个结果（需修复引用）";
       }
-      state.ruleLabels.set(rule.id, { actor, condition, actions });
+      if (!isCurrent || isCurrent()) state.ruleLabels.set(rule.id, { actor, condition, actions });
     }));
   }
 
@@ -1524,9 +1572,20 @@
     if (typeof id !== "string" || id.length === 0) throw new Error("MVU_ENTITY_ID_MISSING");
     const key = entityType + ":" + id;
     if (state.entities.has(key)) return state.entities.get(key);
+    const cacheGeneration = entityCacheGeneration;
+    const fieldContextIdentity = entityType === "field" && state.snapshot
+      ? contextIdentity(state.snapshot.activeContext)
+      : null;
     const entity = await native.callAuxiliary("getEntityById", entityType === "field"
       ? withActiveScopeContext({ entityType, id })
-      : { entityType, id });
+      : { entityType, id }, "entity-cache:" + cacheGeneration);
+    if (cacheGeneration !== entityCacheGeneration) {
+      throw new Error("MVU_ENTITY_CACHE_SUPERSEDED");
+    }
+    if (entityType === "field" && fieldContextIdentity !== null && (!state.snapshot ||
+        fieldContextIdentity !== contextIdentity(state.snapshot.activeContext))) {
+      throw new Error("MVU_ENTITY_SCOPE_SUPERSEDED");
+    }
     const validators = {
       field: validateFieldEntity,
       actor: validateActor,
@@ -1573,7 +1632,7 @@
         if (!state.selectedFieldId) throw new Error("MVU_FIELD_SELECTION_MISSING");
         let field = await getEntity("field", state.selectedFieldId);
         if ((field.currentValue === null || field.scopeKey === null) && field.scope === "character") {
-          await projectCharacterContext(field.bindingIds);
+          await projectCharacterContext({ fieldId: field.id });
           field = await getEntity("field", state.selectedFieldId);
         }
         if (field.currentValue === null || field.scopeKey === null) throw new Error("MVU_FIELD_CONTEXT_MISSING");

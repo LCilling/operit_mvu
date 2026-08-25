@@ -186,11 +186,35 @@ test("rule label hydration stays below the host per-origin async quota", async (
   };
 
   await window.MvuUi.navigate("rule-library");
+  await waitFor(() => window.MvuUi.state.ruleLabels.size === 5, "rule labels did not hydrate");
 
   assert.ok(maximumActiveLookups <= 2, `rule label hydration reached ${maximumActiveLookups} concurrent calls`);
   const labels = Array.from(window.MvuUi.state.ruleLabels.values());
   assert.equal(labels.length, 5);
   assert.ok(labels.every((label) => !/待修复|需修复/.test(`${label.condition} ${label.actions}`)));
+});
+
+test("rule library renders before slow auxiliary labels finish", async (t) => {
+  const window = await createApp("rules");
+  t.after(() => window.close());
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "getEntityById") await gate;
+    return originalCall(method, params);
+  };
+
+  const navigation = window.MvuUi.navigate("rule-library");
+  const winner = await Promise.race([
+    navigation.then(() => "rendered"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 100)),
+  ]);
+
+  assert.equal(winner, "rendered");
+  assert.equal(window.document.querySelectorAll("[data-rule-row]").length, 5);
+  release();
+  await waitFor(() => window.MvuUi.state.ruleLabels.size === 5, "slow rule labels did not finish");
 });
 
 test("effect library uses exact ten-row production paging with search statistics and visible creation", async (t) => {

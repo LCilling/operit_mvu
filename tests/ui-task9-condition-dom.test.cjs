@@ -203,6 +203,11 @@ test("condition reference hydration stays below the host per-origin async quota"
   };
 
   await window.MvuUi.navigate("condition-library");
+  await waitFor(() => {
+    const visible = window.MvuUi.state.pages.conditions.items;
+    return visible.length === 10 && visible.every((condition) =>
+      typeof window.MvuUi.state.conditionMeta.get(condition.id)?.referenceCount === "number");
+  }, "condition references did not hydrate");
 
   assert.ok(maximumActiveReferences <= 2, `reference hydration reached ${maximumActiveReferences} concurrent calls`);
   const visibleConditions = window.MvuUi.state.pages.conditions.items;
@@ -212,6 +217,33 @@ test("condition reference hydration stays below the host per-origin async quota"
     assert.equal(meta?.error, "", `${condition.id} failed reference hydration`);
     assert.equal(typeof meta?.referenceCount, "number");
   }
+});
+
+test("condition library renders before slow reference counts finish", async (t) => {
+  const window = await createApp("rules");
+  t.after(() => window.close());
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  window.MvuUi.native.call = async function (method, params) {
+    if (method === "getConditionReferences") await gate;
+    return originalCall(method, params);
+  };
+
+  const navigation = window.MvuUi.navigate("condition-library");
+  const winner = await Promise.race([
+    navigation.then(() => "rendered"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 100)),
+  ]);
+
+  assert.equal(winner, "rendered");
+  assert.equal(window.document.querySelectorAll("[data-condition-row]").length, 10);
+  release();
+  await waitFor(() => {
+    const visible = window.MvuUi.state.pages.conditions.items;
+    return visible.every((condition) =>
+      typeof window.MvuUi.state.conditionMeta.get(condition.id)?.referenceCount === "number");
+  }, "slow condition references did not finish");
 });
 
 test("condition serializer preserves every production predicate token and exact payload keys", async (t) => {

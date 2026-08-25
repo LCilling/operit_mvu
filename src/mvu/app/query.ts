@@ -168,6 +168,7 @@ export interface MvuQuerySource {
   listActorsForGroup?(groupId: string): Promise<DataActor[]>;
   listGroups(): Promise<QueryGroup[]>;
   activeContext(): Promise<StateScopeContext>;
+  resolveProjectionContext?(requested: StateScopeContext): Promise<StateScopeContext>;
   migrationStatus(): Promise<MigrationStatus>;
   /** Authoritative production budget; omitted by compatibility/test sources. */
   modelBudget?(): Promise<ModelFieldBudgetStats>;
@@ -390,14 +391,13 @@ export class MvuQueryService {
 
   async queryFields(request: QueryRequest): Promise<QueryResponse<FieldQueryItem>> {
     validateProjectionContext(request.scopeContext);
-    const [snapshot, context, actors, groups] = await Promise.all([
+    const [snapshot, activeContext, actors, groups] = await Promise.all([
       this.source.readV3(),
-      request.scopeContext === undefined
-        ? this.source.activeContext()
-        : Promise.resolve(request.scopeContext),
+      this.source.activeContext(),
       this.source.listActors(),
       this.source.listGroups(),
     ]);
+    const context = await authorizeProjectionContext(this.source, request.scopeContext, activeContext);
     const dataset = snapshot.dataset;
     const picker = request.filters?.mode === "picker" || request.cursor !== undefined;
     const response = queryCollection({
@@ -649,13 +649,12 @@ export class MvuQueryService {
       if (request.entityType === "field") {
         const field = dataset.fields.find((item) => item.id === request.id);
         if (field !== undefined) {
-          const [context, actors, groups] = await Promise.all([
-            request.scopeContext === undefined
-              ? this.source.activeContext()
-              : Promise.resolve(request.scopeContext),
+          const [activeContext, actors, groups] = await Promise.all([
+            this.source.activeContext(),
             this.source.listActors(),
             this.source.listGroups(),
           ]);
+          const context = await authorizeProjectionContext(this.source, request.scopeContext, activeContext);
           entity = projectField(field, dataset, context, actors, groups);
         }
       }
@@ -1281,6 +1280,48 @@ function validateProjectionContext(value: StateScopeContext | undefined): void {
     typeof value.actorName !== "string") {
     throw new Error("MVU_QUERY_SCOPE_CONTEXT_INVALID");
   }
+}
+
+async function authorizeProjectionContext(
+  source: MvuQuerySource,
+  requested: StateScopeContext | undefined,
+  active: StateScopeContext,
+): Promise<StateScopeContext> {
+  if (requested === undefined) return active;
+  if (source.resolveProjectionContext !== undefined) {
+    const authorized = await source.resolveProjectionContext(requested);
+    if (authorized.chatId !== requested.chatId ||
+        authorized.actorId !== requested.actorId ||
+        authorized.groupId !== requested.groupId) {
+      throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+    }
+    return authorized;
+  }
+  if (requested.chatId !== active.chatId || requested.groupId !== active.groupId) {
+    throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+  }
+  if (active.groupId === null) {
+    if (requested.actorId !== active.actorId) {
+      throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+    }
+    return active;
+  }
+  if (requested.actorId === null) return active;
+  if (source.listActorsForGroup === undefined) {
+    throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+  }
+  const member = (await source.listActorsForGroup(active.groupId)).find(
+    (actor) => actor.characterId === requested.actorId,
+  );
+  if (member === undefined) {
+    throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+  }
+  return {
+    chatId: active.chatId,
+    actorId: member.characterId,
+    groupId: active.groupId,
+    actorName: member.name,
+  };
 }
 
 function validateRecordRequest(request: QueryRequest): void {

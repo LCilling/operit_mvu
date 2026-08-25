@@ -249,6 +249,9 @@ function createSource(dataset, overrides = {}) {
       async listActors() {
         return structuredClone(actors);
       },
+      async listActorsForGroup() {
+        return structuredClone(actors);
+      },
       async listGroups() {
         return structuredClone(groups);
       },
@@ -378,12 +381,18 @@ test("field queries and detail honor an explicit UI projection context", async (
   const fixture = createSource(dataset, {
     queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
   });
-  const service = new MvuQueryService(fixture.source, fixture.options);
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async listActorsForGroup(groupId) {
+      assert.equal(groupId, "group_000");
+      return makeActors().slice(0, 2);
+    },
+  }, fixture.options);
   const scopeContext = {
     chatId: "chat_main",
     actorId: "actor_001",
     groupId: "group_000",
-    actorName: "Actor 001",
+    actorName: "Untrusted display name",
   };
 
   const list = await service.queryFields({ page: 1, scopeContext });
@@ -402,6 +411,44 @@ test("field queries and detail honor an explicit UI projection context", async (
     () => MVU_REQUEST_PARSERS.getEntityById({ entityType: "actor", id: "actor_001", scopeContext }),
     /MVU_GET_ENTITY_REQUEST_INVALID/,
   );
+  for (const unauthorized of [
+    { ...scopeContext, chatId: "chat_other" },
+    { ...scopeContext, groupId: "group_001" },
+    { ...scopeContext, actorId: "actor_002" },
+  ]) {
+    await assert.rejects(
+      service.queryFields({ page: 1, scopeContext: unauthorized }),
+      /MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED/,
+    );
+    await assert.rejects(
+      service.getEntityById({ entityType: "field", id: "field_0000", scopeContext: unauthorized }),
+      /MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED/,
+    );
+  }
+});
+
+test("an authoritative host resolver permits another selected group without trusting its labels", async () => {
+  const dataset = makeDataset();
+  dataset.fields = [{ ...field(0), scope: "character", bindingIds: ["actor_002"] }];
+  dataset.stateValues["character:actor_002"] = { field_0000: 73 };
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const requested = {
+    chatId: "chat_group_001", actorId: "actor_002", groupId: "group_001", actorName: "Spoofed",
+  };
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async resolveProjectionContext(value) {
+      assert.deepEqual(value, requested);
+      return { ...requested, actorName: "Actor 002" };
+    },
+  }, fixture.options);
+
+  const page = await service.queryFields({ page: 1, scopeContext: requested });
+
+  assert.equal(page.items[0].currentValue, 73);
+  assert.equal(page.items[0].scopeKey, "character:actor_002");
 });
 
 test("group membership filtering is server-owned and cursor tokens cannot be reused", async () => {

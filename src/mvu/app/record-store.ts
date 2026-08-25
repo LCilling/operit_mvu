@@ -5,6 +5,7 @@ import { assertDataChangeRecord } from "./validation";
 
 export const RECORDS_PER_SEGMENT = 500;
 const RECORD_PARTIAL_READ_INITIAL_LINES = 32;
+const MAX_RECORD_STORED_LINE_CODE_UNITS = 32_000;
 const MAX_SEGMENT_SCAN_COUNT = 1_024;
 const MAX_LATEST_CHANGE_TARGETS = 100_000;
 
@@ -79,7 +80,10 @@ export class SegmentedRecordStore {
   ): Promise<StagedRecordWrite> {
     assertRecordManifest(currentManifest);
     requireRevision(commitRevision);
-    for (const record of records) assertDataChangeRecord(record);
+    for (const record of records) {
+      assertDataChangeRecord(record);
+      serializeStoredRecordLine(record, commitRevision);
+    }
     if (records.length === 0) {
       return { manifest: cloneManifest(currentManifest), touchedSegmentPaths: [] };
     }
@@ -99,10 +103,8 @@ export class SegmentedRecordStore {
       const available = RECORDS_PER_SEGMENT - segment.committedLineCount;
       const chunk = records.slice(recordIndex, recordIndex + available);
       const path = this.segmentPath(segment.fileName);
-      const content = chunk.map((record) => JSON.stringify({
-        commitRevision,
-        record,
-      } satisfies StoredRecordLine)).join("\n") + "\n";
+      const content = chunk.map((record) =>
+        serializeStoredRecordLine(record, commitRevision)).join("\n") + "\n";
       if (!Number.isSafeInteger(manifest.recordCount + chunk.length)) {
         throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
       }
@@ -375,29 +377,31 @@ export class SegmentedRecordStore {
     for (let chunkStart = firstLine; chunkStart <= lastLine;
       chunkStart += RECORD_PARTIAL_READ_INITIAL_LINES) {
       const chunkEnd = Math.min(lastLine, chunkStart + RECORD_PARTIAL_READ_INITIAL_LINES - 1);
-      const content = await this.files.readTextPart(
-        this.segmentPath(fileName),
-        chunkStart,
-        chunkEnd,
-      );
-      if (hasPartialReadTruncationMarker(content)) {
-        return this.readStoredLineRangeFromFullFile(fileName, firstLine, lastLine);
-      }
-      lines.push(...parsePartialLines(content, fileName, chunkStart, chunkEnd));
+      lines.push(...await this.readStoredLineChunk(fileName, chunkStart, chunkEnd));
     }
     return lines;
   }
 
-  private async readStoredLineRangeFromFullFile(
+  private async readStoredLineChunk(
     fileName: string,
     firstLine: number,
     lastLine: number,
   ): Promise<string[]> {
-    const lines = splitLines(await this.files.readText(this.segmentPath(fileName)));
-    if (lines.length < lastLine) {
-      throw new Error(`MVU_V3_RECORD_SEGMENT_SHORT:${fileName}`);
+    const content = await this.files.readTextPart(
+      this.segmentPath(fileName),
+      firstLine,
+      lastLine,
+    );
+    if (!hasPartialReadTruncationMarker(content)) {
+      return parsePartialLines(content, fileName, firstLine, lastLine);
     }
-    return lines.slice(firstLine - 1, lastLine);
+    if (firstLine === lastLine) {
+      throw new Error(`MVU_V3_RECORD_LINE_TOO_LARGE:${fileName}:${firstLine}`);
+    }
+    const midpoint = Math.floor((firstLine + lastLine) / 2);
+    const left = await this.readStoredLineChunk(fileName, firstLine, midpoint);
+    const right = await this.readStoredLineChunk(fileName, midpoint + 1, lastLine);
+    return [...left, ...right];
   }
 
   async deleteSegments(manifest: RecordManifest): Promise<void> {
@@ -661,6 +665,14 @@ function parsePartialLines(
 
 function hasPartialReadTruncationMarker(content: string): boolean {
   return splitLines(content).some((line) => line === "... (file content truncated) ...");
+}
+
+function serializeStoredRecordLine(record: DataChangeRecord, commitRevision: number): string {
+  const line = JSON.stringify({ commitRevision, record } satisfies StoredRecordLine);
+  if (line.length > MAX_RECORD_STORED_LINE_CODE_UNITS) {
+    throw new Error(`MVU_V3_RECORD_LINE_TOO_LARGE:${record.id}`);
+  }
+  return line;
 }
 
 function requireRevision(value: number): void {

@@ -1129,7 +1129,7 @@
     return message.length > 180 ? message.slice(0, 180) + "…" : message;
   }
 
-  async function hydrateConditionRows(conditions) {
+  async function hydrateConditionRows(conditions, isCurrent) {
     const queue = conditions.slice();
     async function hydrateNextCondition() {
       while (queue.length > 0) {
@@ -1144,7 +1144,7 @@
         } catch (error) {
           meta.error = error instanceof Error ? error.message : String(error);
         }
-        ui.state.conditionMeta.set(condition.id, meta);
+        if (!isCurrent || isCurrent()) ui.state.conditionMeta.set(condition.id, meta);
       }
     }
     const workerCount = Math.min(CONDITION_REFERENCE_WORKER_LIMIT, queue.length);
@@ -2455,6 +2455,7 @@
       if (nextMode) ui.state.statusMode = nextMode;
       await ui.transition(function () { render({ resetScroll: false }); });
     } catch (error) {
+      if (error instanceof Error && error.message === "MVU_SNAPSHOT_REQUEST_SUPERSEDED") return;
       ui.showFatal(error);
     } finally {
       setBusy(false);
