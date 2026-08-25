@@ -18,7 +18,10 @@ import type {
   RuleActionV3,
   RuleDefinitionV3,
 } from "./model-v3";
-import { V3_EFFECT_REASON_TEMPLATES } from "./model-v3";
+import {
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
+  V3_EFFECT_REASON_TEMPLATES,
+} from "./model-v3";
 import {
   assertRecordManifest,
   createEmptyRecordManifest,
@@ -238,6 +241,7 @@ export class V3MvuStore implements MvuStore {
       const currentRecords = await this.readCompatibilityRecords(current.dataset);
       const projected = compatibilityDataset(current.dataset, currentRecords);
       assertMvuDataset(next);
+      assertCompatibilityEffectReasonEdits(projected.temporaryEffects, next.temporaryEffects);
       const merged = mergeCompatibilityDataset(current.dataset, projected, next, this.now());
       const recordMutation = compatibilityRecordMutation(currentRecords, next.records);
       const committed = await this.commitLoaded(
@@ -1328,6 +1332,20 @@ function sameEffectReasonTuple(left: DataTemporaryEffect, right: DataTemporaryEf
   return left.reasonMode === right.reasonMode &&
     left.reasonTemplate === right.reasonTemplate &&
     left.reason === right.reason;
+}
+
+function assertCompatibilityEffectReasonEdits(
+  authoritative: readonly DataTemporaryEffect[],
+  next: readonly DataTemporaryEffect[],
+): void {
+  const authoritativeById = new Map(authoritative.map((effect) => [effect.id, effect]));
+  for (const effect of next) {
+    const existing = authoritativeById.get(effect.id);
+    if ((existing === undefined || !sameEffectReasonTuple(existing, effect)) &&
+      effect.reason.length > EFFECT_REASON_SOURCE_MAX_LENGTH) {
+      throw new Error("MVU_EFFECT_REASON_TOO_LONG");
+    }
+  }
 }
 
 function sameEffectInstanceProjection(left: DataTemporaryEffect, right: DataTemporaryEffect): boolean {

@@ -836,6 +836,78 @@ test("legacy IPC and service enforce 512 only when the authoritative reason tupl
   assert.equal(authoritativeReasonTuple.reason, overEditLimit);
 });
 
+test("V3MvuStore compatibility transact rejects a changed 513-unit reason without changing revision or data", async () => {
+  const historicalReason = "旧".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 88);
+  const legacyV2 = legacyDatasetFixture();
+  legacyV2.temporaryEffects[0].reasonMode = "custom";
+  legacyV2.temporaryEffects[0].reason = historicalReason;
+  const files = filesWithV2(legacyV2);
+  const store = v3Store(files, legacyV2);
+  await store.initialize();
+  const before = await store.readV3();
+  const rawBefore = files.snapshot()[V3_PATH];
+  const compatibility = await store.read();
+  const next = structuredClone(compatibility.dataset);
+  next.temporaryEffects[0].reason = "新".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 1);
+
+  await assert.rejects(
+    store.transact(compatibility.revision, next),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+  assert.deepEqual(await store.readV3(), before);
+  assert.equal(files.snapshot()[V3_PATH], rawBefore);
+});
+
+test("V3MvuStore compatibility transact rejects a changed reason above the legacy ceiling instead of truncating", async () => {
+  const legacyV2 = legacyDatasetFixture();
+  legacyV2.temporaryEffects[0].reasonMode = "custom";
+  legacyV2.temporaryEffects[0].reason = "旧原因";
+  const files = filesWithV2(legacyV2);
+  const store = v3Store(files, legacyV2);
+  await store.initialize();
+  const before = await store.readV3();
+  const rawBefore = files.snapshot()[V3_PATH];
+  const compatibility = await store.read();
+  const next = structuredClone(compatibility.dataset);
+  next.temporaryEffects[0].reason = "病".repeat(EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH + 1);
+
+  await assert.rejects(
+    store.transact(compatibility.revision, next),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+  assert.deepEqual(await store.readV3(), before);
+  assert.equal(files.snapshot()[V3_PATH], rawBefore);
+});
+
+test("V3MvuStore compatibility transact preserves an unchanged historical reason through restart", async () => {
+  const historicalReason = "旧".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 88);
+  const legacyV2 = legacyDatasetFixture();
+  legacyV2.temporaryEffects[0].reasonMode = "custom";
+  legacyV2.temporaryEffects[0].reasonTemplate = "relationship";
+  legacyV2.temporaryEffects[0].reason = historicalReason;
+  const files = filesWithV2(legacyV2);
+  const store = v3Store(files, legacyV2);
+  await store.initialize();
+  const compatibility = await store.read();
+  const authoritativeTuple = {
+    reasonMode: compatibility.dataset.temporaryEffects[0].reasonMode,
+    reasonTemplate: compatibility.dataset.temporaryEffects[0].reasonTemplate,
+    reason: compatibility.dataset.temporaryEffects[0].reason,
+  };
+  const next = structuredClone(compatibility.dataset);
+  next.settings.aiEnabled = !next.settings.aiEnabled;
+
+  const committed = await store.transact(compatibility.revision, next);
+  assert.equal(committed.revision, compatibility.revision + 1);
+  const restarted = await v3Store(files, legacyV2).read();
+  assert.deepEqual({
+    reasonMode: restarted.dataset.temporaryEffects[0].reasonMode,
+    reasonTemplate: restarted.dataset.temporaryEffects[0].reasonTemplate,
+    reason: restarted.dataset.temporaryEffects[0].reason,
+  }, authoritativeTuple);
+  assert.equal(authoritativeTuple.reason, historicalReason);
+});
+
 test("new query API keeps the 512 source limit while legacy definitions remain activatable", async () => {
   const files = filesWithV2();
   const store = v3Store(files);

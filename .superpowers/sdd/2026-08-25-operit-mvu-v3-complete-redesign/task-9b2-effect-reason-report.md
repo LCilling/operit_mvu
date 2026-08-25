@@ -54,6 +54,8 @@ An unchanged old-v3 file reports the same warnings on each initialize/restart. T
 - `updateTemporaryEffect` parser permits reason text through the 16,384 compatibility ceiling so an unchanged historical reason can reach the authoritative service comparison. Text above 16,384 is rejected and is never silently truncated.
 - The service reads the stored effect, applies the patch to a clone, and compares the resulting `(reasonMode, reasonTemplate, reason)` tuple with the authoritative tuple. If any tuple member changes, the resulting source must be at most 512. An unrelated patch, including one that repeats the same 513–16,384 text byte-for-byte, round-trips safely.
 - Compatibility reconciliation uses the same tuple comparison before replacing `EffectGroupDefinition.defaultReason`, preventing unrelated v2 edits from degrading a richer v3 product template.
+- The public `V3MvuStore.transact` compatibility boundary performs that authoritative tuple comparison before v2-to-v3 migration. New effects and changed tuples above 512 are rejected, including text above 16,384, so migration cannot silently truncate an attempted edit or advance the revision. An unchanged authoritative 513–16,384-unit tuple remains valid and survives an unrelated transaction plus restart byte-for-byte.
+- Compatibility migration currently emits only effect-reason warnings. Oversized attempted reason alterations are rejected before migration; warnings computed while reconciling untouched compatibility projections do not replace the authoritative v3 reason or active snapshot.
 
 ## Activation, immutability, and bounds
 
@@ -69,15 +71,17 @@ The first RED run, before production changes, produced 11 expected failures out 
 
 1. prototype key `toString` was incorrectly accepted by the v3 persisted validator;
 2. v2 active-reason truncation lacked a migration warning; and
-3. update IPC incorrectly rejected an unchanged 513–16,384-unit legacy reason before the service could compare authoritative state.
+3. update IPC incorrectly rejected an unchanged 513–16,384-unit legacy reason before the service could compare authoritative state; and
+4. public `V3MvuStore.transact` accepted both a changed 513-unit reason and a changed 16,385-unit reason. The dedicated RED run was 17/19 pass with exactly those two failures, while the unchanged-history restart test already passed.
 
 Final verification evidence collected on the completed backend tree:
 
-- `node --test tests/effect-reason-config.test.mjs`: 16/16 pass.
-- Related effect/query/store/rule matrix: 138/138 pass.
-- `pnpm run check` passed at the completed-backend checkpoint, including 237/237 Node tests and 4/4 DOM gate tests. A later pre-commit rerun was blocked before backend typecheck by concurrent `static/**` work failing one `audit-v3-ui` rule: `complete effect-group DTOs must fail closed without an exact bounded defaultReason`.
-- On the latest shared-tree state, `pnpm run typecheck`, `pnpm run audit:effects`, and the 138-test related backend matrix pass independently.
-- `pnpm run build` passed after the backend refactor, including all audits, typecheck, effects audit, and web build, before the later concurrent UI change introduced the audit failure above.
+- `pnpm run typecheck`: pass on the final store-boundary fix.
+- `node --test tests/effect-reason-config.test.mjs`: 19/19 pass.
+- Related effect/query/store/rule matrix: 141/141 pass.
+- `pnpm run audit:effects`: pass.
+- `pnpm run check`: pass on the final shared-tree state, including 240/240 Node tests and 4/4 DOM gate tests.
+- `pnpm run build`: pass, including manifest/web/v3 UI audits, typecheck, effects audit, and web build.
 
 ## Task 9B UI carry (intentionally not changed here)
 
