@@ -1,4 +1,5 @@
 /** Operit ToolPkg entry point for the MVU dynamic-state plugin. */
+import { assertOperitHostCompatibility } from "./host-compat";
 import webContainerScreen from "./ui/web_container/index.ui.js";
 import {
   createRuntime,
@@ -65,6 +66,7 @@ function ensureIpcInstalled(): void {
 }
 
 export function registerToolPkg(): boolean {
+  assertOperitHostCompatibility(ToolPkg, Tools);
   // Install IPC before publishing the route so its first WebView request cannot race registration.
   ensureIpcInstalled();
 
@@ -109,6 +111,7 @@ export function registerToolPkg(): boolean {
 
 export async function onApplicationCreate(): Promise<{ ok: boolean }> {
   try {
+    assertOperitHostCompatibility(ToolPkg, Tools);
     await ensureRuntime().initialize();
     ensureSystemModel();
     ensureIpcInstalled();
