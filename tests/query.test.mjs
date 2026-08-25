@@ -516,7 +516,15 @@ test("typed IPC exposes every query and v3 condition effect-group and rule opera
 });
 
 test("compact snapshot contains summaries counts and first pages without option arrays or full history", async () => {
-  const fixture = createSource(makeDataset(), {
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.fields[0].bindingIds = ["actor_000"];
+  dataset.fields[0].stages = [
+    { id: "stage_low", name: "Low", description: "Low state", threshold: 0 },
+    { id: "stage_high", name: "High", description: "High state", threshold: 40 },
+  ];
+  dataset.stateValues["character:actor_000"] = { field_0000: 48 };
+  const fixture = createSource(dataset, {
     queryCommittedRecords: async ({ offset, limit }) => ({
       items: Array.from({ length: limit }, (_, index) => record(100_000 - 1 - offset - index)),
       loadedCount: limit,
@@ -544,9 +552,70 @@ test("compact snapshot contains summaries counts and first pages without option 
   });
   assert.equal(snapshot.selected.actor.characterId, "actor_000");
   assert.equal(snapshot.selected.group.characterGroupId, "group_000");
+  const projectedField = snapshot.pages.fields.items.find((item) => item.id === "field_0000");
+  assert.deepEqual(projectedField.current, {
+    value: 48,
+    stage: { id: "stage_high", name: "High", threshold: 40 },
+    scopeKey: "character:actor_000",
+    actorId: "actor_000",
+    groupId: "group_000",
+    chatId: "chat_main",
+  });
+  assert.deepEqual(projectedField.range, { minimum: 0, maximum: 100, step: 1 });
+  assert.deepEqual(projectedField.theme, { icon: dataset.fields[0].icon, color: dataset.fields[0].themeColor });
+  assert.equal("stages" in projectedField, false);
+  assert.equal("bindingIds" in projectedField, false);
+  assert.equal("ai" in projectedField, false);
+  assert.equal("actions" in snapshot.pages.rules.items[0], false);
+  assert.equal("expression" in snapshot.pages.conditions.items[0], false);
+  assert.equal("fieldEffects" in snapshot.pages.effectGroups.items[0], false);
+  assert.equal("ruleIds" in snapshot.pages.records.items[0], false);
+  assert.equal("effectIds" in snapshot.pages.records.items[0], false);
+  assert.ok(JSON.stringify(snapshot).length < 24_000);
   assert.equal("actors" in snapshot, false);
   assert.equal("groups" in snapshot, false);
   assert.equal("records" in snapshot, false);
+});
+
+test("condition and effect references are exact bounded pages including active instances", async () => {
+  const dataset = makeDataset();
+  dataset.conditions = [condition(0)];
+  dataset.effectGroups = [effectGroup(0)];
+  dataset.rules = Array.from({ length: 25 }, (_, index) => ({
+    ...rule(index),
+    conditionId: "condition_0000",
+    actions: [{ kind: "activate_effect_group", effectGroupId: "effect_0000" }],
+  }));
+  dataset.activeEffects = Array.from({ length: 23 }, (_, index) => ({
+    id: `active_effect_${String(index).padStart(3, "0")}`,
+    definitionId: "effect_0000",
+    resolvedTargets: [{
+      fieldId: "field_0000",
+      actorId: "actor_t",
+      scope: "character",
+      scopeKey: "character:actor_t",
+    }],
+    duration: { expiresAt: null, remainingTurns: null },
+    activatedAt: new Date(NOW + index).toISOString(),
+    reason: { mode: "custom", template: "general", text: `instance ${index}` },
+  }));
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+
+  const conditionPage1 = await service.getConditionReferences({ id: "condition_0000", page: 1 });
+  const conditionPage3 = await service.getConditionReferences({ id: "condition_0000", page: 3 });
+  assertExactResponse(conditionPage1, { totalCount: 25, hasMore: true });
+  assert.equal(conditionPage1.items.length, 10);
+  assert.equal(conditionPage3.items.length, 5);
+
+  const effectPage1 = await service.getEffectGroupReferences({ id: "effect_0000", page: 1 });
+  const effectPage5 = await service.getEffectGroupReferences({ id: "effect_0000", page: 5 });
+  assertExactResponse(effectPage1, { totalCount: 48, hasMore: true });
+  assert.equal(effectPage1.items.length, 10);
+  assert.equal(effectPage1.items.every((item) => item.relation === "active_instance"), true);
+  assert.equal(effectPage5.items.length, 8);
 });
 
 test("entity lookup is type-scoped and cannot become a file or cross-owner accessor", async () => {

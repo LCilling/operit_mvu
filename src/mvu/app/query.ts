@@ -115,6 +115,69 @@ export interface MvuQueryServiceOptions {
   cursorCapacity?: number;
 }
 
+export interface FieldPageSummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  scope: DataField["scope"];
+  order: number;
+  range: { minimum: number; maximum: number; step: number };
+  theme: { icon: string; color: string };
+  current: {
+    value: number;
+    stage: { id: string; name: string; threshold: number };
+    scopeKey: string;
+    actorId: string | null;
+    groupId: string | null;
+    chatId: string | null;
+  } | null;
+}
+
+export interface RulePageSummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  conditionId: string;
+  actionCount: number;
+  executionOrder: number;
+  updatedAt: string;
+}
+
+export interface ConditionPageSummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  rootKind: ConditionExpression["kind"];
+  updatedAt: string;
+}
+
+export interface EffectGroupPageSummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  fieldCount: number;
+  updatedAt: string;
+}
+
+export interface RecordPageSummary {
+  id: string;
+  fieldId: string;
+  fieldName: string;
+  actorId: string | null;
+  actorName: string;
+  groupId: string | null;
+  before: number;
+  after: number;
+  delta: number;
+  reason: string;
+  source: DataChangeRecord["source"];
+  occurredAt: number;
+}
+
 export interface MvuCompactPageSnapshot {
   revision: number;
   activeContext: StateScopeContext;
@@ -134,11 +197,11 @@ export interface MvuCompactPageSnapshot {
     group: QueryGroup | null;
   };
   pages: {
-    fields: QueryResponse<DataField>;
-    rules: QueryResponse<RuleDefinitionV3>;
-    conditions: QueryResponse<ConditionDefinition>;
-    effectGroups: QueryResponse<EffectGroupDefinition>;
-    records: QueryResponse<DataChangeRecord>;
+    fields: QueryResponse<FieldPageSummary>;
+    rules: QueryResponse<RulePageSummary>;
+    conditions: QueryResponse<ConditionPageSummary>;
+    effectGroups: QueryResponse<EffectGroupPageSummary>;
+    records: QueryResponse<RecordPageSummary>;
   };
 }
 
@@ -432,7 +495,13 @@ export class MvuQueryService {
           ? null
           : klona(groups.find((item) => item.characterGroupId === activeContext.groupId) ?? null),
       },
-      pages: { fields, rules, conditions, effectGroups, records },
+      pages: {
+        fields: mapQueryResponse(fields, (field) => summarizeField(field, dataset, activeContext)),
+        rules: mapQueryResponse(rules, summarizeRule),
+        conditions: mapQueryResponse(conditions, summarizeCondition),
+        effectGroups: mapQueryResponse(effectGroups, summarizeEffectGroup),
+        records: mapQueryResponse(records, summarizeRecord),
+      },
     };
   }
 
@@ -976,6 +1045,120 @@ function requireEntityId(id: string): void {
 function sortReferences(references: EntityReferenceSummary[]): EntityReferenceSummary[] {
   return references.sort((left, right) =>
     compareText(left.entityType, right.entityType) || compareRawId(left.id, right.id));
+}
+
+function mapQueryResponse<TSource, TResult>(
+  response: QueryResponse<TSource>,
+  map: (item: TSource) => TResult,
+): QueryResponse<TResult> {
+  return {
+    items: response.items.map(map),
+    loadedCount: response.loadedCount,
+    totalCount: response.totalCount,
+    hasMore: response.hasMore,
+    nextCursor: response.nextCursor,
+  };
+}
+
+function summarizeField(
+  field: DataField,
+  dataset: MvuDatasetV3,
+  context: StateScopeContext,
+): FieldPageSummary {
+  const scopeKey = contextScopeKey(field, context);
+  const value = scopeKey === null
+    ? null
+    : dataset.stateValues[scopeKey]?.[field.id] ?? field.initialValue;
+  const stage = value === null ? null : stageForValue(field, value);
+  return {
+    id: field.id,
+    name: field.name,
+    description: field.description,
+    enabled: field.enabled,
+    scope: field.scope,
+    order: field.order,
+    range: { minimum: field.minimum, maximum: field.maximum, step: field.step },
+    theme: { icon: field.icon, color: field.themeColor },
+    current: scopeKey === null || value === null || stage === null ? null : {
+      value,
+      stage: { id: stage.id, name: stage.name, threshold: stage.threshold },
+      scopeKey,
+      actorId: context.actorId,
+      groupId: context.groupId,
+      chatId: context.chatId,
+    },
+  };
+}
+
+function contextScopeKey(field: DataField, context: StateScopeContext): string | null {
+  if (field.scope === "global") return "global";
+  const bindingId = field.scope === "character"
+    ? context.actorId
+    : field.scope === "group"
+      ? context.groupId
+      : context.chatId;
+  if (bindingId === null || !field.bindingIds.includes(bindingId)) return null;
+  return `${field.scope}:${bindingId}`;
+}
+
+function stageForValue(field: DataField, value: number): DataField["stages"][number] | null {
+  let matched: DataField["stages"][number] | null = null;
+  for (const stage of field.stages) {
+    if (stage.threshold <= value && (matched === null || stage.threshold > matched.threshold)) matched = stage;
+  }
+  return matched;
+}
+
+function summarizeRule(rule: RuleDefinitionV3): RulePageSummary {
+  return {
+    id: rule.id,
+    name: rule.name,
+    description: rule.description,
+    enabled: rule.enabled,
+    conditionId: rule.conditionId,
+    actionCount: rule.actions.length,
+    executionOrder: rule.executionOrder,
+    updatedAt: rule.updatedAt,
+  };
+}
+
+function summarizeCondition(condition: ConditionDefinition): ConditionPageSummary {
+  return {
+    id: condition.id,
+    name: condition.name,
+    description: condition.description,
+    enabled: condition.enabled,
+    rootKind: condition.expression.kind,
+    updatedAt: condition.updatedAt,
+  };
+}
+
+function summarizeEffectGroup(effectGroup: EffectGroupDefinition): EffectGroupPageSummary {
+  return {
+    id: effectGroup.id,
+    name: effectGroup.name,
+    description: effectGroup.description,
+    enabled: effectGroup.enabled,
+    fieldCount: effectGroup.fieldEffects.length,
+    updatedAt: effectGroup.updatedAt,
+  };
+}
+
+function summarizeRecord(record: DataChangeRecord): RecordPageSummary {
+  return {
+    id: record.id,
+    fieldId: record.fieldId,
+    fieldName: record.fieldName,
+    actorId: record.actorId,
+    actorName: record.actorName,
+    groupId: record.groupId,
+    before: record.before,
+    after: record.after,
+    delta: record.delta,
+    reason: record.reason,
+    source: record.source,
+    occurredAt: record.occurredAt,
+  };
 }
 
 function pageReferences(
