@@ -460,6 +460,56 @@ test("range validation disables unchanged input and previews proportional mappin
   assert.match(ui.validateFieldRangeDraft(field, { minimum: 1e15, maximum: 1e15 + 1 }, 48).error, /精度|跨度/);
 });
 
+test("empty and whitespace range inputs are invalid before numeric coercion", async () => {
+  const { context, ui, elements } = createHarness();
+  ui.native.call = async (method) => method === "snapshot" ? validSnapshot() : page([]);
+  vm.runInContext(appSource, context, { filename: "app.js" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const field = validFieldEntity();
+
+  for (const minimum of ["", "   ", "\t\n"]) {
+    const result = ui.validateFieldRangeDraft(field, { minimum, maximum: "100" }, 48);
+    assert.match(result.error, /有效|上下限/);
+    assert.equal(result.previewValue, null);
+  }
+
+  ui.state.entities.set("field:field_a", field);
+  ui.state.snapshot = validSnapshot();
+  const card = new context.Element();
+  card.dataset = { rangeCard: "field_a" };
+  const minimumInput = { value: "   " };
+  const maximumInput = { value: "100" };
+  const errorNode = { textContent: "" };
+  const saveButton = { disabled: false };
+  const previewNode = { textContent: "" };
+  card.querySelector = (selector) => ({
+    '[data-range-number="minimum"]': minimumInput,
+    '[data-range-number="maximum"]': maximumInput,
+    "[data-range-error]": errorNode,
+    '[data-action="save-field-range"]': saveButton,
+    "[data-range-preview]": previewNode,
+  })[selector] || null;
+  const input = new context.Element();
+  input.closest = (selector) => selector === "[data-range-number]" ? input :
+    selector === "[data-range-card]" ? card : null;
+  elements.get("appRoot").listeners.get("input")({ target: input });
+
+  assert.match(errorNode.textContent, /有效|上下限/);
+  assert.equal(saveButton.disabled, true);
+  assert.equal(previewNode.textContent, "换算后 —");
+});
+
+test("reduced motion removes spatial motion without blanket 0.01ms overrides", () => {
+  const start = stylesSource.search(/@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  assert.ok(start >= 0);
+  const reduced = stylesSource.slice(start);
+  assert.doesNotMatch(reduced, /\*,\s*\*::before|\*::after/);
+  assert.doesNotMatch(reduced, /0\.01ms/);
+  assert.match(reduced, /::view-transition-(?:group|old|new)[^{]*\{[^}]*animation:\s*none/);
+  assert.match(reduced, /\.drawer[^}]*\{[^}]*animation:\s*none/);
+  assert.match(runtimeSource, /prefers-reduced-motion:\s*reduce[\s\S]*?update\(\)/);
+});
+
 test("build reports the actual UTF-8 byte length", async () => {
   const root = new URL("..", import.meta.url);
   const { stdout } = await execFileAsync(process.execPath, ["scripts/build-web.mjs"], { cwd: root });
@@ -487,6 +537,8 @@ test("stage names dots and thresholds share exact normalized positions for arbit
   assert.match(html, /class="stage-marker active" style="--stage-position:10%/);
   assert.match(html, /class="stage-marker edge-end" style="--stage-position:90%/);
   assert.doesNotMatch(stylesSource, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/);
+  assert.match(stylesSource, /\.stage-map\s*\{[^}]*margin:\s*24px 7px 0;/);
+  assert.match(stylesSource, /\.stage-marker\[data-stage-lane="1"\]\s+\.stage-name\s*\{[^}]*translateY\(-24px\)/);
 });
 
 test("field detail requests bounded records for its field and exact scope", async () => {
