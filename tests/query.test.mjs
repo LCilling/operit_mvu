@@ -435,7 +435,7 @@ test("an authoritative host resolver permits another selected group without trus
     queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
   });
   const requested = {
-    chatId: "chat_group_001", actorId: "actor_002", groupId: "group_001", actorName: "Spoofed",
+    chatId: null, actorId: "actor_002", groupId: "group_001", actorName: "Spoofed",
   };
   const service = new MvuQueryService({
     ...fixture.source,
@@ -449,6 +449,14 @@ test("an authoritative host resolver permits another selected group without trus
 
   assert.equal(page.items[0].currentValue, 73);
   assert.equal(page.items[0].scopeKey, "character:actor_002");
+
+  await assert.rejects(
+    service.queryFields({
+      page: 1,
+      scopeContext: { chatId: null, actorId: null, groupId: null, actorName: "No scope" },
+    }),
+    /MVU_QUERY_SCOPE_CONTEXT_INVALID/,
+  );
 });
 
 test("group membership filtering is server-owned and cursor tokens cannot be reused", async () => {

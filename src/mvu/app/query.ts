@@ -1274,7 +1274,8 @@ function validateProjectionContext(value: StateScopeContext | undefined): void {
   if (value === undefined) return;
   if (typeof value !== "object" || value === null ||
     Object.keys(value).length !== 4 ||
-    typeof value.chatId !== "string" || value.chatId.length === 0 ||
+    (value.chatId !== null && (typeof value.chatId !== "string" || value.chatId.length === 0)) ||
+    (value.chatId === null && value.groupId === null) ||
     (value.actorId !== null && (typeof value.actorId !== "string" || value.actorId.length === 0)) ||
     (value.groupId !== null && (typeof value.groupId !== "string" || value.groupId.length === 0)) ||
     typeof value.actorName !== "string") {
