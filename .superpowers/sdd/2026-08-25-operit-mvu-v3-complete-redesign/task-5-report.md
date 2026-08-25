@@ -579,3 +579,112 @@ The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICA
 - Explicit export is intentionally O(total committed history), materializes the v2 JSON document, and holds the in-runtime path queue for a consistent manifest. Ordinary message/UI compatibility paths remain bounded; very large exports may consume substantial time and memory.
 - Atomic durability still depends on the host's declared same-directory `files.atomic_replace` capability. Tests prove the adapter's checked ordering and failure behavior, not lower-level device filesystem internals.
 - No code-review subagent dispatcher was available. The direct full-diff audit found and fixed the valid-v3 force-retry issue, but this remains a process limitation rather than an independent review.
+
+## Review round 4 fix — 2026-08-25
+
+### Starting state and Critical root cause
+
+- Round-4 starting `HEAD`: `eb50ca17385bbac751518ef6b8635b6972d41869`; branch and linked worktree were verified before edits. Existing commits and ignored artifacts were preserved; `progress.md` was not edited.
+- Baseline `pnpm run check` passed 91 tests, with 91 pass, 0 fail, 0 skipped, and 0 todo.
+- Round 4 verified that valid config and committed-record validation completed before `resumeSegmentCleanup()`, but both operations still shared `initializeAttempt()`'s outer migration catch. A delete rejection therefore returned `v2_compat` even though v3 remained valid and atomically published.
+- The compatibility service then accepted writes into stale v2. A later initialization rediscovered v3 and made those apparently successful v2 mutations disappear.
+- Mutation preflight also awaited cleanup as a required operation, so even after startup authority was corrected, a repeated delete failure prevented v3 commits.
+- Finally, cleanup journal matching required exact revision/manifest equality. Any later valid v3 commit made the old journal appear stale and caused its pending old paths to be abandoned.
+- This section supersedes round 3's incorrect claim that cleanup-only failure should return structured `v2_compat`. The correct contract is structured `mode: "v3"` with optional pending-cleanup status; migration retry is unavailable while valid v3 exists.
+
+### Honest round-4 RED evidence
+
+The direct-store and production-runtime regressions both failed before production edits at the same authority boundary:
+
+```text
+Command: node --test --test-name-pattern="valid v3 stays authoritative|production runtime keeps valid v3 authoritative" tests/record-store.test.mjs
+Result: exit 1; tests 2; pass 0; fail 2; skipped 0; todo 0
+Both failures: expected `v3`, actual `v2_compat` after injected `FAKE_DELETEFILE_FAILED` during startup cleanup.
+```
+
+TDD then applied only the startup-authority/status correction. That exposed the independent mutation defect before descendant matching or mutation recovery was changed:
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="valid v3 stays authoritative|production runtime keeps valid v3 authoritative" tests/record-store.test.mjs
+Result: exit 1; tests 2; pass 0; fail 2
+Both failures: `FAKE_DELETEFILE_FAILED` escaped mutation preflight, so direct `transactV3` and production `runtime.updateSettings` could not commit.
+```
+
+After cleanup preflight became best-effort and journal matching became descendant-aware:
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="valid v3 stays authoritative|production runtime keeps valid v3 authoritative" tests/record-store.test.mjs
+Result: exit 0; tests 2; pass 2; fail 0; skipped 0; todo 0
+```
+
+### Round-4 invariants and fixes
+
+- Valid v3 config plus committed records establish authority before superseded-segment cleanup. `tryResumeSegmentCleanup()` records cleanup errors but never routes validated v3 through migration fallback.
+- `MigrationStatus` in v3 mode may now include `{ cleanup: { state: "pending", error } }`. `migrationStatus()` decorates the authoritative v3 status from current cleanup state, allowing advanced/runtime consumers to distinguish maintenance warning from migration failure.
+- `retryMigration()` still checks the initialized mode. Cleanup-pending v3 remains `mode: "v3"`, so retry rejects with `MVU_V3_MIGRATION_RETRY_NOT_ALLOWED` and cannot rebuild from stale v2.
+- Mutation recovery validates any runtime-required record repair, then attempts pending superseded-file cleanup best-effort. A cleanup rejection remains structured pending state while the v3 CAS transaction proceeds normally.
+- A config-only descendant leaves the manifest exact at a later safe revision. An append descendant may extend only the prior final segment or allocate segments at/after the prior `nextSegmentIndex`; earlier segments remain exact. The matcher validates this lineage before cleanup.
+- Cleanup journal eligibility accepts either the exact expected publication or a strictly later proven descendant revision. A later revision whose manifest lineage cannot be proven retains the journal and reports pending error rather than deleting paths or silently abandoning cleanup.
+- Before any cleanup deletion, every journal path is still checked against the complete live manifest. A live path raises `MVU_V3_SEGMENT_CLEANUP_PROTECTED_PATH`; it is never deleted.
+- Direct-store coverage appends `record_9000` after repeated cleanup failure, proves the old journal revision is retained across the new config revision, then restarts and proves cleanup removes only the old segment while the appended record and v3 setting survive.
+- Production-runtime coverage uses the real Tools file adapter, starts with valid v3 plus injected cleanup failure, reads zero v3 records instead of 501 stale v2 records, commits `aiEnabled: false` to v3, preserves v2 bytes/revision, then restarts, clears the journal, and retains the v3 mutation.
+
+### Files and implementation commit
+
+- `src/mvu/app/store-v3.ts`
+- `tests/record-store.test.mjs`
+
+```text
+9a1b0bd2fd3553ddd13e10463461f7f716e4e7b0 fix: keep valid v3 authoritative during cleanup
+2 files changed, 177 insertions(+), 16 deletions(-)
+```
+
+### Exact round-4 GREEN verification
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="valid v3 stays authoritative|production runtime keeps valid v3 authoritative" tests/record-store.test.mjs
+Result: exit 0; tests 2; pass 2; fail 0; skipped 0; todo 0
+```
+
+```text
+Command: pnpm run check
+Result: exit 0
+- Manifest audit: PASS (`operit-toolpkg-host`, API 3, 7 capabilities)
+- UI audit: PASS (15 screens, 42 declared actions, 48 handled actions, 20 native methods)
+- TypeScript: PASS
+- Temporary-effect audit: PASS
+- Node tests: 92 total, 92 pass, 0 fail, 0 skipped, 0 todo
+```
+
+```text
+Command: pnpm run pack
+Result: exit 0
+- Manifest/UI/type/effect audits: PASS
+- Web build: `dist/app.html` 9,323,226 bytes
+- Package: `release/operit_mvu-2.0.1.toolpkg`, 54 entries, 9,944,486 bytes data
+```
+
+```text
+Command: git diff --check
+Result: exit 0; no output
+```
+
+### Round-4 acceptance matrix
+
+- [x] **Startup authority separated from cleanup.** Once v3 config and committed records validate, cleanup rejection is caught as maintenance state and cannot select `v2_compat`.
+- [x] **Structured pending cleanup.** V3 migration status exposes a pending state and exact structured error while all reads and production decisions remain on v3.
+- [x] **Mutation after cleanup failure.** Direct append and production runtime setting mutations commit to v3 after another injected delete failure; stale v2 bytes and revision remain exact and unchanged.
+- [x] **Journal preserved across revision.** Both regressions prove the original expected revision remains in the journal after a later v3 commit; no migration or config publication overwrites it.
+- [x] **Descendant cleanup recovery.** Later restart accepts exact-manifest config descendants and record-manifest append descendants, deletes only superseded absent paths, clears the journal, and preserves the intervening v3 mutations.
+- [x] **Never delete live paths.** Descendant lineage is validated and all journal paths are checked against the current manifest before the first deletion; the direct append remains queryable after cleanup.
+- [x] **Retry fails closed.** `retryMigration()` rejects while cleanup-pending valid v3 exists and cannot become a stale-v2 escape hatch.
+- [x] **Production and direct regressions.** Both paths inject startup and mutation cleanup failures, assert v3 reads/commits, restart, recover, clear the journal, and verify durable mutation visibility.
+- [x] **Prior suite preserved.** All 91 round-3 tests remain green; the added production regression raises the complete suite to 92/92.
+- [x] **Required verification.** Focused RED/GREEN, `pnpm run check`, `pnpm run pack`, and `git diff --check` are recorded above and pass.
+
+### Residual limitations after round 4
+
+- Cleanup warning state is runtime-local and refreshed by startup or mutation cleanup attempts. If another store instance clears the journal, an already-initialized idle instance can display a stale warning until its next attempt; v3 authority and persisted data are unaffected.
+- A later higher v3 revision whose record manifest cannot be proven as a descendant retains the cleanup journal and warning indefinitely rather than risking deletion. This is fail-closed and may require operator/host intervention.
+- Existing scope limitations remain: one persistent ToolPkg main runtime, no interprocess/external-writer CAS claim, no directory listing for arbitrary crash-temp reclamation, a 1,024-path cleanup bound, and explicit export's intentional O(total history) cost.
+- No code-review subagent dispatcher was available. A direct full-diff safety audit was performed before final verification; the absence of independent review remains a process limitation.
