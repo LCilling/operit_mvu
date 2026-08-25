@@ -436,3 +436,146 @@ The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICA
 - Recovery fails closed when a contiguous orphan/allocation run reaches the 1,024-path bound. It performs no orphan deletion in that case and may require host/operator cleanup rather than risking unbounded or partial destructive work.
 - The v2 compatibility projection cannot faithfully represent several distinct active-instance reasons or identify arbitrary multi-instance lifetime/target edits. It preserves the v3 instances and uses a neutral projection or explicit ambiguity error instead of silently collapsing data.
 - No subagent dispatcher was available for the requested independent code-review skill. A direct full-diff/acceptance audit found and fixed the partial-deletion ordering issue above; the lack of an independent reviewer remains a process limitation.
+
+## Review round 3 fix — 2026-08-25
+
+### Starting WIP and findings
+
+- Round-3 starting `HEAD`: `819ceb89ca9012f14be4ecd7856fd4eebb1d64aa`; branch `codex/mvu-v3-complete-redesign` and the requested linked worktree were verified before editing.
+- `pnpm run check` was GREEN at the round-2 baseline: 85 tests, 85 pass, 0 fail, 0 skipped, 0 todo. Existing commits and ignored SDD/build artifacts were preserved; `progress.md` was not edited.
+- Ordinary v3 compatibility reads correctly loaded only the newest 500 records, but production export called the same bounded runtime dataset API and therefore omitted older committed records.
+- Replacement and clear published a new manifest but had no durable record of the old committed paths, so superseded segment files were never reclaimed.
+- Unique record-stage, repair, v2 config, and v3 config paths cleaned up some publication failures, but their initial write was outside the rejection guard. A host write that wrote bytes and then rejected left a known owned temp behind.
+- The review specified no host directory-listing capability. The fix therefore uses exact transaction-owned paths and a bounded cleanup journal, without claiming that arbitrary crash leftovers can be discovered.
+
+### Honest round-3 RED evidence
+
+All five reviewer reproductions failed before production edits:
+
+```text
+Command: node --test --test-name-pattern="production IPC export|record replacement journals|partial superseded|cleanup journal whose|owned record" tests/record-store.test.mjs
+Result: exit 1; tests 5; pass 0; fail 5; skipped 0; todo 0
+Failures:
+- production IPC export: `500 !== 1001`
+- replacement ordering: cleanup journal was undefined before config publication
+- partial cleanup: `Missing expected rejection`
+- failed config publication: no cleanup journal was retained for restart reconciliation
+- write-then-reject: an owned `.stage` path remained (`true !== false`)
+```
+
+The first implementation GREEN run was:
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="production IPC export|record replacement journals|partial superseded|cleanup journal whose|owned record" tests/record-store.test.mjs
+Result: exit 0; tests 5; pass 5; fail 0; skipped 0; todo 0
+```
+
+The first full-suite attempt exposed a Windows ESM test-isolation problem, not a production persistence failure:
+
+```text
+Command: pnpm run check
+Result: exit 1; tests 90; pass 89; fail 1
+Failure: the second dynamic import of `dist/main.js` reused the already-registered module, so the new test could not capture a fresh `operit_mvu:export_dataset` handler.
+Correction: install the real production `installMvuIpc` handlers against the persistent runtime and real Tools adapter in the export test. Existing production-main registration coverage remains unchanged.
+```
+
+The required review gate had no subagent dispatcher in this session, so a direct full-diff audit was performed. It found an additional fail-closed retry defect and reproduced it before the fix:
+
+```text
+Command: node --test --test-name-pattern="retry after repeated cleanup failure" tests/record-store.test.mjs
+Result: exit 1; tests 1; pass 0; fail 1
+Failure: expected `v2_compat`, actual `v3` — force retry rebuilt from v2 after repeated cleanup rejection even though the atomically published v3 config was valid.
+```
+
+Cleanup recovery is now outside the invalid-config force-rebuild catch. A validated v3 config is never made eligible for v2 rebuild merely because deletion failed:
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="retry after repeated cleanup failure" tests/record-store.test.mjs
+Result: exit 0; tests 1; pass 1; fail 0; skipped 0; todo 0
+```
+
+### Round-3 invariants and fixes
+
+- `V3MvuStore.readForExport()` is the explicit expensive compatibility-export API. It pages every committed record in ascending 500-record batches and validates the final count. Ordinary `read()`/runtime snapshots remain capped at the newest 500 records.
+- Export and normal record queries hold the existing dataset/config path queue while reading the selected committed manifest. A replace/import cleanup therefore cannot delete a segment halfway through an in-runtime read.
+- Production `operit_mvu:export_dataset` calls `runtime.exportDataset()`. V3 uses the complete paged export API; v2-only and structured `v2_compat` modes retain their full legacy-store read.
+- Before a record replacement publishes config, the store atomically publishes `operit_mvu.records.v3.cleanup.json`. The journal contains the exact superseded absolute paths, expected safe-integer revision, and exact expected record-manifest identity.
+- Config publication remains the only commit point. Cleanup runs afterward under the same dataset path queue, checks every journal path and the 1,024-path bound before deletion, and rejects any path present in the committed replacement manifest.
+- Startup/recovery validates the committed manifest, then reconciles the journal. Exact revision/manifest matches resume idempotent deletion and finally remove the journal; mismatches remove only the journal and never its listed segments because the intended config publication did not occur.
+- A partial delete leaves the unchanged exact journal. Restart skips already-absent old paths, deletes the remainder, and removes the journal. Repeated clear with no committed segments creates no empty journal and remains idempotent.
+- Cleanup recovery failure cannot route a valid v3 config through force migration. Retry remains structured `v2_compat`, preserves the valid v3 and byte-identical v2 documents, and retries cleanup only.
+- `publishOwnedTemporaryFile` wraps the initial write and atomic replacement for record stage files, repair files, legacy config, v3 config, and cleanup-journal publication. Any observable in-process rejection attempts deletion of that operation's unique temp path while preserving the original error.
+- The host fake now models a write that stores bytes and then rejects, in addition to atomic-replace rejection. Tests cover both phases for segment, repair, config, and journal owners.
+
+### Files in the round-3 code/test commit
+
+- `src/mvu/app/index.ts`
+- `src/mvu/app/record-store.ts`
+- `src/mvu/app/store-v3.ts`
+- `src/mvu/app/store.ts`
+- `src/shared/ipc.ts`
+- `tests/helpers.mjs`
+- `tests/record-store.test.mjs`
+
+Implementation commit:
+
+```text
+319b100ef11777464b20ddc648567fae934254c8 fix: complete v3 export and segment cleanup
+7 files changed, 485 insertions(+), 31 deletions(-)
+```
+
+### Exact round-3 GREEN verification
+
+Final focused reviewer coverage:
+
+```text
+Command: pnpm run typecheck && node --test --test-name-pattern="production IPC export|runtime import and repeated clear|partial superseded|cleanup journal whose|retry after repeated cleanup|owned record" tests/record-store.test.mjs
+Result: exit 0; tests 6; pass 6; fail 0; skipped 0; todo 0
+```
+
+Final full verification on the implementation commit:
+
+```text
+Command: pnpm run check
+Result: exit 0
+- Manifest audit: PASS (`operit-toolpkg-host`, API 3, 7 capabilities)
+- UI audit: PASS (15 screens, 42 declared actions, 48 handled actions, 20 native methods)
+- TypeScript: PASS
+- Temporary-effect audit: PASS
+- Node tests: 91 total, 91 pass, 0 fail, 0 skipped, 0 todo
+```
+
+```text
+Command: pnpm run pack
+Result: exit 0
+- Manifest/UI/type/effect audits: PASS
+- Web build: `dist/app.html` 9,323,226 bytes
+- Package: `release/operit_mvu-2.0.1.toolpkg`, 54 entries, 9,941,588 bytes data
+```
+
+```text
+Command: git diff --check
+Result: exit 0; no output
+```
+
+The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICALLY_FAILED` and legacy-store rejection diagnostics are emitted by deterministic failure-order tests; all corresponding assertions pass.
+
+### Round-3 acceptance matrix
+
+- [x] **Bounded ordinary reads and complete explicit export.** Ordinary compatibility snapshots remain 500 records. The production IPC export test migrates and exports 1,001 committed records, checks exact count, first/last IDs, complete ordered ID sequence, and no gaps or duplicates; it also verifies v2 object shape and byte-identical source v2 storage.
+- [x] **Crash-resumable superseded-segment cleanup.** Runtime import/replace and clear journal exact old paths plus expected revision/manifest before config publication, atomically publish config, delete only old unreferenced paths under the queue, and remove the journal after success.
+- [x] **Safe startup reconciliation.** Matching committed replacement journals resume after partial deletion; mismatched journals from failed config publication are discarded without deleting committed old paths; valid v3 retry never rebuilds from v2 because cleanup failed.
+- [x] **Protected new manifest and bounded deletion.** Journal validation rejects duplicates, malformed/non-record paths, protected replacement paths, unsafe revisions/manifests, and more than 1,024 old paths before deletion. Successful replace tests prove new segment generations remain while old generations are removed.
+- [x] **Required failure injection.** Deterministic tests cover journal write-after-write rejection, journal atomic publication rejection, config write-after-write rejection, config atomic publication rejection, partial old-segment deletion, restart completion, successful import replacement, clear, and repeated clear.
+- [x] **Ordinary owned-temp rejection cleanup.** Segment stage, orphan-tail repair, v2 config, v3 config, and cleanup-journal temp owners all use one checked write-plus-atomic-publication guard and best-effort deletion on observable rejection. Both write-then-reject and replace-failure phases are covered.
+- [x] **Prior guarantees preserved.** All 85 pre-round-3 tests remain green, including 500-line committed-count segments, orphan-tail repair, atomic config/record ordering, raw whole-segment reads, bounded normal work, migration/fallback/retry, production message transaction composition, v3 compatibility semantics, effect handling, hourly retention, role-aware AI, caps, validation, safe integers, manifest capability audits, and byte-identical v2 preservation.
+- [x] **Required verification.** Focused RED/GREEN evidence, final 91-test `pnpm run check`, `pnpm run pack`, and `git diff --check` are recorded and green.
+
+### Residual limitations after round 3
+
+- The atomic/CAS scope remains one persistent ToolPkg main JavaScript runtime with owner-isolated storage. External processes/writers remain outside the proven host contract, as documented in round 2.
+- A true process crash after writing a unique stage/config/journal temp but before rejection handling can leave that temp. The host exposes no bounded directory listing, so it cannot be honestly discovered or reclaimed; unique names prevent collision or commitment.
+- Superseded-segment cleanup deliberately fails closed before publication when more than 1,024 committed old segment paths would need deletion. This avoids unbounded/destructive recovery but requires future host/operator cleanup for such an extreme replacement.
+- Explicit export is intentionally O(total committed history), materializes the v2 JSON document, and holds the in-runtime path queue for a consistent manifest. Ordinary message/UI compatibility paths remain bounded; very large exports may consume substantial time and memory.
+- Atomic durability still depends on the host's declared same-directory `files.atomic_replace` capability. Tests prove the adapter's checked ordering and failure behavior, not lower-level device filesystem internals.
+- No code-review subagent dispatcher was available. The direct full-diff audit found and fixed the valid-v3 force-retry issue, but this remains a process limitation rather than an independent review.
