@@ -10,15 +10,21 @@ import type {
   ConditionPredicate,
   EffectActorSelector,
   EffectGroupDefinition,
+  EffectReasonConfig,
   EffectReasonSnapshot,
   MvuDatasetV3,
   MigrationResult,
   ResolvedEffectTarget,
   RuleDefinitionV3,
 } from "./model-v3";
+import {
+  EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+  EFFECT_REASON_RENDERED_MAX_LENGTH,
+  truncateEffectReasonText,
+} from "./model-v3";
 import { assertMvuDatasetV3, normalizeMvuDataset } from "./validation";
-import { hydrateLegacyActiveEffectSnapshots } from "./effect-engine";
-import { resolveTemporaryEffectReason } from "./temporary-effect";
+import { hydrateLegacyActiveEffectSnapshots, normalizeRenderedEffectReason } from "./effect-engine";
+import { TEMPORARY_EFFECT_REASON_TEMPLATES } from "./temporary-effect";
 
 const HOURS_IN_MILLISECONDS = 3_600_000;
 const ALL_CHANGE_SOURCES = ["manual", "natural", "per_turn", "rule", "ai"] as const;
@@ -30,10 +36,17 @@ const ALL_CHANGE_SOURCES = ["manual", "natural", "per_turn", "rule", "ai"] as co
 export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResult {
   const source = normalizeMvuDataset(cloneJson(v2));
   const nowIso = isoTimestamp(now);
-  const effectGroups = source.temporaryEffects.map(migrateEffectGroup);
+  const warnings: string[] = [];
+  const reasonConfigs = new Map(source.temporaryEffects.map((effect) => [
+    effect.id,
+    migrateLegacyReasonConfig(effect, warnings),
+  ]));
+  const effectGroups = source.temporaryEffects.map((effect) =>
+    migrateEffectGroup(effect, reasonConfigs.get(effect.id)!));
   const conditions = source.autoRules.map((rule) => migrateCondition(rule, nowIso));
   const rules = source.autoRules.map((rule) => migrateRule(rule, nowIso));
-  const activeEffects = source.temporaryEffects.filter((effect) => effect.enabled).map(migrateActiveEffect);
+  const activeEffects = source.temporaryEffects.filter((effect) => effect.enabled).map((effect) =>
+    migrateActiveEffect(effect, reasonConfigs.get(effect.id)!));
   const hourlyMessageBuckets = Object.fromEntries(Object.entries(source.messageFacts).map(([key, facts]) => [
     key,
     hourlyMessageBucketsFromFacts(facts),
@@ -69,13 +82,13 @@ export function migrateDatasetV2ToV3(v2: MvuDataset, now: number): MigrationResu
 
   return {
     dataset,
-    records: cloneJson(source.records),
+    records: source.records.map((record) => normalizeLegacyRecord(record, warnings)),
     report: {
       migratedFields: dataset.fields.length,
       migratedRules: dataset.rules.length,
       migratedConditions: dataset.conditions.length,
       migratedEffectGroups: dataset.effectGroups.length,
-      warnings: [],
+      warnings,
     },
   };
 }
@@ -133,7 +146,7 @@ function migrateRule(rule: MvuDataset["autoRules"][number], nowIso: string): Rul
   };
 }
 
-function migrateEffectGroup(effect: DataTemporaryEffect): EffectGroupDefinition {
+function migrateEffectGroup(effect: DataTemporaryEffect, reason: EffectReasonConfig): EffectGroupDefinition {
   const createdAt = isoTimestamp(effect.createdAt);
   const targetsByField = new Map<string, DataTemporaryEffectTarget[]>();
   for (const target of effect.targets) {
@@ -144,7 +157,7 @@ function migrateEffectGroup(effect: DataTemporaryEffect): EffectGroupDefinition 
   return {
     id: effectGroupId(effect.id),
     name: `Migrated effect ${effect.id}`,
-    description: effect.reasonMode === "custom" ? effect.reason : effect.reasonTemplate,
+    description: effect.reasonMode === "custom" ? reason.text : effect.reasonTemplate,
     enabled: effect.enabled,
     fieldEffects: [...targetsByField.entries()].map(([fieldId, targets], index) => ({
       id: `field_effect_${effect.id}_${index}`,
@@ -154,17 +167,13 @@ function migrateEffectGroup(effect: DataTemporaryEffect): EffectGroupDefinition 
         ? { kind: "fixed_adjustment", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }
         : { kind: "all_multiplier", value: effect.value, sources: [...ALL_CHANGE_SOURCES] }],
     })),
-    defaultReason: {
-      mode: effect.reasonMode,
-      template: effect.reasonTemplate,
-      text: effect.reason,
-    },
+    defaultReason: cloneJson(reason),
     createdAt,
     updatedAt: createdAt,
   };
 }
 
-function migrateActiveEffect(effect: DataTemporaryEffect): ActiveEffectInstance {
+function migrateActiveEffect(effect: DataTemporaryEffect, reason: EffectReasonConfig): ActiveEffectInstance {
   return {
     id: `active_effect_${effect.id}`,
     definitionId: effectGroupId(effect.id),
@@ -179,7 +188,7 @@ function migrateActiveEffect(effect: DataTemporaryEffect): ActiveEffectInstance 
       remainingTurns: effect.remainingTurns,
     },
     activatedAt: isoTimestamp(effect.createdAt),
-    reason: reasonSnapshot(effect),
+    reason: reasonSnapshot(reason),
   };
 }
 
@@ -197,12 +206,44 @@ function actorIdFromTarget(scope: ResolvedEffectTarget["scope"] | undefined, sco
   return actorId.length > 0 ? actorId : null;
 }
 
-function reasonSnapshot(effect: DataTemporaryEffect): EffectReasonSnapshot {
+function reasonSnapshot(reason: EffectReasonConfig): EffectReasonSnapshot {
+  return {
+    mode: reason.mode,
+    template: reason.template,
+    text: normalizeRenderedEffectReason(reason.mode === "custom"
+      ? reason.text
+      : TEMPORARY_EFFECT_REASON_TEMPLATES[reason.template]),
+  };
+}
+
+function migrateLegacyReasonConfig(
+  effect: DataTemporaryEffect,
+  warnings: string[],
+): EffectReasonConfig {
+  const text = truncateEffectReasonText(effect.reason, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH);
+  if (text !== effect.reason) {
+    warnings.push(
+      `MVU_EFFECT_REASON_LEGACY_TRUNCATED:${effect.id}:${effect.reason.length}:${EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH}`,
+    );
+  }
   return {
     mode: effect.reasonMode,
     template: effect.reasonTemplate,
-    text: resolveTemporaryEffectReason(effect),
+    text,
   };
+}
+
+function normalizeLegacyRecord(
+  record: MvuDataset["records"][number],
+  warnings: string[],
+): MvuDataset["records"][number] {
+  const reason = truncateEffectReasonText(record.reason, EFFECT_REASON_RENDERED_MAX_LENGTH);
+  if (reason !== record.reason) {
+    warnings.push(
+      `MVU_CHANGE_RECORD_REASON_LEGACY_TRUNCATED:${record.id}:${record.reason.length}:${EFFECT_REASON_RENDERED_MAX_LENGTH}`,
+    );
+  }
+  return { ...cloneJson(record), reason };
 }
 
 function conditionId(legacyRuleId: string): string { return `condition_${legacyRuleId}`; }

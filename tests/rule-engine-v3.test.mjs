@@ -274,6 +274,7 @@ test("one v3 message batches all AI predicates and applies T-only actions throug
         { kind: "positive_multiplier", value: 0.5, sources: ["rule"] },
       ],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: NOW_ISO,
     updatedAt: NOW_ISO,
   }];
@@ -707,6 +708,7 @@ test("v3 validation rejects extra keys on each rule action variant", () => {
       actorSelector: { kind: "trigger_actor" },
       operations: [{ kind: "immediate_delta", value: 1 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: NOW_ISO,
     updatedAt: NOW_ISO,
   }];

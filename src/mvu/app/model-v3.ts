@@ -65,7 +65,23 @@ export interface EffectDuration {
   remainingTurns: number | null;
 }
 
-export const EFFECT_REASON_TEXT_MAX_LENGTH = 512;
+/** Maximum source text accepted by new v3 editor/API requests. */
+export const EFFECT_REASON_SOURCE_MAX_LENGTH = 512;
+/** Compatibility ceiling for reason source retained from legacy persisted documents. */
+export const EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH = 16_384;
+/** Maximum size of any one value substituted into a reason template. */
+export const EFFECT_REASON_VARIABLE_MAX_LENGTH = 256;
+/** Shared persistence ceiling for resolved active snapshots and change-record reasons. */
+export const EFFECT_REASON_RENDERED_MAX_LENGTH = 2_048;
+/** @deprecated Use EFFECT_REASON_SOURCE_MAX_LENGTH for new editor/API input. */
+export const EFFECT_REASON_TEXT_MAX_LENGTH = EFFECT_REASON_SOURCE_MAX_LENGTH;
+
+/** Deterministic UTF-16 truncation that never leaves a dangling high surrogate. */
+export function truncateEffectReasonText(value: string, maximum: number): string {
+  if (value.length <= maximum) return value;
+  const truncated = value.slice(0, maximum);
+  return /[\uD800-\uDBFF]$/.test(truncated) ? truncated.slice(0, -1) : truncated;
+}
 
 /** Reusable reason source. Template text is retained for lossless v2 compatibility but ignored when rendered. */
 export interface EffectReasonConfig {

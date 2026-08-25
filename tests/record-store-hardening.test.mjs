@@ -357,6 +357,7 @@ test("legacy rule edits preserve hidden selectors, targets, references, and shar
       actorSelector: { kind: "selected", actorIds: ["T"] },
       operations: [{ kind: "fixed_adjustment", value: 1, sources: ["natural"] }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: iso(),
     updatedAt: iso(),
   }, {
@@ -370,6 +371,7 @@ test("legacy rule edits preserve hidden selectors, targets, references, and shar
       actorSelector: { kind: "trigger_actor" },
       operations: [{ kind: "immediate_delta", value: 3 }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: iso(),
     updatedAt: iso(),
   }];
@@ -460,6 +462,7 @@ test("legacy effect writes preserve reusable semantics and every active instance
       actorSelector: { kind: "selected", actorIds: ["T"] },
       operations: [{ kind: "fixed_adjustment", value: 2, sources: ["manual", "ai"] }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: iso(),
     updatedAt: iso(),
   }];
@@ -521,6 +524,7 @@ test("expiry settles active instances without disabling their reusable definitio
       actorSelector: { kind: "selected", actorIds: ["T"] },
       operations: [{ kind: "fixed_adjustment", value: 2, sources: ["natural"] }],
     }],
+    defaultReason: { mode: "template", template: "general", text: "" },
     createdAt: iso(-60_000),
     updatedAt: iso(-60_000),
   }];

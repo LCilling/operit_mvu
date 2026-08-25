@@ -9,7 +9,7 @@ import type {
 } from "./model-v3";
 import type { RecordQueryRequest, RecordQueryResult } from "./record-store";
 import type { MigrationStatus, V3MvuStoreSnapshot } from "./store-v3";
-import { assertMvuDatasetV3 } from "./validation";
+import { assertEditableEffectReasonConfig, assertMvuDatasetV3 } from "./validation";
 import {
   commitFieldTemplateImport,
   createFieldTemplateExport,
@@ -717,11 +717,15 @@ export class MvuQueryService {
     }))), request.page);
   }
 
-  createEffectGroup(request: RevisionedRequest & { effectGroup: EffectGroupInput }): Promise<MutationResponse<EffectGroupDefinition>> {
+  async createEffectGroup(request: RevisionedRequest & { effectGroup: EffectGroupInput }): Promise<MutationResponse<EffectGroupDefinition>> {
+    assertEditableEffectReasonConfig(request.effectGroup.defaultReason);
     return this.createEntity(request.expectedRevision, "effect_group", request.effectGroup, (draft, created) => draft.effectGroups.push(created));
   }
 
-  updateEffectGroup(request: RevisionedIdRequest & { patch: EffectGroupPatch }): Promise<MutationResponse<EffectGroupDefinition>> {
+  async updateEffectGroup(request: RevisionedIdRequest & { patch: EffectGroupPatch }): Promise<MutationResponse<EffectGroupDefinition>> {
+    if (request.patch.defaultReason !== undefined) {
+      assertEditableEffectReasonConfig(request.patch.defaultReason);
+    }
     return this.updateEntity(request.expectedRevision, "effect_group", request.id, request.patch, (draft) => draft.effectGroups);
   }
 

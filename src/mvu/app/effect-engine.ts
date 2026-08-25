@@ -10,7 +10,14 @@ import type {
   EffectReasonSnapshot,
   ResolvedEffectTarget,
 } from "./model-v3";
-import { EFFECT_REASON_TEXT_MAX_LENGTH, type ChangeSource } from "./model-v3";
+import {
+  EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+  EFFECT_REASON_RENDERED_MAX_LENGTH,
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
+  EFFECT_REASON_VARIABLE_MAX_LENGTH,
+  truncateEffectReasonText,
+  type ChangeSource,
+} from "./model-v3";
 import {
   TEMPORARY_EFFECT_REASON_TEMPLATES,
   renderEffectReasonText,
@@ -84,6 +91,9 @@ export function activateEffectGroup(input: ActivateEffectGroupInput): EffectActi
   const diagnostics: EffectDiagnostic[] = [];
   const resolvedTargets: ResolvedEffectTarget[] = [];
   const immediateChanges: ImmediateFieldChange[] = [];
+  if (input.reason !== undefined && (input.reason.text?.length ?? 0) > EFFECT_REASON_SOURCE_MAX_LENGTH) {
+    throw new Error("MVU_EFFECT_REASON_TOO_LONG");
+  }
   const configuredReason: EffectReasonInput = input.reason ?? input.definition.defaultReason ?? DEFAULT_EFFECT_REASON;
   const reason = resolveEffectReason({
     reason: configuredReason,
@@ -220,17 +230,49 @@ export function resolveEffectReason(input: {
   if (input.reason.mode === "custom" && (input.reason.text?.trim().length ?? 0) === 0) {
     throw new Error("MVU_EFFECT_REASON_EMPTY");
   }
-  if ((input.reason.text?.length ?? 0) > EFFECT_REASON_TEXT_MAX_LENGTH) {
+  if ((input.reason.text?.length ?? 0) > EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH) {
     throw new Error("MVU_EFFECT_REASON_TOO_LONG");
   }
   const sourceText = input.reason.mode === "custom"
     ? input.reason.text?.trim() ?? ""
     : TEMPORARY_EFFECT_REASON_TEMPLATES[input.reason.template];
+  const variables = normalizeReasonVariables(input.variables);
+  const rendered = renderEffectReasonText(sourceText, variables);
   return {
     mode: input.reason.mode,
     template: input.reason.template,
-    text: renderEffectReasonText(sourceText, input.variables),
+    text: normalizeRenderedEffectReason(rendered),
   };
+}
+
+/** Normalizes a completed reason before it crosses an active-instance or record boundary. */
+export function normalizeRenderedEffectReason(value: string): string {
+  const normalized = truncateEffectReasonText(value, EFFECT_REASON_RENDERED_MAX_LENGTH)
+    .replace(/\u0000/g, "")
+    .trim();
+  return truncateEffectReasonText(
+    normalized.length === 0 ? TEMPORARY_EFFECT_REASON_TEMPLATES.general : normalized,
+    EFFECT_REASON_RENDERED_MAX_LENGTH,
+  );
+}
+
+function normalizeReasonVariables(variables: EffectReasonVariables | undefined): EffectReasonVariables {
+  if (variables === undefined) return {};
+  return {
+    triggerActorName: normalizeEffectReasonVariable(variables.triggerActorName),
+    ruleName: normalizeEffectReasonVariable(variables.ruleName),
+    effectGroupName: normalizeEffectReasonVariable(variables.effectGroupName),
+    fieldName: normalizeEffectReasonVariable(variables.fieldName),
+    event: normalizeEffectReasonVariable(variables.event),
+  };
+}
+
+export function normalizeEffectReasonVariable(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return truncateEffectReasonText(value, EFFECT_REASON_VARIABLE_MAX_LENGTH)
+    .replace(/[\u0000-\u001F\u007F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 const DEFAULT_EFFECT_REASON: EffectReasonConfig = {
@@ -243,9 +285,19 @@ function effectFieldNames(
   definition: EffectGroupDefinition,
   fields: readonly DataField[],
 ): string {
-  const names = definition.fieldEffects.map((fieldEffect) =>
-    fields.find((field) => field.id === fieldEffect.fieldId)?.name ?? fieldEffect.fieldId);
-  return [...new Set(names)].join("、");
+  const names = new Set<string>();
+  let result = "";
+  for (const fieldEffect of definition.fieldEffects) {
+    const name = fields.find((field) => field.id === fieldEffect.fieldId)?.name ?? fieldEffect.fieldId;
+    if (names.has(name)) continue;
+    names.add(name);
+    const separator = result.length === 0 ? "" : "、";
+    const remaining = EFFECT_REASON_VARIABLE_MAX_LENGTH - result.length - separator.length;
+    if (remaining <= 0) break;
+    result += separator + truncateEffectReasonText(name, remaining);
+    if (result.length >= EFFECT_REASON_VARIABLE_MAX_LENGTH) break;
+  }
+  return result;
 }
 
 function resolveTargets(

@@ -62,7 +62,7 @@ import type {
   RuleDefinitionV3,
   RuleTargetSelector,
 } from "../mvu/app/model-v3";
-import { EFFECT_REASON_TEXT_MAX_LENGTH } from "../mvu/app/model-v3";
+import { EFFECT_REASON_SOURCE_MAX_LENGTH } from "../mvu/app/model-v3";
 import type {
   BackgroundModelProbeResult,
   SystemModelApi,
@@ -1252,7 +1252,7 @@ function parseEffectReasonConfig(value: unknown): EffectReasonConfig {
     ["general", "positive", "negative", "environment", "relationship"] as const,
     "MVU_EFFECT_REASON_CONFIG_INVALID",
   );
-  const text = requireBoundedString(record, "text", EFFECT_REASON_TEXT_MAX_LENGTH, "MVU_EFFECT_REASON_CONFIG_INVALID");
+  const text = requireBoundedString(record, "text", EFFECT_REASON_SOURCE_MAX_LENGTH, "MVU_EFFECT_REASON_CONFIG_INVALID");
   if (mode === "custom" && text.trim().length === 0) fail("MVU_EFFECT_REASON_CONFIG_INVALID");
   return { mode, template, text };
 }
