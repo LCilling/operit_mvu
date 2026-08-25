@@ -72,6 +72,7 @@ export interface MvuRuntime {
   initialize(): Promise<MigrationStatus>;
   migrationStatus(): Promise<MigrationStatus>;
   dataset(): Promise<MvuDataset>;
+  exportDataset(): Promise<MvuDataset>;
   snapshot(context: StateScopeContext): Promise<MvuSnapshotView>;
   buildMvuData(context: StateScopeContext): Promise<ReturnType<typeof buildMvuData>>;
   applyCommand(
@@ -114,6 +115,10 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
       return runtimeMigrationStatus(store);
     },
     async dataset() {
+      return service.getDataset();
+    },
+    async exportDataset() {
+      if (isV3MvuStore(store)) return (await store.readForExport()).dataset;
       return service.getDataset();
     },
     async snapshot(activeContext) {

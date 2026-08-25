@@ -180,6 +180,7 @@ export function createFakeMvuFileApi(initialFiles = {}, options = {}) {
       operations.push({ operation: "writeText", path, content });
       await waitAtBarrier("writeText", { path, content });
       files.set(path, content);
+      failIfRequested("writeTextAfterWrite", { path, content });
     },
     async appendText(path, content) {
       failIfRequested("appendText", { path, content });

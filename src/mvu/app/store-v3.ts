@@ -12,22 +12,26 @@ import type {
   EffectGroupDefinition,
   MigrationResult,
   MvuDatasetV3,
+  RecordManifest,
   RuleActionV3,
   RuleDefinitionV3,
 } from "./model-v3";
 import {
+  assertRecordManifest,
   createEmptyRecordManifest,
   SegmentedRecordStore,
   type RecordQueryRequest,
   type RecordQueryResult,
 } from "./record-store";
 import type { MvuFileApi, MvuStore, MvuStoreSnapshot } from "./store";
-import { StaleRevisionError } from "./store";
+import { publishOwnedTemporaryFile, StaleRevisionError } from "./store";
 import { assertMvuDataset, assertMvuDatasetV3 } from "./validation";
 
 const V2_FILE_NAME = "operit_mvu.dataset.v2.json";
 const V3_FILE_NAME = "operit_mvu.dataset.v3.json";
+const V3_CLEANUP_FILE_NAME = "operit_mvu.records.v3.cleanup.json";
 const COMPATIBILITY_RECORD_LIMIT = 500;
+const MAX_SEGMENT_CLEANUP_COUNT = 1_024;
 const runtimePathTails = new Map<string, Promise<void>>();
 const runtimeRecoveryRequired = new Set<string>();
 
@@ -60,6 +64,13 @@ export interface V3MvuStoreOptions {
 type RecordMutation =
   | { kind: "append"; records: readonly DataChangeRecord[] }
   | { kind: "replace"; records: readonly DataChangeRecord[] };
+
+interface SegmentCleanupJournal {
+  formatVersion: 1;
+  expectedRevision: number;
+  expectedRecordManifest: RecordManifest;
+  supersededPaths: string[];
+}
 
 export class V3UnavailableError extends Error {
   constructor(status: Extract<MigrationStatus, { mode: "v2_compat" }>) {
@@ -154,8 +165,27 @@ export class V3MvuStore implements MvuStore {
   }
 
   async queryRecords(request: RecordQueryRequest): Promise<RecordQueryResult> {
-    const snapshot = await this.readV3();
-    return this.records.queryRecords(snapshot.dataset.recordManifest, request);
+    const status = await this.initialize();
+    if (status.mode !== "v3") throw new V3UnavailableError(status);
+    return this.enqueuePath(async () => {
+      const snapshot = await this.loadV3Config();
+      return this.records.queryRecords(snapshot.dataset.recordManifest, request);
+    });
+  }
+
+  /**
+   * Explicit, potentially expensive export read. Ordinary compatibility reads
+   * remain capped; export walks committed manifest pages while holding the
+   * dataset queue so a replacement cleanup cannot remove a segment mid-read.
+   */
+  async readForExport(): Promise<MvuStoreSnapshot> {
+    const status = await this.initialize();
+    if (status.mode === "v2_compat") return this.legacyStore.read();
+    return this.enqueuePath(async () => {
+      const current = await this.loadV3Config();
+      const committedRecords = await this.readAllCommittedRecords(current.dataset);
+      return compatibilitySnapshot(current.dataset, committedRecords);
+    });
   }
 
   async read(): Promise<MvuStoreSnapshot> {
@@ -197,15 +227,26 @@ export class V3MvuStore implements MvuStore {
       const configDir = this.configDir();
       const v3Path = this.v3Path(configDir);
       if (await this.files.exists(v3Path)) {
+        let existing: V3MvuStoreSnapshot | undefined;
         try {
-          const existing = await this.loadV3Config();
-          await this.records.validateAndRepair(existing.dataset.recordManifest, existing.revision);
-          runtimeRecoveryRequired.delete(v3Path);
-          return { mode: "v3", source: "existing" };
+          const candidate = await this.loadV3Config();
+          await this.records.validateAndRepair(candidate.dataset.recordManifest, candidate.revision);
+          existing = candidate;
         } catch (error) {
           if (!forceRebuild) throw error;
         }
+        if (existing !== undefined) {
+          // Cleanup failure does not make a validated, atomically published v3
+          // config eligible for force-rebuild from v2. Retry only the journal.
+          runtimeRecoveryRequired.delete(v3Path);
+          await this.resumeSegmentCleanup(existing.dataset);
+          return { mode: "v3", source: "existing" };
+        }
       }
+
+      // With no valid published v3 config, a cleanup journal cannot match a
+      // committed replacement. Remove only the journal, never its listed data.
+      await this.discardCleanupJournal();
 
       const v2Path = `${configDir}/${V2_FILE_NAME}`;
       const hasV2 = await this.files.exists(v2Path);
@@ -271,6 +312,14 @@ export class V3MvuStore implements MvuStore {
     }
     const commitRevision = current.revision + 1;
     const configPath = this.v3Path(this.configDir());
+    let supersededPaths: string[] = [];
+    if (recordMutation.kind === "replace") {
+      if (current.dataset.recordManifest.segments.length > MAX_SEGMENT_CLEANUP_COUNT) {
+        throw new Error("MVU_V3_SEGMENT_CLEANUP_LIMIT");
+      }
+      supersededPaths = current.dataset.recordManifest.segments.map((segment) =>
+        `${this.records.directoryPath()}/${segment.fileName}`);
+    }
     runtimeRecoveryRequired.add(configPath);
     const staged = recordMutation.kind === "append"
       ? await this.records.stageAppend(current.dataset.recordManifest, recordMutation.records, commitRevision)
@@ -279,8 +328,22 @@ export class V3MvuStore implements MvuStore {
     committed.revision = commitRevision;
     committed.recordManifest = staged.manifest;
     assertMvuDatasetV3(committed);
+    if (supersededPaths.length > 0) {
+      const publishedPaths = new Set(committed.recordManifest.segments.map((segment) =>
+        `${this.records.directoryPath()}/${segment.fileName}`));
+      supersededPaths = supersededPaths.filter((path) => !publishedPaths.has(path));
+      const journal: SegmentCleanupJournal = {
+        formatVersion: 1,
+        expectedRevision: committed.revision,
+        expectedRecordManifest: klona(committed.recordManifest),
+        supersededPaths,
+      };
+      assertSegmentCleanupJournal(journal, this.records.directoryPath());
+      await this.persistCleanupJournal(journal);
+    }
     await this.persistConfig(configPath, committed);
     runtimeRecoveryRequired.delete(configPath);
+    if (supersededPaths.length > 0) await this.resumeSegmentCleanup(committed);
     return { revision: committed.revision, dataset: klona(committed) };
   }
 
@@ -295,19 +358,87 @@ export class V3MvuStore implements MvuStore {
     return records;
   }
 
+  private async readAllCommittedRecords(dataset: MvuDatasetV3): Promise<DataChangeRecord[]> {
+    const records: DataChangeRecord[] = [];
+    let offset = 0;
+    while (offset < dataset.recordManifest.recordCount) {
+      const page = await this.records.queryRecords(dataset.recordManifest, {
+        offset,
+        limit: COMPATIBILITY_RECORD_LIMIT,
+        direction: "asc",
+      });
+      if (page.loadedCount === 0 || page.nextOffset === offset) {
+        throw new Error("MVU_V3_RECORD_EXPORT_STALLED");
+      }
+      records.push(...page.items);
+      offset += page.loadedCount;
+    }
+    if (records.length !== dataset.recordManifest.recordCount) {
+      throw new Error("MVU_V3_RECORD_EXPORT_COUNT_MISMATCH");
+    }
+    return records;
+  }
+
   private async persistConfig(path: string, dataset: MvuDatasetV3): Promise<void> {
     const configDir = this.configDir();
     if (!(await this.files.exists(configDir))) await this.files.mkdir(configDir);
     const temporaryPath = `${path}.tmp.${nextTransactionId()}`;
-    await this.files.writeText(temporaryPath, JSON.stringify(dataset, null, 2));
-    await this.files.replaceAtomically(temporaryPath, path);
+    await publishOwnedTemporaryFile(
+      this.files,
+      temporaryPath,
+      path,
+      JSON.stringify(dataset, null, 2),
+    );
+  }
+
+  private async persistCleanupJournal(journal: SegmentCleanupJournal): Promise<void> {
+    const path = this.cleanupPath(this.configDir());
+    const temporaryPath = `${path}.tmp.${nextTransactionId()}`;
+    await publishOwnedTemporaryFile(
+      this.files,
+      temporaryPath,
+      path,
+      JSON.stringify(journal, null, 2),
+    );
+  }
+
+  private async resumeSegmentCleanup(committed: MvuDatasetV3): Promise<void> {
+    const journalPath = this.cleanupPath(this.configDir());
+    if (!(await this.files.exists(journalPath))) return;
+    const parsed = JSON.parse(await this.files.readText(journalPath)) as unknown;
+    assertSegmentCleanupJournal(parsed, this.records.directoryPath());
+    const matchesPublishedReplacement = parsed.expectedRevision === committed.revision &&
+      JSON.stringify(parsed.expectedRecordManifest) === JSON.stringify(committed.recordManifest);
+    if (!matchesPublishedReplacement) {
+      await this.files.deleteFile(journalPath);
+      return;
+    }
+
+    const publishedPaths = new Set(committed.recordManifest.segments.map((segment) =>
+      `${this.records.directoryPath()}/${segment.fileName}`));
+    for (const path of parsed.supersededPaths) {
+      if (publishedPaths.has(path)) {
+        throw new Error("MVU_V3_SEGMENT_CLEANUP_PROTECTED_PATH");
+      }
+    }
+    for (const path of parsed.supersededPaths) {
+      if (await this.files.exists(path)) await this.files.deleteFile(path);
+    }
+    await this.files.deleteFile(journalPath);
+  }
+
+  private async discardCleanupJournal(): Promise<void> {
+    const path = this.cleanupPath(this.configDir());
+    if (await this.files.exists(path)) await this.files.deleteFile(path);
   }
 
   private async recoverIfRequired(current: V3MvuStoreSnapshot): Promise<void> {
     const path = this.v3Path(this.configDir());
-    if (!runtimeRecoveryRequired.has(path)) return;
-    await this.records.validateAndRepair(current.dataset.recordManifest, current.revision);
-    runtimeRecoveryRequired.delete(path);
+    if (runtimeRecoveryRequired.has(path)) {
+      await this.records.validateAndRepair(current.dataset.recordManifest, current.revision);
+      runtimeRecoveryRequired.delete(path);
+    }
+    await this.resumeSegmentCleanup(current.dataset);
   }
 
   private enqueuePath<T>(operation: () => Promise<T>): Promise<T> {
@@ -323,10 +454,53 @@ export class V3MvuStore implements MvuStore {
   private v3Path(configDir: string): string {
     return `${configDir}/${V3_FILE_NAME}`;
   }
+
+  private cleanupPath(configDir: string): string {
+    return `${configDir}/${V3_CLEANUP_FILE_NAME}`;
+  }
 }
 
 export function isV3MvuStore(store: MvuStore): store is V3MvuStore {
   return store instanceof V3MvuStore;
+}
+
+function assertSegmentCleanupJournal(
+  value: unknown,
+  recordsDirectory: string,
+): asserts value is SegmentCleanupJournal {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("MVU_V3_SEGMENT_CLEANUP_JOURNAL_INVALID");
+  }
+  const candidate = value as Partial<SegmentCleanupJournal>;
+  if (Object.keys(candidate).sort().join(",") !==
+      "expectedRecordManifest,expectedRevision,formatVersion,supersededPaths" ||
+    candidate.formatVersion !== 1 ||
+    !Number.isSafeInteger(candidate.expectedRevision) ||
+    (candidate.expectedRevision ?? -1) < 0 ||
+    !Array.isArray(candidate.supersededPaths) ||
+    candidate.supersededPaths.length < 1 ||
+    candidate.supersededPaths.length > MAX_SEGMENT_CLEANUP_COUNT) {
+    throw new Error("MVU_V3_SEGMENT_CLEANUP_JOURNAL_INVALID");
+  }
+  assertRecordManifest(candidate.expectedRecordManifest);
+  const expectedManifest = candidate.expectedRecordManifest as RecordManifest;
+  const protectedPaths = new Set(expectedManifest.segments.map((segment) =>
+    `${recordsDirectory}/${segment.fileName}`));
+  const seen = new Set<string>();
+  for (const path of candidate.supersededPaths) {
+    if (typeof path !== "string" || seen.has(path) || protectedPaths.has(path)) {
+      throw new Error("MVU_V3_SEGMENT_CLEANUP_JOURNAL_INVALID");
+    }
+    const prefix = `${recordsDirectory}/`;
+    const fileName = path.startsWith(prefix) ? path.slice(prefix.length) : "";
+    const match = /^segment-(\d+)\.jsonl$/.exec(fileName);
+    const index = match === null ? Number.NaN : Number(match[1]);
+    if (!Number.isSafeInteger(index) || index < 1 ||
+      fileName !== `segment-${String(index).padStart(6, "0")}.jsonl`) {
+      throw new Error("MVU_V3_SEGMENT_CLEANUP_JOURNAL_INVALID");
+    }
+    seen.add(path);
+  }
 }
 
 function compatibilitySnapshot(dataset: MvuDatasetV3, records: readonly DataChangeRecord[]): MvuStoreSnapshot {

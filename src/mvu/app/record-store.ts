@@ -1,6 +1,6 @@
 import type { DataChangeRecord } from "./model";
 import type { RecordManifest, RecordSegmentMetadata } from "./model-v3";
-import type { MvuFileApi } from "./store";
+import { publishOwnedTemporaryFile, type MvuFileApi } from "./store";
 import { assertDataChangeRecord } from "./validation";
 
 export const RECORDS_PER_SEGMENT = 500;
@@ -96,18 +96,7 @@ export class SegmentedRecordStore {
       recordIndex += chunk.length;
       if (created) {
         const stagingPath = `${path}.stage.${operationId}.${touchedSegmentPaths.length}`;
-        await this.files.writeText(stagingPath, content);
-        try {
-          await this.files.replaceAtomically(stagingPath, path);
-        } catch (error) {
-          try {
-            if (await this.files.exists(stagingPath)) await this.files.deleteFile(stagingPath);
-          } catch {
-            // The unique transaction suffix prevents an unremovable staging file
-            // from colliding with a future writer.
-          }
-          throw error;
-        }
+        await publishOwnedTemporaryFile(this.files, stagingPath, path, content);
       } else {
         await this.files.appendText(path, content);
       }
@@ -164,11 +153,12 @@ export class SegmentedRecordStore {
       validateSegmentMetadata(segment, parsed);
       if (lines.length > segment.committedLineCount) {
         const temporaryPath = `${path}.repair.tmp.${nextRecordOperationId()}`;
-        await this.files.writeText(
+        await publishOwnedTemporaryFile(
+          this.files,
           temporaryPath,
+          path,
           committedLines.length === 0 ? "" : `${committedLines.join("\n")}\n`,
         );
-        await this.files.replaceAtomically(temporaryPath, path);
       }
     }
     // New segments are allocated contiguously from nextSegmentIndex. If a

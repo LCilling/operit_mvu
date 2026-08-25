@@ -825,7 +825,7 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
       guarded("exportDataset", MVU_REQUEST_PARSERS.exportDataset, async () => {
         const fileName = buildExportFileName(new Date());
         const savedPath = `${MVU_EXPORT_DIRECTORY}/${fileName}`;
-        const json = JSON.stringify(await runtime.dataset(), null, 2);
+        const json = JSON.stringify(await runtime.exportDataset(), null, 2);
         const directoryResult = await Tools.Files.mkdir(MVU_EXPORT_DIRECTORY, true, "android");
         requireSuccessfulFileOperation("DIRECTORY_CREATE", directoryResult);
         const writeResult = await Tools.Files.write(savedPath, json, false, "android");

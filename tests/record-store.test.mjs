@@ -14,6 +14,7 @@ import {
   FileMvuStore,
   StaleRevisionError,
 } from "../dist/mvu/app/store.js";
+import { installMvuIpc } from "../dist/shared/ipc.js";
 import {
   createFakeMvuFileApi,
   legacyDatasetFixture,
@@ -22,6 +23,7 @@ import {
 const CONFIG_DIR = "/config";
 const V2_PATH = `${CONFIG_DIR}/operit_mvu.dataset.v2.json`;
 const V3_PATH = `${CONFIG_DIR}/operit_mvu.dataset.v3.json`;
+const V3_CLEANUP_PATH = `${CONFIG_DIR}/operit_mvu.records.v3.cleanup.json`;
 const RECORD_DIRECTORY = `${CONFIG_DIR}/operit_mvu.records.v3`;
 const NOW = Date.parse("2033-05-18T03:33:20.000Z");
 const HOUR = 3_600_000;
@@ -179,7 +181,11 @@ function installProductionHost(t, files, hostSnapshot, modelCalls, registrations
       },
     },
     ipc: {
-      on() { return () => {}; },
+      on(channel, handler) {
+        registrations.ipc ??= {};
+        registrations.ipc[channel] = handler;
+        return () => { delete registrations.ipc[channel]; };
+      },
       async call() { throw new Error("UNEXPECTED_IPC_CALL"); },
     },
     registerUiRoute(definition) { registrations.ui = definition; },
@@ -1398,4 +1404,252 @@ test("hourly cleanup derives its horizon from every enabled condition window", a
     { startedAt: currentHour - 9_000 * HOUR, messageCount: 2 },
     { startedAt: currentHour, messageCount: 1 },
   ]);
+});
+
+test("production IPC export pages every committed record while ordinary snapshots stay bounded", async (t) => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 1_001 }, (_, index) => changeRecord(index));
+  const { files, serialized } = filesWithV2(legacy);
+  const registrations = {};
+  installProductionHost(t, files, {
+    chatId: "chat_main",
+    activePrompt: null,
+    activeCharacter: null,
+    activeGroup: null,
+    characters: [],
+    groups: [],
+    members: [],
+    currentCharacter: null,
+  }, [], registrations, []);
+  const runtime = createRuntime({ getConfigDir: () => CONFIG_DIR });
+  assert.equal((await runtime.initialize()).mode, "v3");
+  const uninstall = installMvuIpc(runtime, {
+    async snapshot() { throw new Error("UNEXPECTED_EXPORT_SNAPSHOT"); },
+    systemModel: {},
+  });
+  t.after(uninstall);
+
+  assert.equal((await runtime.dataset()).records.length, 500);
+  const response = await registrations.ipc["operit_mvu:export_dataset"]({});
+  const exported = JSON.parse(files.snapshot()[response.savedPath]);
+  const ids = exported.records.map((record) => record.id);
+
+  assert.equal(exported.formatVersion, 2);
+  assert.deepEqual(Object.keys(exported).sort(), Object.keys(legacy).sort());
+  assert.equal(exported.records.length, 1_001);
+  assert.equal(ids[0], "record_0");
+  assert.equal(ids.at(-1), "record_1000");
+  assert.equal(new Set(ids).size, ids.length);
+  assert.deepEqual(ids, Array.from({ length: 1_001 }, (_, index) => `record_${index}`));
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+});
+
+test("runtime import and repeated clear journal exact old paths and clean only superseded segments", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const runtime = createRuntime({ store });
+  const before = await runtime.dataset();
+  const replacement = structuredClone(before);
+  replacement.records = Array.from({ length: 501 }, (_, index) => changeRecord(index + 1_000));
+  const publication = files.pauseNext(
+    "replaceAtomically",
+    ({ destination }) => destination === V3_PATH,
+  );
+
+  const transaction = runtime.service.replaceDataset(replacement);
+  await publication.entered;
+  const duringPublication = files.snapshot();
+  publication.release();
+  await transaction;
+  const journal = JSON.parse(duringPublication[V3_CLEANUP_PATH]);
+
+  assert.equal(journal.expectedRevision, before.revision + 1);
+  assert.deepEqual(journal.supersededPaths, [
+    `${RECORD_DIRECTORY}/segment-000001.jsonl`,
+    `${RECORD_DIRECTORY}/segment-000002.jsonl`,
+  ]);
+  assert.deepEqual(journal.expectedRecordManifest.segments.map(({ fileName }) => fileName), [
+    "segment-000003.jsonl",
+    "segment-000004.jsonl",
+  ]);
+  assert.equal(JSON.parse(duringPublication[V3_PATH]).revision, before.revision);
+  assert.equal(typeof duringPublication[`${RECORD_DIRECTORY}/segment-000001.jsonl`], "string");
+  assert.equal(typeof duringPublication[`${RECORD_DIRECTORY}/segment-000003.jsonl`], "string");
+  assert.equal((await runtime.dataset()).records.length, 500);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], undefined);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], undefined);
+  assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000003.jsonl`], "string");
+  assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000004.jsonl`], "string");
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.deepEqual(
+    (await store.queryRecords({ offset: 0, limit: 501, direction: "asc" })).items.map(({ id }) => id),
+    Array.from({ length: 501 }, (_, index) => `record_${index + 1_000}`),
+  );
+
+  await runtime.clearRecords();
+  await runtime.clearRecords();
+  assert.equal((await store.queryRecords({ offset: 0, limit: 1 })).totalCount, 0);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000003.jsonl`], undefined);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000004.jsonl`], undefined);
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+});
+
+test("partial superseded-segment deletion resumes from the committed cleanup journal after restart", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files, serialized } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const before = await store.read();
+  const cleared = structuredClone(before.dataset);
+  cleared.records = [];
+  files.failNext(
+    "deleteFile",
+    ({ path }) => path === `${RECORD_DIRECTORY}/segment-000002.jsonl`,
+  );
+
+  await assert.rejects(store.transact(before.revision, cleared), /FAKE_DELETEFILE_FAILED/);
+
+  assert.equal(JSON.parse(files.snapshot()[V3_PATH]).recordManifest.recordCount, 0);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], undefined);
+  assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], "string");
+  assert.equal(typeof files.snapshot()[V3_CLEANUP_PATH], "string");
+  const restarted = v3Store(files, legacy);
+  assert.equal((await restarted.initialize()).mode, "v3");
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], undefined);
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.equal((await restarted.queryRecords({ offset: 0, limit: 1 })).totalCount, 0);
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+});
+
+test("a cleanup journal whose config publication failed is discarded on restart without deleting committed paths", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const before = await store.read();
+  const cleared = structuredClone(before.dataset);
+  cleared.records = [];
+  files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
+
+  await assert.rejects(store.transact(before.revision, cleared), /FAKE_REPLACEATOMICALLY_FAILED/);
+
+  assert.equal(JSON.parse(files.snapshot()[V3_PATH]).revision, before.revision);
+  assert.equal(typeof files.snapshot()[V3_CLEANUP_PATH], "string");
+  assert.equal(Object.keys(files.snapshot()).some((path) => path.startsWith(`${V3_PATH}.tmp.`)), false);
+  const restarted = v3Store(files, legacy);
+  assert.equal((await restarted.initialize()).mode, "v3");
+  assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+  assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], "string");
+  assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000002.jsonl`], "string");
+  assert.equal((await restarted.queryRecords({ offset: 0, limit: 501 })).totalCount, 501);
+});
+
+test("retry after repeated cleanup failure never rebuilds or overwrites the valid published v3 config", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = Array.from({ length: 501 }, (_, index) => changeRecord(index));
+  const { files, serialized } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const before = await store.read();
+  const cleared = structuredClone(before.dataset);
+  cleared.records = [];
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  await assert.rejects(store.transact(before.revision, cleared), /FAKE_DELETEFILE_FAILED/);
+  const publishedV3 = files.snapshot()[V3_PATH];
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  files.failNext("deleteFile", ({ path }) => path.endsWith("segment-000002.jsonl"));
+  const restarted = v3Store(files, legacy);
+
+  assert.equal((await restarted.initialize()).mode, "v2_compat");
+  assert.equal((await restarted.retryMigration()).mode, "v2_compat");
+  assert.equal(files.snapshot()[V3_PATH], publishedV3);
+  assert.equal(JSON.parse(files.snapshot()[V3_PATH]).recordManifest.recordCount, 0);
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+  assert.equal(typeof files.snapshot()[V3_CLEANUP_PATH], "string");
+});
+
+test("owned record, repair, legacy config, and cleanup-journal temps are removed after ordinary rejection", async () => {
+  {
+    const files = createFakeMvuFileApi();
+    const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+    files.failNext("writeTextAfterWrite", ({ path }) => path.includes(".jsonl.stage."));
+    await assert.rejects(records.stageAppend(createEmptyRecordManifest(), [changeRecord(1)], 1),
+      /FAKE_WRITETEXTAFTERWRITE_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.includes(".jsonl.stage.")), false);
+    assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], undefined);
+  }
+  {
+    const files = createFakeMvuFileApi();
+    const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+    files.failNext("replaceAtomically", ({ destination }) =>
+      destination === `${RECORD_DIRECTORY}/segment-000001.jsonl`);
+    await assert.rejects(records.stageAppend(createEmptyRecordManifest(), [changeRecord(1)], 1),
+      /FAKE_REPLACEATOMICALLY_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.includes(".jsonl.stage.")), false);
+  }
+  {
+    const files = createFakeMvuFileApi();
+    const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+    const staged = await records.stageAppend(createEmptyRecordManifest(), [changeRecord(1)], 1);
+    const segmentPath = `${RECORD_DIRECTORY}/segment-000001.jsonl`;
+    await files.appendText(segmentPath, "orphan tail\n");
+    files.failNext("writeTextAfterWrite", ({ path }) => path.includes(".repair.tmp."));
+    await assert.rejects(records.validateAndRepair(staged.manifest, 1),
+      /FAKE_WRITETEXTAFTERWRITE_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.includes(".repair.tmp.")), false);
+    assert.equal(lineCount(files.snapshot()[segmentPath]), 2);
+    files.failNext("replaceAtomically", ({ destination }) => destination === segmentPath);
+    await assert.rejects(records.validateAndRepair(staged.manifest, 1),
+      /FAKE_REPLACEATOMICALLY_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.includes(".repair.tmp.")), false);
+    assert.equal(lineCount(files.snapshot()[segmentPath]), 2);
+  }
+  {
+    const { files, serialized } = filesWithV2();
+    const store = legacyStore(files);
+    const before = await store.read();
+    const next = structuredClone(before.dataset);
+    next.settings.aiEnabled = false;
+    files.failNext("writeTextAfterWrite", ({ path }) => path.startsWith(`${V2_PATH}.tmp.`));
+    await assert.rejects(store.transact(before.revision, next), /FAKE_WRITETEXTAFTERWRITE_FAILED/);
+    assert.equal(files.snapshot()[V2_PATH], serialized);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.startsWith(`${V2_PATH}.tmp.`)), false);
+    files.failNext("replaceAtomically", ({ destination }) => destination === V2_PATH);
+    await assert.rejects(store.transact(before.revision, next), /FAKE_REPLACEATOMICALLY_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.startsWith(`${V2_PATH}.tmp.`)), false);
+  }
+  {
+    const legacy = legacyDatasetFixture();
+    legacy.records = [changeRecord(1)];
+    const { files } = filesWithV2(legacy);
+    const store = v3Store(files, legacy);
+    await store.initialize();
+    const before = await store.read();
+    const cleared = structuredClone(before.dataset);
+    cleared.records = [];
+    files.failNext("writeTextAfterWrite", ({ path }) => path.startsWith(`${V3_CLEANUP_PATH}.tmp.`));
+    await assert.rejects(store.transact(before.revision, cleared), /FAKE_WRITETEXTAFTERWRITE_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) =>
+      path.startsWith(`${V3_CLEANUP_PATH}.tmp.`)), false);
+    assert.equal(JSON.parse(files.snapshot()[V3_PATH]).revision, before.revision);
+    assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], "string");
+    files.failNext("replaceAtomically", ({ destination }) => destination === V3_CLEANUP_PATH);
+    await assert.rejects(store.transact(before.revision, cleared), /FAKE_REPLACEATOMICALLY_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) =>
+      path.startsWith(`${V3_CLEANUP_PATH}.tmp.`)), false);
+    assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+    files.failNext("writeTextAfterWrite", ({ path }) => path.startsWith(`${V3_PATH}.tmp.`));
+    await assert.rejects(store.transact(before.revision, cleared), /FAKE_WRITETEXTAFTERWRITE_FAILED/);
+    assert.equal(Object.keys(files.snapshot()).some((path) => path.startsWith(`${V3_PATH}.tmp.`)), false);
+    assert.equal(typeof files.snapshot()[V3_CLEANUP_PATH], "string");
+    const restarted = v3Store(files, legacy);
+    assert.equal((await restarted.initialize()).mode, "v3");
+    assert.equal(files.snapshot()[V3_CLEANUP_PATH], undefined);
+    assert.equal(typeof files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], "string");
+  }
 });
