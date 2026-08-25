@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship Operit MVU 0.3.0 with actor-aware effect groups, a reusable condition library, bounded v3 persistence/querying, searchable large-data UI, four-section navigation, and verified compatibility with the modified OperitAI APK.
+**Goal:** Ship Operit MVU 3.0.0 with actor-aware effect groups, a reusable condition library, bounded v3 persistence/querying, searchable large-data UI, four-section navigation, and verified compatibility with the modified OperitAI APK.
 
 **Architecture:** Keep the feature plugin-local. Introduce v3 domain modules beside the current app service, migrate v2 into a separate v3 dataset without overwriting it, append history into committed JSONL segments, and expose all large collections through typed query IPC. Split the monolithic WebView script into a small shared runtime plus four page modules that consume query responses instead of a full dataset snapshot.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Set package and manifest version to `0.3.0`; produce `release/operit_mvu-0.3.0.toolpkg`.
+- Set package and manifest version to `3.0.0`; produce `release/operit_mvu-3.0.0.toolpkg`.
 - Do not modify or overwrite `operit_mvu.dataset.v2.json`; migration writes v3 files and switches only after validation.
 - Do not modify OperitAI host source; use the APK under `OperitAI` only for integration verification.
 - Missing `triggerActorId` must skip the affected action and record a diagnostic; it must never broaden to all actors.
@@ -675,11 +675,11 @@ git commit -m "feat: bound MVU model input and diagnostics"
 
 **Interfaces:**
 - Consumes: complete v3 implementation and modified OperitAI APK.
-- Produces: verified `release/operit_mvu-0.3.0.toolpkg`, QA evidence, source commit, GitHub release.
+- Produces: verified `release/operit_mvu-3.0.0.toolpkg`, QA evidence, source commit, GitHub release.
 
 - [ ] **Step 1: Write a failing package audit**
 
-Assert package/manifest/docs version `0.3.0`, dataset docs state v3 plus v2 migration, release name is exact, archive excludes tests/QA/artifacts, and archive contains one root `app.html` plus runtime files.
+Assert package/manifest/docs version `3.0.0`, dataset docs state v3 plus v2 migration, release name is exact, archive excludes tests/QA/artifacts, and archive contains one root `app.html` plus runtime files.
 
 - [ ] **Step 2: Run package audit RED**
 
@@ -689,13 +689,13 @@ Expected: FAIL while version remains 2.0.1.
 
 - [ ] **Step 3: Update version and user-facing documentation**
 
-Replace versioned artifact references with `operit_mvu-0.3.0.toolpkg`. Document condition library, actor-bound rules, effect groups, page sizes, searchable pickers, v2 migration, v3 export, and recovery behavior.
+Replace versioned artifact references with `operit_mvu-3.0.0.toolpkg`. Document condition library, actor-bound rules, effect groups, page sizes, searchable pickers, v2 migration, v3 export, and recovery behavior.
 
 - [ ] **Step 4: Run complete verification and package**
 
 Run: `pnpm run check; pnpm run pack; node scripts/audit-v3-package.mjs`
 
-Expected: PASS and a new `release/operit_mvu-0.3.0.toolpkg`.
+Expected: PASS and a new `release/operit_mvu-3.0.0.toolpkg`.
 
 - [ ] **Step 5: Perform visual verification**
 
@@ -703,7 +703,7 @@ Build the local app and inspect 320/360/393/430 widths plus 130% text sizing. Ca
 
 - [ ] **Step 6: Test in the modified OperitAI APK**
 
-Locate the APK with `rg --files OperitAI -g '*.apk'`, install/update it with ADB, import the 0.3.0 ToolPkg, then exercise the eight integration scenarios in the spec. Record commands, package hashes, device identity, and observed results without modifying the OperitAI worktree.
+Locate the APK with `rg --files OperitAI -g '*.apk'`, install/update it with ADB, import the 3.0.0 ToolPkg, then exercise the eight integration scenarios in the spec. Record commands, package hashes, device identity, and observed results without modifying the OperitAI worktree. Complete a full MuMu acceptance pass before any GitHub push: score visual harmony, compactness, comprehensibility, functional completeness, error recovery, and end-to-end user experience; repair and retest every confirmed regression.
 
 - [ ] **Step 7: Request code review and fix findings**
 
@@ -713,9 +713,9 @@ Use `superpowers:requesting-code-review`, review all changes from `ba3086d` to H
 
 ```powershell
 git add package.json manifest.json README.md docs scripts/audit-v3-package.mjs
-git commit -m "release: prepare Operit MVU 0.3.0"
+git commit -m "release: prepare Operit MVU 3.0.0"
 ```
 
 - [ ] **Step 9: Push and publish only the verified commit**
 
-Push the implementation branch, merge according to the repository’s existing release workflow, create tag `v0.3.0`, and publish `release/operit_mvu-0.3.0.toolpkg` as the GitHub release asset. Verify the remote tag commit and uploaded asset SHA-256 match local values.
+Only after the complete MuMu acceptance pass is green, push the implementation branch, merge according to the repository’s existing release workflow, create tag `v3.0.0`, and publish `release/operit_mvu-3.0.0.toolpkg` as the GitHub release asset. Verify the remote tag commit and uploaded asset SHA-256 match local values.
