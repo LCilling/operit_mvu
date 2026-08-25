@@ -10,6 +10,17 @@ import type {
 import type { RecordQueryRequest, RecordQueryResult } from "./record-store";
 import type { MigrationStatus, V3MvuStoreSnapshot } from "./store-v3";
 import { assertMvuDatasetV3 } from "./validation";
+import {
+  commitFieldTemplateImport,
+  createFieldTemplateExport,
+  previewFieldTemplate,
+  type ExportFieldTemplateRequest,
+  type FieldTemplateExportPayload,
+  type FieldTemplateImportResult,
+  type FieldTemplatePreview,
+  type ImportFieldTemplateRequest,
+  type PreviewFieldTemplateImportRequest,
+} from "./field-template";
 
 export const QUERY_SEARCH_MAX_LENGTH = 120;
 export const QUERY_CURSOR_MAX_LENGTH = 96;
@@ -322,6 +333,18 @@ export class MvuQueryService {
     this.createCursorToken = options.createCursorToken ?? defaultCursorToken;
     this.cursorTtlMs = positiveSafeInteger(options.cursorTtlMs, DEFAULT_CURSOR_TTL_MS);
     this.cursorCapacity = positiveSafeInteger(options.cursorCapacity, DEFAULT_CURSOR_CAPACITY);
+  }
+
+  exportFieldTemplate(request: ExportFieldTemplateRequest): Promise<FieldTemplateExportPayload> {
+    return createFieldTemplateExport(this.source, request, this.now());
+  }
+
+  previewFieldTemplateImport(request: PreviewFieldTemplateImportRequest): Promise<FieldTemplatePreview> {
+    return previewFieldTemplate(this.source, request);
+  }
+
+  importFieldTemplate(request: ImportFieldTemplateRequest): Promise<FieldTemplateImportResult> {
+    return commitFieldTemplateImport(this.source, request);
   }
 
   async queryFields(request: QueryRequest): Promise<QueryResponse<FieldQueryItem>> {
