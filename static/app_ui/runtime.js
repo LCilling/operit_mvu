@@ -86,6 +86,7 @@
     conditionListRecovery: null,
     managementDeleteDialog: null,
     managementRecoveries: { rules: null, effectGroups: null },
+    managementPending: { rules: false, effectGroups: false },
     advancedExport: { busy: false, result: null, error: "" },
     advancedDialog: null,
     advancedImportOpener: null,
@@ -238,8 +239,8 @@
   }
 
   function requireStringArray(value, code, allowEmpty) {
-    if (!Array.isArray(value) || (!allowEmpty && value.length === 0) ||
-        !value.every(function (entry) { return typeof entry === "string" && entry.length > 0; })) {
+    if (!Array.isArray(value) || value.length > 100 || (!allowEmpty && value.length === 0) ||
+        !value.every(function (entry) { return typeof entry === "string" && entry.length > 0 && entry.length <= 256; })) {
       throw new Error(code);
     }
   }
@@ -515,7 +516,7 @@
       return;
     }
     validateRuleActorSelector(rule.triggerActorSelector);
-    if (!Array.isArray(rule.actions) || rule.actions.length === 0 || !finiteNumber(rule.cooldownHours) ||
+    if (!Array.isArray(rule.actions) || rule.actions.length === 0 || rule.actions.length > 100 || !finiteNumber(rule.cooldownHours) ||
         rule.cooldownHours < 0 || !Number.isSafeInteger(rule.executionOrder)) throw new Error("MVU_RULE_INVALID");
     requireString(rule.createdAt, "MVU_RULE_INVALID");
     requireString(rule.updatedAt, "MVU_RULE_INVALID");
@@ -664,7 +665,7 @@
       requireBoolean(effect.truncated, "MVU_EFFECT_GROUP_INVALID");
       return;
     }
-    if (!Array.isArray(effect.fieldEffects) || effect.fieldEffects.length === 0) throw new Error("MVU_EFFECT_GROUP_INVALID");
+    if (!Array.isArray(effect.fieldEffects) || effect.fieldEffects.length === 0 || effect.fieldEffects.length > 100) throw new Error("MVU_EFFECT_GROUP_INVALID");
     requireString(effect.createdAt, "MVU_EFFECT_GROUP_INVALID");
     requireString(effect.updatedAt, "MVU_EFFECT_GROUP_INVALID");
     validateEffectReasonConfig(effect.defaultReason, 16384);
@@ -701,10 +702,11 @@
   }
 
   function validateFieldEffect(fieldEffect) {
-    if (!isRecord(fieldEffect) || !Array.isArray(fieldEffect.operations) || fieldEffect.operations.length === 0) {
+    if (!isRecord(fieldEffect) || !Array.isArray(fieldEffect.operations) || fieldEffect.operations.length === 0 || fieldEffect.operations.length > 100) {
       throw new Error("MVU_FIELD_EFFECT_INVALID");
     }
     requireString(fieldEffect.id, "MVU_FIELD_EFFECT_INVALID");
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(fieldEffect.id)) throw new Error("MVU_FIELD_EFFECT_INVALID");
     requireString(fieldEffect.fieldId, "MVU_FIELD_EFFECT_INVALID");
     validateEffectActorSelector(fieldEffect.actorSelector);
     fieldEffect.operations.forEach(function (operation) {
@@ -716,6 +718,9 @@
       }
       requireStringArray(operation.sources, "MVU_EFFECT_OPERATION_INVALID", false);
       if (!operation.sources.every(function (source) { return ["manual", "natural", "per_turn", "rule", "ai"].includes(source); })) {
+        throw new Error("MVU_EFFECT_OPERATION_INVALID");
+      }
+      if (["positive_multiplier", "negative_multiplier", "all_multiplier"].includes(operation.kind) && operation.value < 0) {
         throw new Error("MVU_EFFECT_OPERATION_INVALID");
       }
     });
@@ -1493,7 +1498,7 @@
     state.directory.groupTotal = results[1].totalCount;
   }
 
-  async function loadRouteData(routeId) {
+  async function loadRouteData(routeId, options) {
     const route = ROUTES[routeId];
     if (!route) throw new Error("MVU_ROUTE_UNKNOWN:" + routeId);
     state.routeError = null;
@@ -1539,6 +1544,7 @@
         message: readableError(error),
         action: "重试",
       };
+      if (options && options.throwOnError) throw error;
     }
   }
 
@@ -1663,9 +1669,18 @@
     }
     if (method === "queryActors") {
       const groupId = params && params.filters && params.filters.groupId;
+      const fieldId = params && params.filters && params.filters.fieldId;
       const picker = isDemoPickerRequest(method, params);
-      const source = groupId ? (demo.groupMembers[groupId] || []) : (picker ? demo.pickerActors : demo.actors);
-      return demoPickerResponse(demoQuery(source, params, 30, "characterId", true, "actors"), params, picker, source);
+      let source = groupId ? (demo.groupMembers[groupId] || []) : (picker ? demo.pickerActors : demo.actors);
+      if (fieldId) {
+        const field = demo.fields.concat(demo.pickerFields).find(function (item) { return item.id === fieldId; });
+        if (!field || field.scope !== "character") return Promise.reject(new Error("MVU_QUERY_FILTER_INVALID:fieldId"));
+        const boundIds = new Set(field.bindingIds || []);
+        source = source.filter(function (actor) { return boundIds.has(actor.characterId); });
+      }
+      const actorParams = fieldId ? { ...params, filters: { ...(params.filters || {}) } } : params;
+      if (fieldId) delete actorParams.filters.fieldId;
+      return demoPickerResponse(demoQuery(source, actorParams, 30, "characterId", true, "actors"), params, picker, source);
     }
     if (method === "queryGroups") {
       const picker = isDemoPickerRequest(method, params);
@@ -1912,10 +1927,10 @@
 
   function demoValidateRuleReferences(rule, demo) {
     const conditions = new Set(demo.conditionEntities.concat(demo.pickerConditions).map(function (item) { return item.id; }));
-    const fields = new Set(demo.fields.concat(demo.pickerFields).map(function (item) { return item.id; }));
+    const fields = new Map(demo.fields.concat(demo.pickerFields).map(function (item) { return [item.id, item]; }));
     const actors = new Set(demo.actors.concat(demo.pickerActors).map(function (item) { return item.characterId; }));
     const groups = new Set(demo.groups.concat(demo.pickerGroups).map(function (item) { return item.characterGroupId; }));
-    const effects = new Set(demo.effectEntities.concat(demo.pickerEffects).map(function (item) { return item.id; }));
+    const effects = new Map(demo.effectEntities.concat(demo.pickerEffects).map(function (item) { return [item.id, item]; }));
     if (!conditions.has(rule.conditionId)) throw new Error("MVU_RULE_CONDITION_NOT_FOUND:" + rule.conditionId);
     if (rule.triggerActorSelector.kind === "selected" && rule.triggerActorSelector.actorIds.some(function (id) { return !actors.has(id); })) {
       throw new Error("MVU_RULE_ACTOR_NOT_FOUND");
@@ -1928,11 +1943,17 @@
         if (!effects.has(action.effectGroupId)) throw new Error("MVU_RULE_EFFECT_GROUP_NOT_FOUND:" + action.effectGroupId);
         return;
       }
-      if (!fields.has(action.fieldId)) throw new Error("MVU_RULE_FIELD_NOT_FOUND:" + action.fieldId);
-      if (action.target.kind === "selected" && action.target.actorIds.some(function (id) { return !actors.has(id); })) {
+      const field = fields.get(action.fieldId);
+      if (!field) throw new Error("MVU_RULE_FIELD_NOT_FOUND:" + action.fieldId);
+      if (field.scope !== "character" && action.target.kind !== "all_bound") throw new Error("MVU_RULE_TARGET_SCOPE_INVALID");
+      const boundIds = new Set(field.bindingIds || []);
+      if (action.target.kind === "selected" && action.target.actorIds.some(function (id) { return !actors.has(id) || !boundIds.has(id); })) {
         throw new Error("MVU_RULE_TARGET_ACTOR_NOT_FOUND");
       }
-      if (action.effectGroupIds.some(function (id) { return !effects.has(id); })) throw new Error("MVU_RULE_EFFECT_GROUP_NOT_FOUND");
+      if (action.effectGroupIds.some(function (id) {
+        const effect = effects.get(id);
+        return !effect || !effect.fieldEffects.some(function (fieldEffect) { return fieldEffect.fieldId === action.fieldId; });
+      })) throw new Error("MVU_RULE_EFFECT_GROUP_NOT_FOUND");
     });
   }
 
@@ -1991,7 +2012,8 @@
       if (seen.has(fieldEffect.fieldId)) throw new Error("MVU_EFFECT_FIELD_DUPLICATE:" + fieldEffect.fieldId);
       seen.add(fieldEffect.fieldId);
       if (field.scope !== "character" && fieldEffect.actorSelector.kind !== "all_bound") throw new Error("MVU_EFFECT_ACTOR_SCOPE_INVALID");
-      if (fieldEffect.actorSelector.kind === "selected" && fieldEffect.actorSelector.actorIds.some(function (id) { return !actors.has(id); })) {
+      const boundIds = new Set(field.bindingIds || []);
+      if (fieldEffect.actorSelector.kind === "selected" && fieldEffect.actorSelector.actorIds.some(function (id) { return !actors.has(id) || !boundIds.has(id); })) {
         throw new Error("MVU_EFFECT_ACTOR_NOT_FOUND");
       }
     });
@@ -2558,7 +2580,7 @@
     const demoEffectEntities = Array.from({ length: 23 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(2, "0");
       return { id: "demo-effect-" + ordinal, name: "演示效果 " + ordinal, description: "服务端效果查询", enabled: true,
-        fieldEffects: [{ id: "demo-field-effect-" + ordinal, fieldId: "demo-field-" + String(index % 12 + 1).padStart(2, "0"),
+        fieldEffects: [{ id: "demo_field_effect_" + ordinal, fieldId: "demo-field-" + String(index % 12 + 1).padStart(2, "0"),
           actorSelector: { kind: "all_bound" }, operations: [{ kind: "immediate_delta", value: 1 }] }],
         defaultReason: { mode: "template", template: "general", text: "" },
         createdAt: timestamp, updatedAt: timestamp };
@@ -2633,7 +2655,9 @@
     const pickerEffects = Array.from({ length: 96 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(3, "0");
       return { ...effectEntities[0], id: "picker-effect-" + ordinal, name: "游标效果 " + ordinal,
-        fieldEffects: effectEntities[0].fieldEffects.map(function (item) { return { ...item, id: item.id + "-picker-" + ordinal }; }) };
+        fieldEffects: effectEntities[0].fieldEffects.map(function (item) {
+          return { ...item, id: item.id + "_picker_" + ordinal, fieldId: "picker-field-" + ordinal };
+        }) };
     });
     const pickerRules = Array.from({ length: 96 }, function (_value, index) {
       const ordinal = String(index + 1).padStart(3, "0");

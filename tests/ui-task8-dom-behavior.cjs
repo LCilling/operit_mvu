@@ -175,7 +175,10 @@ test("picker cache cap pauses only auto-fetch and keeps retained DOM without a d
   const window = await createApp("rule-editor");
   t.after(() => window.close());
   const { document } = window;
-  document.querySelector('[data-picker-key="rule-trigger-actors"]').click();
+  const actorKind = document.querySelector('[name="ruleActorKind"]');
+  actorKind.value = "selected";
+  actorKind.dispatchEvent(new window.Event("change", { bubbles: true }));
+  document.querySelector('[data-picker-key="rule-trigger-selected"]').click();
   await waitFor(() => window.MvuUi.state.entityPicker?.orderIds.length === 30, "actor picker first page did not load");
   const picker = window.MvuUi.state.entityPicker;
   picker.retainedPageLimit = 1;

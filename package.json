@@ -1,6 +1,6 @@
 {
   "name": "operit_mvu",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "private": true,
   "description": "Dynamic character state ToolPkg for OperitAI",
   "license": "MIT",
@@ -9,6 +9,7 @@
     "audit": "node scripts/audit-manifest.mjs && node scripts/audit-host-api-compat.mjs && node scripts/audit-web-ui.mjs && node scripts/audit-v3-ui.mjs",
     "audit:manifest": "node scripts/audit-manifest.mjs",
     "audit:host": "node scripts/audit-host-api-compat.mjs",
+    "audit:package": "node scripts/audit-v3-package.mjs",
     "audit:v3": "node scripts/audit-v3-ui.mjs",
     "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
@@ -18,7 +19,7 @@
     "build:web": "node scripts/build-web.mjs",
     "build": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run build:web && pnpm run audit:host",
     "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run test:v3 && pnpm run test:dom && pnpm run audit:host",
-    "pack": "pnpm run build && node scripts/pack.mjs"
+    "pack": "pnpm run build && node scripts/pack.mjs && pnpm run audit:package"
   },
   "devDependencies": {
     "happy-dom": "20.11.6",
