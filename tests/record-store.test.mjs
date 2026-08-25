@@ -91,6 +91,33 @@ function lineCount(content) {
   return lines.length;
 }
 
+test("indexed field-scope record pages keep exact totals with bounded segment reads", async () => {
+  const files = createFakeMvuFileApi();
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+  const source = Array.from({ length: 1_000 }, (_, index) => changeRecord(index, index < 500
+    ? { fieldId: "field_other", scopeKey: "character:U", actorId: "U" }
+    : {}));
+  const staged = await records.stageAppend(createEmptyRecordManifest(), source, 1);
+  const beforeQuery = files.operations().length;
+
+  const result = await records.queryRecords(staged.manifest, {
+    limit: 10,
+    direction: "desc",
+    fieldId: "field_affinity",
+    scopeKey: "character:T",
+  });
+
+  assert.equal(result.totalCount, 500);
+  assert.deepEqual(result.items.map((item) => item.id), [
+    "record_999", "record_998", "record_997", "record_996", "record_995",
+    "record_994", "record_993", "record_992", "record_991", "record_990",
+  ]);
+  const reads = files.operations().slice(beforeQuery).filter((operation) => operation.operation.startsWith("readText"));
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].startLine, 1);
+  assert.equal(reads[0].endLine, 500);
+});
+
 function installProductionHost(t, files, hostSnapshot, modelCalls, registrations, fileCalls) {
   const previous = {
     hasIcons: Object.prototype.hasOwnProperty.call(globalThis, "Icons"),

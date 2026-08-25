@@ -504,6 +504,8 @@ export class MvuQueryService {
       offset: (page - 1) * MANAGEMENT_PAGE_SIZES.records,
       limit: MANAGEMENT_PAGE_SIZES.records,
       direction,
+      fieldId: request.filters?.fieldId as string | undefined,
+      scopeKey: request.filters?.scopeKey as string | undefined,
     });
     return {
       items: result.items,
@@ -547,7 +549,8 @@ export class MvuQueryService {
       this.queryRecords({ page: 1 }),
     ]);
     const dataset = snapshot.dataset;
-    const fields = queryCollectionFromValidated("fields", dataset.fields, {}, MANAGEMENT_PAGE_SIZES.fields, false, {
+    const applicableFields = dataset.fields.filter((field) => field.enabled && contextScopeKey(field, activeContext) !== null);
+    const fields = queryCollectionFromValidated("fields", applicableFields, {}, MANAGEMENT_PAGE_SIZES.fields, false, {
       key: "order", direction: "asc",
     }, { order: (item) => item.order }, (item) => item.id);
     const rules = queryCollectionFromValidated("rules", dataset.rules, {}, MANAGEMENT_PAGE_SIZES.rules, false, {
@@ -1078,8 +1081,13 @@ function validateQueryRequest(
 }
 
 function validateRecordRequest(request: QueryRequest): void {
-  validateQueryRequest(request, { cursor: false, sortKeys: ["occurredAt"], filterKeys: [] });
-  if ((request.search ?? "").length > 0 || Object.keys(request.filters ?? {}).length > 0) {
+  validateQueryRequest(request, { cursor: false, sortKeys: ["occurredAt"], filterKeys: ["fieldId", "scopeKey"] });
+  if ((request.search ?? "").length > 0) {
+    throw new Error("MVU_QUERY_FILTER_INVALID");
+  }
+  requireFilter(request.filters ?? {}, "fieldId", isNonEmptyFilterString);
+  requireFilter(request.filters ?? {}, "scopeKey", isNonEmptyFilterString);
+  if ((request.filters?.fieldId === undefined) !== (request.filters?.scopeKey === undefined)) {
     throw new Error("MVU_QUERY_FILTER_INVALID");
   }
   if (request.sort !== undefined && request.sort.key !== "occurredAt") {

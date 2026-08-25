@@ -297,7 +297,10 @@ function createQuerySource(
       if (status.mode === "v3" && isV3MvuStore(activeRuntime.store)) {
         return activeRuntime.store.queryRecords(request);
       }
-      const records = (await activeRuntime.dataset()).records;
+      const records = (await activeRuntime.dataset()).records.filter((record) =>
+        request.fieldId === undefined ||
+        (record.fieldId === request.fieldId && record.scopeKey === request.scopeKey)
+      );
       const offset = request.offset ?? 0;
       const ordered = request.direction === "asc" ? records : [...records].reverse();
       const items = ordered.slice(offset, offset + request.limit);

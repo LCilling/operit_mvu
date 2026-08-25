@@ -160,14 +160,16 @@
   function stageStrip(field, value, colors) {
     const stages = field.stages.slice().sort(function (a, b) { return a.threshold - b.threshold; });
     return '<article class="detail-card stage-card"><div class="card-heading"><strong>阶段</strong><span>' +
-      ui.formatNumber(field.minimum) + " – " + ui.formatNumber(field.maximum) + '</span></div><div class="stage-labels">' +
+      ui.formatNumber(field.minimum) + " – " + ui.formatNumber(field.maximum) + '</span></div><div class="stage-map"><div class="stage-track">' +
       stages.map(function (stage, index) {
         const active = value >= stage.threshold && (index === stages.length - 1 || value < stages[index + 1].threshold);
-        return '<span class="' + (active ? "active" : "") + '" style="--stage-color:' + colors[index] + '">' + ui.escapeHtml(stage.name) + "</span>";
-      }).join("") + '</div><div class="stage-track">' + stages.map(function (stage, index) {
-        return '<i style="left:' + percent(stage.threshold, field.minimum, field.maximum) + '%;--stage-color:' + colors[index] + '" aria-hidden="true"></i>';
-      }).join("") + '<b style="left:' + percent(value, field.minimum, field.maximum) + '%" aria-label="当前值位置"></b></div><div class="stage-values">' +
-      stages.map(function (stage) { return '<span>' + ui.formatNumber(stage.threshold) + "</span>"; }).join("") + "</div></article>";
+        const edge = index === 0 ? " edge-start" : index === stages.length - 1 ? " edge-end" : "";
+        return '<span class="stage-marker' + (active ? " active" : "") + edge + '" style="--stage-position:' +
+          percent(stage.threshold, field.minimum, field.maximum) + '%;--stage-color:' + colors[index] + '" data-stage-lane="' +
+          (index % 2) + '"><span class="stage-name">' + ui.escapeHtml(stage.name) + '</span><i aria-hidden="true"></i><span class="stage-threshold">' +
+          ui.formatNumber(stage.threshold) + "</span></span>";
+      }).join("") + '<b class="stage-current" style="--stage-position:' + percent(value, field.minimum, field.maximum) +
+      '%" aria-label="当前值位置"></b></div></div></article>';
   }
 
   function trendModel(field, records, colors) {

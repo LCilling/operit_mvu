@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 
 const runtimeSource = await readFile(new URL("../static/app_ui/runtime.js", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../static/app_ui/app.js", import.meta.url), "utf8");
+const componentsSource = await readFile(new URL("../static/app_ui/components.js", import.meta.url), "utf8");
 
 function page(items) {
   return { items, loadedCount: items.length, totalCount: items.length, hasMore: false, nextCursor: null };
@@ -197,4 +198,62 @@ test("snapshot and query validation rejects malformed items for every DTO kind",
   }
   assert.throws(() => ui.validateQueryResponse(page([{ characterId: 7 }]), "actors"), /INVALID/);
   assert.throws(() => ui.validateQueryResponse(page([{ characterGroupId: 7 }]), "groups"), /INVALID/);
+});
+
+test("range validation disables unchanged input and previews proportional mapping", async () => {
+  const { context, ui } = createHarness();
+  ui.native.call = async (method) => method === "snapshot" ? validSnapshot() : page([]);
+  vm.runInContext(appSource, context, { filename: "app.js" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const field = {
+    minimum: 0, maximum: 100, step: 1, initialValue: 10,
+    stages: [{ threshold: 0 }, { threshold: 20 }, { threshold: 50 }, { threshold: 80 }],
+  };
+
+  assert.deepEqual({ ...ui.validateFieldRangeDraft(field, { minimum: 0, maximum: 100 }, 48) }, {
+    changed: false, error: "", previewValue: 48, mappedStep: 1,
+  });
+  assert.deepEqual({ ...ui.validateFieldRangeDraft(field, { minimum: -100, maximum: 100 }, 48) }, {
+    changed: true, error: "", previewValue: -4, mappedStep: 2,
+  });
+  assert.match(ui.validateFieldRangeDraft(field, { minimum: 1e15, maximum: 1e15 + 1 }, 48).error, /精度|跨度/);
+});
+
+test("stage names dots and thresholds share exact normalized positions for arbitrary counts", () => {
+  const { context, ui } = createHarness();
+  vm.runInContext(componentsSource, context, { filename: "components.js" });
+  const field = {
+    minimum: 0, maximum: 100, themeColor: "#7058d8",
+    stages: [
+      { id: "low", name: "低", threshold: 0 },
+      { id: "mid", name: "中", threshold: 10 },
+      { id: "high", name: "高", threshold: 90 },
+    ],
+  };
+
+  const html = ui.components.stageStrip(field, 12, ui.components.stagePalette(field));
+
+  assert.match(html, /class="stage-marker edge-start" style="--stage-position:0%/);
+  assert.match(html, /class="stage-marker active" style="--stage-position:10%/);
+  assert.match(html, /class="stage-marker edge-end" style="--stage-position:90%/);
+});
+
+test("field detail requests bounded records for its field and exact scope", async () => {
+  const { ui } = createHarness();
+  const calls = [];
+  ui.state.snapshot = validSnapshot();
+  ui.state.selectedFieldId = "field_a";
+  ui.native.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "getEntityById") return { id: "field_a" };
+    if (method === "queryRecords") return page([]);
+    return page([]);
+  };
+
+  await ui.loadRouteData("field-detail");
+
+  const request = calls.find(([method]) => method === "queryRecords")[1];
+  assert.equal(request.page, 1);
+  assert.equal(request.filters.fieldId, "field_a");
+  assert.equal(request.filters.scopeKey, "character:actor_a");
 });

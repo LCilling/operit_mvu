@@ -16,6 +16,8 @@ export interface RecordQueryRequest {
   offset?: number;
   limit: number;
   direction?: "asc" | "desc";
+  fieldId?: string;
+  scopeKey?: string;
 }
 
 export interface RecordQueryResult {
@@ -195,6 +197,13 @@ export class SegmentedRecordStore {
     if (direction !== "asc" && direction !== "desc") {
       throw new Error("MVU_V3_RECORD_QUERY_INVALID");
     }
+    if ((request.fieldId === undefined) !== (request.scopeKey === undefined) ||
+      (request.fieldId !== undefined && (request.fieldId.length === 0 || request.scopeKey!.length === 0))) {
+      throw new Error("MVU_V3_RECORD_QUERY_INVALID");
+    }
+    if (request.fieldId !== undefined && request.scopeKey !== undefined) {
+      return this.queryFilteredRecords(manifest, request, request.fieldId, request.scopeKey, direction);
+    }
     const available = Math.max(0, manifest.recordCount - offset);
     const take = Math.min(request.limit, available);
     if (take === 0) {
@@ -221,6 +230,70 @@ export class SegmentedRecordStore {
       hasMore,
       nextOffset: hasMore ? offset + items.length : null,
     };
+  }
+
+  private async queryFilteredRecords(
+    manifest: RecordManifest,
+    request: RecordQueryRequest,
+    fieldId: string,
+    scopeKey: string,
+    direction: "asc" | "desc",
+  ): Promise<RecordQueryResult> {
+    const key = recordFilterKey(fieldId, scopeKey);
+    const cached = new Map<number, DataChangeRecord[]>();
+    const matchingCounts: number[] = [];
+    for (let index = 0; index < manifest.segments.length; index += 1) {
+      const segment = manifest.segments[index];
+      if (segment.filterCounts !== undefined) {
+        matchingCounts.push(segment.filterCounts[key] ?? 0);
+        continue;
+      }
+      const rows = await this.readSegmentRecords(segment);
+      cached.set(index, rows);
+      matchingCounts.push(rows.filter((record) => record.fieldId === fieldId && record.scopeKey === scopeKey).length);
+    }
+    const totalCount = matchingCounts.reduce((sum, count) => sum + count, 0);
+    let skip = request.offset ?? 0;
+    let remaining = Math.min(request.limit, Math.max(0, totalCount - skip));
+    const items: DataChangeRecord[] = [];
+    const indexes = direction === "asc"
+      ? manifest.segments.map((_segment, index) => index)
+      : manifest.segments.map((_segment, index) => index).reverse();
+    for (const index of indexes) {
+      const count = matchingCounts[index];
+      if (skip >= count) {
+        skip -= count;
+        continue;
+      }
+      let matches = (cached.get(index) ?? await this.readSegmentRecords(manifest.segments[index]))
+        .filter((record) => record.fieldId === fieldId && record.scopeKey === scopeKey);
+      if (direction === "desc") matches = matches.reverse();
+      const available = matches.slice(skip, skip + remaining);
+      items.push(...available);
+      remaining -= available.length;
+      skip = 0;
+      if (remaining === 0) break;
+    }
+    const offset = request.offset ?? 0;
+    const hasMore = offset + items.length < totalCount;
+    return {
+      items,
+      loadedCount: items.length,
+      totalCount,
+      hasMore,
+      nextOffset: hasMore ? offset + items.length : null,
+    };
+  }
+
+  private async readSegmentRecords(segment: RecordSegmentMetadata): Promise<DataChangeRecord[]> {
+    const content = await this.files.readTextPart(
+      this.segmentPath(segment.fileName),
+      1,
+      segment.committedLineCount,
+    );
+    const lines = parsePartialLines(content, segment.fileName, 1, segment.committedLineCount);
+    return lines.map((line, index) =>
+      parseStoredLine(line, segment.fileName, index + 1, segment.lastRevision).record);
   }
 
   async deleteSegments(manifest: RecordManifest): Promise<void> {
@@ -287,6 +360,7 @@ export class SegmentedRecordStore {
       lastOccurredAt: firstRecord.occurredAt,
       firstRevision: commitRevision,
       lastRevision: commitRevision,
+      filterCounts: {},
     };
     manifest.segments.push(segment);
     manifest.nextSegmentIndex += 1;
@@ -344,6 +418,14 @@ export function assertRecordManifest(value: unknown): asserts value is RecordMan
       failManifest();
     }
     const validatedSegment = segment as RecordSegmentMetadata;
+    if (validatedSegment.filterCounts !== undefined) {
+      if (typeof validatedSegment.filterCounts !== "object" || validatedSegment.filterCounts === null ||
+        Object.entries(validatedSegment.filterCounts).some(([key, count]) => key.length === 0 || key.length > 1_024 ||
+          !Number.isSafeInteger(count) || count <= 0) ||
+        Object.values(validatedSegment.filterCounts).reduce((sum, count) => sum + count, 0) !== validatedSegment.committedLineCount) {
+        failManifest();
+      }
+    }
     previousIndex = validatedSegment.index;
     if (!Number.isSafeInteger(total + validatedSegment.committedLineCount)) failManifest();
     total += validatedSegment.committedLineCount;
@@ -355,7 +437,10 @@ export function assertRecordManifest(value: unknown): asserts value is RecordMan
 
 function cloneManifest(manifest: RecordManifest): RecordManifest {
   return {
-    segments: manifest.segments.map((segment) => ({ ...segment })),
+    segments: manifest.segments.map((segment) => ({
+      ...segment,
+      ...(segment.filterCounts === undefined ? {} : { filterCounts: { ...segment.filterCounts } }),
+    })),
     recordCount: manifest.recordCount,
     nextSegmentIndex: manifest.nextSegmentIndex,
   };
@@ -369,9 +454,17 @@ function updateSegmentMetadata(
   for (const record of records) {
     segment.firstOccurredAt = Math.min(segment.firstOccurredAt, record.occurredAt);
     segment.lastOccurredAt = Math.max(segment.lastOccurredAt, record.occurredAt);
+    if (segment.filterCounts !== undefined) {
+      const key = recordFilterKey(record.fieldId, record.scopeKey);
+      segment.filterCounts[key] = (segment.filterCounts[key] ?? 0) + 1;
+    }
   }
   segment.committedLineCount += records.length;
   segment.lastRevision = revision;
+}
+
+function recordFilterKey(fieldId: string, scopeKey: string): string {
+  return `${fieldId.length}:${fieldId}${scopeKey}`;
 }
 
 function validateSegmentMetadata(
@@ -390,6 +483,17 @@ function validateSegmentMetadata(
   for (let index = 1; index < revisions.length; index += 1) {
     if (revisions[index] < revisions[index - 1]) {
       throw new Error(`MVU_V3_RECORD_SEGMENT_REVISION_ORDER:${metadata.fileName}`);
+    }
+  }
+  if (metadata.filterCounts !== undefined) {
+    const actual: Record<string, number> = {};
+    for (const line of lines) {
+      const key = recordFilterKey(line.record.fieldId, line.record.scopeKey);
+      actual[key] = (actual[key] ?? 0) + 1;
+    }
+    if (Object.keys(actual).length !== Object.keys(metadata.filterCounts).length ||
+      Object.entries(actual).some(([key, count]) => metadata.filterCounts?.[key] !== count)) {
+      throw new Error(`MVU_V3_RECORD_SEGMENT_FILTER_METADATA_MISMATCH:${metadata.fileName}`);
     }
   }
 }

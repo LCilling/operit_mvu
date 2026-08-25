@@ -27,16 +27,21 @@
   }
 
   function fieldManagementCard(field) {
-    const current = field.current ? ui.formatNumber(field.current.value) : "未绑定";
-    return '<article class="management-card range-card" data-range-card="' + ui.escapeHtml(field.id) + '"><header><div>' + c.stateIcon(field) +
+    const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
+    const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
+    const current = summary && summary.current ? ui.formatNumber(summary.current.value) : "未绑定";
+    const view = { theme: { icon: field.icon, color: field.themeColor } };
+    return '<article class="management-card range-card" data-range-card="' + ui.escapeHtml(field.id) + '"><header><div>' + c.stateIcon(view) +
       '<span><strong>' + ui.escapeHtml(field.name) + '</strong><small>' + ui.escapeHtml(c.SCOPE_LABELS[field.scope] || field.scope) + " · 当前 " + current +
       '</small></span></div><span class="status-dot ' + (field.enabled ? "enabled" : "") + '">' + (field.enabled ? "已启用" : "已停用") + "</span></header>" +
-      '<div class="range-editor"><label>下限<input type="number" inputmode="decimal" value="' + field.range.minimum + '" data-range-number="minimum"></label>' +
-      '<span class="range-line" aria-hidden="true"></span><label>上限<input type="number" inputmode="decimal" value="' + field.range.maximum + '" data-range-number="maximum"></label></div>' +
-      '<p class="range-note">保存后按相对位置同步当前值、阶段与关联规则。</p><div class="card-actions">' +
+      '<div class="range-preview" style="--range-position:' + ((currentValue - field.minimum) / (field.maximum - field.minimum) * 100) +
+      '%"><span class="range-preview-track"><i></i></span><output data-range-preview>换算后 ' + ui.formatNumber(currentValue) + '</output></div>' +
+      '<div class="range-editor"><label>下限<input type="number" inputmode="decimal" step="any" value="' + field.minimum + '" data-range-number="minimum"></label>' +
+      '<span class="range-line" aria-hidden="true"></span><label>上限<input type="number" inputmode="decimal" step="any" value="' + field.maximum + '" data-range-number="maximum"></label></div>' +
+      '<p class="range-note">保存后按相对位置同步当前值、阶段与关联规则；步进同步换算为 ' + ui.formatNumber(field.step) + '。</p><div class="card-actions">' +
       '<button type="button" class="button ghost" data-action="open-field" data-field-id="' + ui.escapeHtml(field.id) + '">查看</button>' +
       '<button type="button" class="button secondary" data-action="edit-field" data-field-id="' + ui.escapeHtml(field.id) + '">修改</button>' +
-      '<button type="button" class="button primary compact" data-action="save-field-range" data-field-id="' + ui.escapeHtml(field.id) + '">保存范围</button></div>' +
+      '<button type="button" class="button primary compact" data-action="save-field-range" data-field-id="' + ui.escapeHtml(field.id) + '" disabled>保存范围</button></div>' +
       '<p class="inline-error" role="alert" data-range-error></p></article>';
   }
 

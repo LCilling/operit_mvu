@@ -166,6 +166,8 @@ export interface RecordSegmentMetadata {
   lastOccurredAt: number;
   firstRevision: number;
   lastRevision: number;
+  /** Exact per field/scope counts used to page one field without scanning all history. */
+  filterCounts?: Record<string, number>;
 }
 
 /** Only lines named by this committed manifest are visible to readers. */
