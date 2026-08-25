@@ -73,7 +73,7 @@ function main() {
     throw new Error("app.html still contains an external script or stylesheet reference");
   }
   write(outFile, out);
-  console.log(`Wrote ${path.relative(rootDir, outFile).replace(/\\/g, "/")} (${out.length} bytes)`);
+  console.log(`Wrote ${path.relative(rootDir, outFile).replace(/\\/g, "/")} (${Buffer.byteLength(out, "utf8")} bytes)`);
 }
 
 main();

@@ -115,15 +115,16 @@
     }
     const actor = target.closest("[data-select-actor]");
     if (actor) {
-      ui.state.statusMode = "character";
-      ui.state.lastActorId = actor.dataset.selectActor;
-      await reloadContext({ groupId: ui.state.snapshot.activeContext.groupId, actorId: actor.dataset.selectActor });
+      await reloadContext(
+        { groupId: ui.state.snapshot.activeContext.groupId, actorId: actor.dataset.selectActor },
+        ui.state.snapshot.activeContext.groupId,
+        "character"
+      );
       return;
     }
     const group = target.closest("[data-select-group]");
     if (group) {
-      ui.state.statusMode = "group";
-      await reloadContext({ groupId: group.dataset.selectGroup });
+      await reloadContext({ groupId: group.dataset.selectGroup }, group.dataset.selectGroup, "group");
       return;
     }
     const actionButton = target.closest("[data-action]");
@@ -221,7 +222,6 @@
 
   async function switchStatusMode(mode) {
     if (mode !== "character" && mode !== "group") throw new Error("MVU_STATUS_MODE_INVALID");
-    ui.state.statusMode = mode;
     if (mode === "group") {
       const selected = ui.state.snapshot.activeContext.groupId ||
         (ui.state.snapshot.selected.group && ui.state.snapshot.selected.group.characterGroupId) ||
@@ -230,23 +230,31 @@
         ui.transition(render);
         return;
       }
-      await reloadContext({ groupId: selected }, selected);
+      await reloadContext({ groupId: selected }, selected, "group");
       return;
     }
-    if (ui.state.lastActorId) {
-      const groupId = ui.state.snapshot.activeContext.groupId;
-      await reloadContext({ groupId, actorId: ui.state.lastActorId }, groupId);
-    } else {
-      ui.transition(render);
-    }
+    const groupId = ui.state.snapshot.activeContext.groupId;
+    await ui.loadDirectory(groupId || null);
+    const actorIds = ui.state.directory.actors.map(function (actor) { return actor.characterId; });
+    const actorId = actorIds.includes(ui.state.lastActorId) ? ui.state.lastActorId : actorIds[0];
+    if (!actorId) throw new Error("MVU_GROUP_MEMBER_MISSING");
+    await reloadContext({ groupId, actorId }, groupId, "character", true);
   }
 
-  async function reloadContext(request, directoryGroupId) {
+  async function reloadContext(request, directoryGroupId, nextMode, directoryLoaded) {
     setBusy(true);
     try {
-      await ui.loadSnapshot(request);
-      await ui.loadDirectory(directoryGroupId || null);
+      const snapshot = await ui.loadSnapshot(request);
+      if (nextMode === "character" && snapshot.activeContext.actorId !== request.actorId) {
+        throw new Error("MVU_ACTOR_PROJECTION_MISMATCH");
+      }
+      if (nextMode === "group" &&
+          (snapshot.activeContext.groupId !== request.groupId || snapshot.activeContext.actorId !== null)) {
+        throw new Error("MVU_GROUP_PROJECTION_MISMATCH");
+      }
+      if (!directoryLoaded) await ui.loadDirectory(directoryGroupId || null);
       await ui.loadRouteData(ui.state.route);
+      if (nextMode) ui.state.statusMode = nextMode;
       ui.transition(function () { render({ resetScroll: false }); });
     } catch (error) {
       ui.showFatal(error);
