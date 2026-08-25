@@ -113,12 +113,7 @@ export const MVU_IPC = {
 
 export type EmptyRequest = Record<string, never>;
 export interface SnapshotRequest { actorId?: string; groupId?: string; }
-export interface MvuPageSnapshot extends MvuCompactPageSnapshot {
-  contextLabels: {
-    groupName: string | null;
-    chatName: string;
-  };
-}
+export type MvuPageSnapshot = MvuCompactPageSnapshot;
 export type FieldInput = Omit<DataField, "id" | "order">;
 export type FieldPatch = Partial<Omit<DataField, "id">>;
 export type LinkRuleInput = Omit<DataLinkRule, "id">;

@@ -274,6 +274,7 @@ export {
 };
 export {
   MvuQueryService,
+  MVU_SNAPSHOT_MAX_BYTES,
   PICKER_BATCH_SIZE,
   QUERY_CURSOR_MAX_LENGTH,
   QUERY_SEARCH_MAX_LENGTH,
@@ -288,4 +289,10 @@ export type {
   QueryGroup,
   QueryRequest,
   QueryResponse,
+  SnapshotActorSummary,
+  SnapshotContextLabels,
+  SnapshotDisplayLabels,
+  SnapshotGroupSummary,
+  SnapshotMigrationStatus,
+  SnapshotScopeContext,
 } from "./query";

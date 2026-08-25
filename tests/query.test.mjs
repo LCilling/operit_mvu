@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MVU_SNAPSHOT_MAX_BYTES,
   MvuQueryService,
   QUERY_SEARCH_MAX_LENGTH,
 } from "../dist/mvu/app/query.js";
@@ -347,6 +348,87 @@ test("picker cursors are opaque query-bound bounded tokens with expiry and evict
   );
 });
 
+test("picker cursor fingerprints normalize search but preserve exact filter string identity", async () => {
+  const dataset = makeDataset();
+  dataset.fields = Array.from({ length: 62 }, (_, index) => ({
+    ...field(index),
+    order: index,
+    scope: "character",
+    bindingIds: [index < 31 ? "Actor_A" : "actor_a"],
+  }));
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  let cursorSequence = 0;
+  const service = new MvuQueryService(fixture.source, {
+    ...fixture.options,
+    createCursorToken: () => `fingerprint_${++cursorSequence}`,
+  });
+
+  const exact = await service.queryFields({
+    filters: { mode: "picker", bindingId: "Actor_A" },
+    sort: { key: "order", direction: "asc" },
+  });
+  assert.equal(exact.totalCount, 31);
+  assert.notEqual(exact.nextCursor, null);
+  await service.queryFields({
+    filters: { bindingId: "Actor_A", mode: "picker" },
+    sort: { direction: "asc", key: "order" },
+    cursor: exact.nextCursor,
+  });
+  await assert.rejects(
+    service.queryFields({
+      filters: { mode: "picker", bindingId: "actor_a" },
+      sort: { key: "order", direction: "asc" },
+      cursor: exact.nextCursor,
+    }),
+    /MVU_QUERY_CURSOR_INVALID/,
+  );
+
+  const normalizedSearch = await service.queryActors({ search: "  ＡＣＴＯＲ   ０  " });
+  assert.notEqual(normalizedSearch.nextCursor, null);
+  await service.queryActors({ search: "actor 0", cursor: normalizedSearch.nextCursor });
+});
+
+test("all exact string filters preserve case and code-unit identity", async () => {
+  const dataset = makeDataset();
+  dataset.fields = [
+    { ...field(0), id: "Field_A", bindingIds: ["Actor_A"] },
+    { ...field(1), id: "field_a", bindingIds: ["actor_a"] },
+  ];
+  dataset.conditions = [
+    { ...condition(0), id: "Condition_A" },
+    { ...condition(1), id: "condition_a" },
+  ];
+  dataset.effectGroups = [
+    { ...effectGroup(0), id: "Effect_A", fieldEffects: [{ ...effectGroup(0).fieldEffects[0], fieldId: "Field_A" }] },
+    { ...effectGroup(1), id: "effect_a", fieldEffects: [{ ...effectGroup(1).fieldEffects[0], fieldId: "field_a" }] },
+  ];
+  dataset.rules = [
+    { ...rule(0), id: "rule_condition_upper", conditionId: "Condition_A" },
+    { ...rule(1), id: "rule_condition_lower", conditionId: "condition_a" },
+    { ...rule(2), id: "rule_actor_upper", triggerActorSelector: { kind: "selected", actorIds: ["Actor_A"] } },
+    { ...rule(3), id: "rule_actor_lower", triggerActorSelector: { kind: "selected", actorIds: ["actor_a"] } },
+    { ...rule(4), id: "rule_group_upper", triggerActorSelector: { kind: "group", groupIds: ["Group_A"] } },
+    { ...rule(5), id: "rule_group_lower", triggerActorSelector: { kind: "group", groupIds: ["group_a"] } },
+  ];
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+
+  assert.deepEqual((await service.queryFields({ filters: { bindingId: "Actor_A" } })).items.map((item) => item.id), ["Field_A"]);
+  assert.deepEqual((await service.queryFields({ filters: { bindingId: "actor_a" } })).items.map((item) => item.id), ["field_a"]);
+  assert.deepEqual((await service.queryRules({ filters: { conditionId: "Condition_A" } })).items.map((item) => item.id), ["rule_condition_upper"]);
+  assert.deepEqual((await service.queryRules({ filters: { conditionId: "condition_a" } })).items.map((item) => item.id), ["rule_condition_lower"]);
+  assert.deepEqual((await service.queryRules({ filters: { actorId: "Actor_A" } })).items.map((item) => item.id), ["rule_actor_upper"]);
+  assert.deepEqual((await service.queryRules({ filters: { actorId: "actor_a" } })).items.map((item) => item.id), ["rule_actor_lower"]);
+  assert.deepEqual((await service.queryRules({ filters: { groupId: "Group_A" } })).items.map((item) => item.id), ["rule_group_upper"]);
+  assert.deepEqual((await service.queryRules({ filters: { groupId: "group_a" } })).items.map((item) => item.id), ["rule_group_lower"]);
+  assert.deepEqual((await service.queryEffectGroups({ filters: { fieldId: "Field_A" } })).items.map((item) => item.id), ["Effect_A"]);
+  assert.deepEqual((await service.queryEffectGroups({ filters: { fieldId: "field_a" } })).items.map((item) => item.id), ["effect_a"]);
+});
+
 test("picker pagination uses normalized human sort and raw ID as the final tie-break", async () => {
   const dataset = makeDataset();
   const fixture = createSource(dataset, {
@@ -600,6 +682,80 @@ test("compact snapshot contains summaries counts and first pages without option 
   assert.equal("records" in snapshot, false);
 });
 
+test("compact snapshot stays below a deterministic byte cap for multi-megabyte legacy labels", async () => {
+  const huge = "😀".repeat(1_000_000);
+  assert.equal(huge.length, 2_000_000);
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.fields = [{
+    ...field(0),
+    name: huge,
+    description: "\ud800".repeat(100),
+    bindingIds: ["actor_000"],
+  }];
+  dataset.conditions = [{ ...condition(0), name: huge, description: huge }];
+  dataset.effectGroups = [{ ...effectGroup(0), name: huge, description: huge }];
+  dataset.rules = [{ ...rule(0), name: huge, description: huge }];
+  const hugeRecord = { ...record(0), fieldName: huge, actorName: huge, reason: huge };
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({
+      items: [hugeRecord],
+      loadedCount: 1,
+      totalCount: 1,
+      hasMore: false,
+      nextOffset: null,
+    }),
+  });
+  const source = {
+    ...fixture.source,
+    async listActors() {
+      return [{ characterId: "actor_000", name: huge, avatarUri: huge, enabled: true }];
+    },
+    async listGroups() {
+      return [{ characterGroupId: "group_000", name: huge, avatarUri: huge }];
+    },
+    async activeContext() {
+      return { chatId: "chat_main", actorId: "actor_000", groupId: "group_000", actorName: huge };
+    },
+    async migrationStatus() {
+      return {
+        mode: "v3",
+        source: "migrated",
+        report: {
+          migratedFields: 1,
+          migratedRules: 1,
+          migratedConditions: 1,
+          migratedEffectGroups: 1,
+          warnings: Array.from({ length: 12 }, () => huge),
+        },
+        cleanup: { state: "pending", error: { code: huge, message: huge } },
+      };
+    },
+  };
+  const snapshot = await new MvuQueryService(source, fixture.options).pageSnapshot({
+    groupName: huge,
+    chatName: huge,
+  });
+
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= MVU_SNAPSHOT_MAX_BYTES);
+  assert.equal(snapshot.pages.fields.items[0].truncated, true);
+  assert.equal(snapshot.pages.rules.items[0].truncated, true);
+  assert.equal(snapshot.pages.conditions.items[0].truncated, true);
+  assert.equal(snapshot.pages.effectGroups.items[0].truncated, true);
+  assert.equal(snapshot.pages.records.items[0].truncated, true);
+  assert.equal(snapshot.selected.actor.truncated, true);
+  assert.equal(snapshot.selected.group.truncated, true);
+  assert.equal(snapshot.activeContext.truncated, true);
+  assert.equal(snapshot.contextLabels.truncated, true);
+  assert.equal(snapshot.migrationStatus.truncated, true);
+  assert.equal(snapshot.migrationStatus.report.warningCount, 12);
+  assert.equal(snapshot.migrationStatus.report.warnings.length, 8);
+  assert.equal(snapshot.migrationStatus.report.warningsTruncated, true);
+  assert.equal(snapshot.pages.fields.items[0].name.isWellFormed(), true);
+  assert.equal(snapshot.pages.fields.items[0].description.isWellFormed(), true);
+  assert.equal(snapshot.contextLabels.chatName.isWellFormed(), true);
+});
+
 test("condition and effect references are exact bounded pages including active instances", async () => {
   const dataset = makeDataset();
   dataset.conditions = [condition(0)];
@@ -750,30 +906,83 @@ test("condition effect-group and rule CRUD copy toggle delete and references sta
   assert.equal(fixture.current().rules.some((item) => item.id === createdRule.id), false);
 });
 
-test("stale clients cannot overwrite condition effect-group or rule mutations", async () => {
-  const dataset = makeDataset();
-  dataset.activeEffects = [];
-  const fixture = createSource(dataset, {
-    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
-  });
-  const service = new MvuQueryService(fixture.source, fixture.options);
-  const staleRevision = dataset.revision;
+test("all condition effect-group and rule mutations enforce revision CAS before writes", async (t) => {
+  const conditionInput = {
+    name: "Matrix condition",
+    description: "matrix",
+    enabled: true,
+    expression: { kind: "predicate", predicate: { kind: "user_care" } },
+  };
+  const effectGroupInput = {
+    name: "Matrix effect",
+    description: "matrix",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_matrix",
+      fieldId: "field_0000",
+      actorSelector: { kind: "all_bound" },
+      operations: [{ kind: "immediate_delta", value: 1 }],
+    }],
+  };
+  const ruleInput = {
+    name: "Matrix rule",
+    description: "matrix",
+    enabled: true,
+    triggerActorSelector: { kind: "any" },
+    conditionId: "condition_0000",
+    actions: [{ kind: "activate_effect_group", effectGroupId: "effect_0000" }],
+    cooldownHours: 0,
+    executionOrder: 1,
+  };
+  const operations = [
+    ["condition create", (service, expectedRevision) => service.createCondition({ expectedRevision, condition: conditionInput })],
+    ["condition update", (service, expectedRevision) => service.updateCondition({ id: "condition_0000", expectedRevision, patch: { description: "updated" } })],
+    ["condition copy", (service, expectedRevision) => service.copyCondition({ id: "condition_0000", expectedRevision })],
+    ["condition toggle", (service, expectedRevision) => service.toggleCondition({ id: "condition_0000", enabled: false, expectedRevision })],
+    ["condition delete", (service, expectedRevision) => service.deleteCondition({ id: "condition_0000", expectedRevision })],
+    ["effect-group create", (service, expectedRevision) => service.createEffectGroup({ expectedRevision, effectGroup: effectGroupInput })],
+    ["effect-group update", (service, expectedRevision) => service.updateEffectGroup({ id: "effect_0000", expectedRevision, patch: { description: "updated" } })],
+    ["effect-group copy", (service, expectedRevision) => service.copyEffectGroup({ id: "effect_0000", expectedRevision })],
+    ["effect-group toggle", (service, expectedRevision) => service.toggleEffectGroup({ id: "effect_0000", enabled: false, expectedRevision })],
+    ["effect-group delete", (service, expectedRevision) => service.deleteEffectGroup({ id: "effect_0000", expectedRevision })],
+    ["rule create", (service, expectedRevision) => service.createRule({ expectedRevision, rule: ruleInput })],
+    ["rule update", (service, expectedRevision) => service.updateRule({ id: "rule_0000", expectedRevision, patch: { description: "updated" } })],
+    ["rule copy", (service, expectedRevision) => service.copyRule({ id: "rule_0000", expectedRevision })],
+    ["rule toggle", (service, expectedRevision) => service.toggleRule({ id: "rule_0000", enabled: false, expectedRevision })],
+    ["rule delete", (service, expectedRevision) => service.deleteRule({ id: "rule_0000", expectedRevision })],
+  ];
 
-  const committed = await service.updateCondition({
-    id: "condition_0000",
-    expectedRevision: staleRevision,
-    patch: { description: "first client" },
-  });
-  assert.equal(committed.revision, staleRevision + 1);
-  assert.equal(committed.entity.description, "first client");
-  await assert.rejects(
-    service.updateCondition({
-      id: "condition_0000",
-      expectedRevision: staleRevision,
-      patch: { description: "stale client" },
-    }),
-  );
-  assert.equal(fixture.current().conditions[0].description, "first client");
+  for (const [name, mutate] of operations) {
+    await t.test(name, async () => {
+      const dataset = makeDataset();
+      dataset.conditions = [condition(0)];
+      dataset.effectGroups = [effectGroup(0)];
+      dataset.rules = name === "condition delete" || name === "effect-group delete" ? [] : [rule(0)];
+      dataset.activeEffects = [];
+      const fixture = createSource(dataset, {
+        queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+      });
+      let writes = 0;
+      const transactV3 = fixture.source.transactV3;
+      const service = new MvuQueryService({
+        ...fixture.source,
+        async transactV3(...args) {
+          writes += 1;
+          return transactV3(...args);
+        },
+      }, fixture.options);
+      const before = fixture.current();
+
+      await assert.rejects(mutate(service, dataset.revision + 99), /MVU_STALE_REVISION/);
+      assert.equal(writes, 0);
+      assert.deepEqual(fixture.current(), before);
+
+      const committed = await mutate(service, dataset.revision);
+      assert.equal(committed.revision, dataset.revision + 1);
+      assert.equal(writes, 1);
+      assert.equal(fixture.current().revision, dataset.revision + 1);
+    });
+  }
 });
 
 test("copying nested conditions assigns fresh IDs to every AI predicate", async () => {
