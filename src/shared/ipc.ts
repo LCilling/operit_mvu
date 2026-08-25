@@ -62,7 +62,10 @@ import type {
   RuleDefinitionV3,
   RuleTargetSelector,
 } from "../mvu/app/model-v3";
-import { EFFECT_REASON_SOURCE_MAX_LENGTH } from "../mvu/app/model-v3";
+import {
+  EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+  EFFECT_REASON_SOURCE_MAX_LENGTH,
+} from "../mvu/app/model-v3";
 import type {
   BackgroundModelProbeResult,
   SystemModelApi,
@@ -623,7 +626,12 @@ function parseTemporaryEffectInput(value: unknown): TemporaryEffectInput {
       ["general", "positive", "negative", "environment", "relationship"] as const,
       "MVU_EFFECT_REASON_TEMPLATE_REQUIRED"
     ),
-    reason: requireString(record, "reason", "MVU_EFFECT_REASON_REQUIRED"),
+    reason: requireBoundedString(
+      record,
+      "reason",
+      EFFECT_REASON_SOURCE_MAX_LENGTH,
+      "MVU_EFFECT_REASON_TOO_LONG",
+    ),
     createdAt: requireNumber(record, "createdAt", "MVU_EFFECT_CREATED_REQUIRED"),
   };
 }
@@ -649,7 +657,14 @@ function parseTemporaryEffectPatch(value: unknown): TemporaryEffectPatch {
       "MVU_EFFECT_REASON_TEMPLATE_REQUIRED"
     );
   }
-  if (hasOwn(record, "reason")) patch.reason = requireString(record, "reason", "MVU_EFFECT_REASON_REQUIRED");
+  if (hasOwn(record, "reason")) {
+    patch.reason = requireBoundedString(
+      record,
+      "reason",
+      EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
+      "MVU_EFFECT_REASON_TOO_LONG",
+    );
+  }
   if (hasOwn(record, "createdAt")) patch.createdAt = requireNumber(record, "createdAt", "MVU_EFFECT_CREATED_REQUIRED");
   return patch;
 }
@@ -1249,7 +1264,7 @@ function parseEffectReasonConfig(value: unknown): EffectReasonConfig {
   const template = requireEnum(
     record,
     "template",
-    ["general", "positive", "negative", "environment", "relationship"] as const,
+    ["general", "rule", "natural", "per_turn", "ai", "manual"] as const,
     "MVU_EFFECT_REASON_CONFIG_INVALID",
   );
   const text = requireBoundedString(record, "text", EFFECT_REASON_SOURCE_MAX_LENGTH, "MVU_EFFECT_REASON_CONFIG_INVALID");

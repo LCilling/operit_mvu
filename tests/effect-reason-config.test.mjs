@@ -9,13 +9,14 @@ import {
   EFFECT_REASON_SOURCE_MAX_LENGTH,
 } from "../dist/mvu/app/model-v3.js";
 import { MvuQueryService } from "../dist/mvu/app/query.js";
-import { processPersistedMessageV3 } from "../dist/mvu/app/service.js";
+import { MvuService, processPersistedMessageV3 } from "../dist/mvu/app/service.js";
 import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
 import { FileMvuStore } from "../dist/mvu/app/store.js";
 import { assertDataChangeRecord, assertMvuDatasetV3 } from "../dist/mvu/app/validation.js";
 import { MVU_REQUEST_PARSERS } from "../dist/shared/ipc.js";
 import {
   createFakeMvuFileApi,
+  effectFixture,
   legacyDatasetFixture,
 } from "./helpers.mjs";
 
@@ -161,35 +162,39 @@ test("v2 migration preserves definition reason configuration and resolves the ac
   templateLegacy.temporaryEffects[0].reasonMode = "template";
   templateLegacy.temporaryEffects[0].reasonTemplate = "positive";
   templateLegacy.temporaryEffects[0].reason = "legacy template metadata";
-  const template = migrateDatasetV2ToV3(templateLegacy, NOW).dataset;
+  const templateMigration = migrateDatasetV2ToV3(templateLegacy, NOW);
+  const template = templateMigration.dataset;
 
   assert.deepEqual(template.effectGroups[0].defaultReason, {
-    mode: "template",
-    template: "positive",
-    text: "legacy template metadata",
-  });
-  assert.deepEqual(template.activeEffects[0].reason, {
-    mode: "template",
-    template: "positive",
+    mode: "custom",
+    template: "general",
     text: "临时增益",
   });
+  assert.deepEqual(template.activeEffects[0].reason, {
+    mode: "custom",
+    template: "general",
+    text: "临时增益",
+  });
+  assert.match(templateMigration.report.warnings.join("\n"), /MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:effect_warm:positive/);
 
   const customLegacy = legacyDatasetFixture();
   customLegacy.temporaryEffects[0].reasonMode = "custom";
   customLegacy.temporaryEffects[0].reasonTemplate = "relationship";
   customLegacy.temporaryEffects[0].reason = "T 触发了 B 事件";
-  const custom = migrateDatasetV2ToV3(customLegacy, NOW).dataset;
+  const customMigration = migrateDatasetV2ToV3(customLegacy, NOW);
+  const custom = customMigration.dataset;
 
   assert.deepEqual(custom.effectGroups[0].defaultReason, {
     mode: "custom",
-    template: "relationship",
+    template: "general",
     text: "T 触发了 B 事件",
   });
   assert.deepEqual(custom.activeEffects[0].reason, {
     mode: "custom",
-    template: "relationship",
+    template: "general",
     text: "T 触发了 B 事件",
   });
+  assert.match(customMigration.report.warnings.join("\n"), /MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:effect_warm:relationship/);
 });
 
 test("old v3 files missing defaultReason backfill deterministically and persist on the next commit", async () => {
@@ -204,7 +209,9 @@ test("old v3 files missing defaultReason backfill deterministically and persist 
   const files = createFakeMvuFileApi({ [V3_PATH]: JSON.stringify(oldV3, null, 2) });
 
   const firstStore = v3Store(files);
-  assert.equal((await firstStore.initialize()).mode, "v3");
+  const firstStatus = await firstStore.initialize();
+  assert.equal(firstStatus.mode, "v3");
+  assert.match(firstStatus.report?.warnings.join("\n") ?? "", /MVU_V3_EFFECT_REASON_DEFAULT_BACKFILLED:effect_group_effect_warm/);
   const first = await firstStore.readV3();
   assert.deepEqual(first.dataset.effectGroups[0].defaultReason, {
     mode: "template",
@@ -231,6 +238,48 @@ test("old v3 files missing defaultReason backfill deterministically and persist 
   assert.deepEqual(restarted.dataset.activeEffects[0].definitionSnapshot, frozenSnapshot);
 });
 
+test("persisted development-v3 legacy templates normalize on cloned read with stable structured warnings", async () => {
+  const oldV3 = migrateDatasetV2ToV3(legacyDatasetFixture(), NOW).dataset;
+  oldV3.effectGroups[0].defaultReason = {
+    mode: "template",
+    template: "positive",
+    text: "legacy template metadata",
+  };
+  oldV3.activeEffects[0].reason = {
+    mode: "template",
+    template: "negative",
+    text: "临时减益",
+  };
+  const files = createFakeMvuFileApi({ [V3_PATH]: JSON.stringify(oldV3, null, 2) });
+
+  const firstStore = v3Store(files);
+  const firstStatus = await firstStore.initialize();
+  assert.equal(firstStatus.mode, "v3");
+  assert.deepEqual(firstStatus.report?.warnings, [
+    "MVU_V3_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:effect_group_effect_warm:positive",
+    "MVU_V3_ACTIVE_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:active_effect_effect_warm:negative",
+  ]);
+  const first = await firstStore.readV3();
+  assert.deepEqual(first.dataset.effectGroups[0].defaultReason, {
+    mode: "custom",
+    template: "general",
+    text: "临时增益",
+  });
+  assert.deepEqual(first.dataset.activeEffects[0].reason, {
+    mode: "custom",
+    template: "general",
+    text: "临时减益",
+  });
+
+  const restartStatus = await v3Store(files).initialize();
+  assert.deepEqual(restartStatus.report?.warnings, firstStatus.report?.warnings);
+
+  await firstStore.transactV3(first.revision, first.dataset, []);
+  const committedStatus = await v3Store(files).initialize();
+  assert.equal(committedStatus.mode, "v3");
+  assert.equal(committedStatus.report, undefined);
+});
+
 test("old persisted v3 normalizes pathological definition and active reason sizes only at the read boundary", async () => {
   const oldV3 = migrateDatasetV2ToV3(legacyDatasetFixture(), NOW).dataset;
   const definitionText = "定".repeat(EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH + 100);
@@ -240,7 +289,13 @@ test("old persisted v3 normalizes pathological definition and active reason size
   const files = createFakeMvuFileApi({ [V3_PATH]: JSON.stringify(oldV3, null, 2) });
   const store = v3Store(files);
 
-  assert.equal((await store.initialize()).mode, "v3");
+  const firstStatus = await store.initialize();
+  assert.equal(firstStatus.mode, "v3");
+  assert.deepEqual(firstStatus.report?.warnings, [
+    `MVU_V3_EFFECT_REASON_LEGACY_TRUNCATED:effect_group_effect_warm:${definitionText.length}:${EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH}`,
+    `MVU_V3_ACTIVE_EFFECT_REASON_LEGACY_TRUNCATED:active_effect_effect_warm:${activeText.length}:${EFFECT_REASON_RENDERED_MAX_LENGTH}`,
+  ]);
+  assert.deepEqual((await v3Store(files).initialize()).report?.warnings, firstStatus.report?.warnings);
   const first = await store.readV3();
   assert.equal(first.dataset.effectGroups[0].defaultReason.text, definitionText.slice(0, EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH));
   assert.equal(first.dataset.activeEffects[0].reason.text, activeText.slice(0, EFFECT_REASON_RENDERED_MAX_LENGTH));
@@ -265,12 +320,12 @@ test("effect-group create update copy query and restart preserve independent rea
   let revision = (await store.readV3()).revision;
   const created = await queries.createEffectGroup({
     expectedRevision: revision,
-    effectGroup: effectGroupInput({ mode: "template", template: "environment", text: "" }),
+    effectGroup: effectGroupInput({ mode: "template", template: "natural", text: "" }),
   });
   revision = created.revision;
   assert.deepEqual(created.entity.defaultReason, {
     mode: "template",
-    template: "environment",
+    template: "natural",
     text: "",
   });
 
@@ -296,7 +351,7 @@ test("effect-group create update copy query and restart preserve independent rea
     expectedRevision: revision,
     patch: {
       name: "改名后的定义",
-      defaultReason: { mode: "custom", template: "relationship", text: "只供新实例使用" },
+      defaultReason: { mode: "custom", template: "manual", text: "只供新实例使用" },
     },
   });
 
@@ -312,7 +367,7 @@ test("effect-group create update copy query and restart preserve independent rea
   assert.notEqual(storedCopy.defaultReason, storedOriginal.defaultReason);
   assert.deepEqual(restarted.dataset.effectGroups.find(({ id }) => id === activeDefinitionId).defaultReason, {
     mode: "custom",
-    template: "relationship",
+    template: "manual",
     text: "只供新实例使用",
   });
   assert.deepEqual(restarted.dataset.activeEffects[0].reason, oldInstanceReason);
@@ -335,7 +390,7 @@ test("rule activation resolves custom variables and template reasons into immuta
     effectGroup(
       "effect_group_template",
       "模板效果",
-      { mode: "template", template: "negative", text: "" },
+      { mode: "template", template: "rule", text: "" },
       2,
     ),
   ];
@@ -368,11 +423,11 @@ test("rule activation resolves custom variables and template reasons into immuta
       template: "general",
       text: "角色T|自定义规则|自定义效果|Affinity|B事件",
     },
-    { mode: "template", template: "negative", text: "临时减益" },
+    { mode: "template", template: "rule", text: "规则触发" },
   ]);
   assert.deepEqual(result.records.map(({ reason }) => reason), [
     "规则触发：自定义规则；效果：角色T|自定义规则|自定义效果|Affinity|B事件",
-    "规则触发：模板规则；效果：临时减益",
+    "规则触发：模板规则；效果：规则触发",
   ]);
   assert.equal(result.records.some(({ reason }) => reason.endsWith("激活效果组")), false);
 });
@@ -397,15 +452,54 @@ test("manual activation uses the definition default unless the caller explicitly
     triggerActorId: "actor_t",
     instanceId: "active_manual_override",
     activatedAt: NOW_ISO,
-    reason: { mode: "template", template: "positive" },
+    reason: { mode: "template", template: "manual" },
   });
 
   assert.equal(automatic.instances[0].reason.text, "手动效果/Affinity");
   assert.deepEqual(overridden.instances[0].reason, {
     mode: "template",
-    template: "positive",
-    text: "临时增益",
+    template: "manual",
+    text: "手动调整",
   });
+});
+
+test("v3 reason templates use the product enum and render every localized fallback", () => {
+  const dataset = baseV3Dataset();
+  const cases = [
+    ["general", "临时状态影响"],
+    ["rule", "规则触发"],
+    ["natural", "自然变化"],
+    ["per_turn", "每轮变化"],
+    ["ai", "AI 更新"],
+    ["manual", "手动调整"],
+  ];
+
+  for (const [template, expected] of cases) {
+    const definition = effectGroup(
+      `effect_group_${template}`,
+      `模板 ${template}`,
+      { mode: "template", template, text: "" },
+    );
+    const activation = activateEffectGroup({
+      definition,
+      fields: dataset.fields,
+      triggerActorId: "actor_t",
+      instanceId: `active_${template}`,
+      activatedAt: NOW_ISO,
+    });
+    assert.deepEqual(activation.instances[0].reason, {
+      mode: "template",
+      template,
+      text: expected,
+    });
+    assert.deepEqual(
+      MVU_REQUEST_PARSERS.createEffectGroup({
+        expectedRevision: 1,
+        effectGroup: effectGroupInput({ mode: "template", template, text: "" }),
+      }).effectGroup.defaultReason,
+      { mode: "template", template, text: "" },
+    );
+  }
 });
 
 test("IPC and v3 validation accept exact reason configs and reject unknown blank or oversized values", () => {
@@ -428,6 +522,8 @@ test("IPC and v3 validation accept exact reason configs and reject unknown blank
     { mode: "custom", template: "general", text: "   " },
     { mode: "custom", template: "general", text: "x".repeat(513) },
     { mode: "template", template: "general", text: "", injected: true },
+    { mode: "template", template: "positive", text: "" },
+    { mode: "template", template: "toString", text: "" },
   ];
   for (const defaultReason of invalidReasons) {
     assert.throws(() => MVU_REQUEST_PARSERS.createEffectGroup({
@@ -441,7 +537,7 @@ test("IPC and v3 validation accept exact reason configs and reject unknown blank
     }), /MVU_EFFECT_REASON_CONFIG_INVALID/);
 
   }
-  for (const defaultReason of [invalidReasons[0], invalidReasons[2]]) {
+  for (const defaultReason of [invalidReasons[0], invalidReasons[2], invalidReasons[3], invalidReasons[4]]) {
     const dataset = baseV3Dataset();
     dataset.effectGroups = [effectGroup("effect_group_invalid", "无效", defaultReason)];
     assert.throws(() => assertMvuDatasetV3(dataset), /MVU_V3_EFFECT_REASON_CONFIG_INVALID/);
@@ -455,7 +551,7 @@ test("v2 compatibility reads definition reasons and updates defaults without rew
   const seeded = migrateDatasetV2ToV3(legacyDatasetFixture(), NOW).dataset;
   seeded.effectGroups[0].defaultReason = {
     mode: "custom",
-    template: "relationship",
+    template: "manual",
     text: "定义默认原因",
   };
   seeded.activeEffects[0].reason = {
@@ -473,21 +569,21 @@ test("v2 compatibility reads definition reasons and updates defaults without rew
     reason: compatibility.dataset.temporaryEffects[0].reason,
   }, {
     reasonMode: "custom",
-    reasonTemplate: "relationship",
+    reasonTemplate: "general",
     reason: "定义默认原因",
   });
 
   const next = structuredClone(compatibility.dataset);
   next.temporaryEffects[0].reasonMode = "custom";
   next.temporaryEffects[0].reasonTemplate = "environment";
-  const updatedLegacyText = "更新".repeat(300);
+  const updatedLegacyText = "更新".repeat(200);
   next.temporaryEffects[0].reason = updatedLegacyText;
   await store.transact(compatibility.revision, next);
 
   const after = await store.readV3();
   assert.deepEqual(after.dataset.effectGroups[0].defaultReason, {
     mode: "custom",
-    template: "environment",
+    template: "general",
     text: updatedLegacyText,
   });
   assert.deepEqual(after.dataset.activeEffects[0].reason, {
@@ -551,7 +647,9 @@ test("legacy v2 reasons preserve ordinary oversized text and deterministically c
   const compatible = migrateDatasetV2ToV3(compatibleV2, NOW);
   assert.equal(compatible.dataset.effectGroups[0].defaultReason.text, compatibleText);
   assert.equal(compatible.dataset.activeEffects[0].reason.text, compatibleText);
-  assert.deepEqual(compatible.report.warnings, []);
+  assert.deepEqual(compatible.report.warnings, [
+    "MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:effect_warm:positive",
+  ]);
 
   const compatibleFiles = filesWithV2(compatibleV2);
   const compatibleStore = v3Store(compatibleFiles, compatibleV2);
@@ -571,6 +669,7 @@ test("legacy v2 reasons preserve ordinary oversized text and deterministically c
   );
   assert.equal(pathological.dataset.activeEffects[0].reason.text.length, EFFECT_REASON_RENDERED_MAX_LENGTH);
   assert.match(pathological.report.warnings.join("\n"), /MVU_EFFECT_REASON_LEGACY_TRUNCATED/);
+  assert.match(pathological.report.warnings.join("\n"), /MVU_ACTIVE_EFFECT_REASON_LEGACY_TRUNCATED/);
 
   const pathologicalFiles = filesWithV2(pathologicalV2);
   const pathologicalStore = v3Store(pathologicalFiles, pathologicalV2);
@@ -656,6 +755,85 @@ test("active snapshots and persisted records require exact bounded rendered reas
 
   const record = changeRecord("x".repeat(EFFECT_REASON_RENDERED_MAX_LENGTH + 1));
   assert.throws(() => assertDataChangeRecord(record), /INVALID_MVU_CHANGE_RECORD/);
+});
+
+test("legacy IPC and service enforce 512 only when the authoritative reason tuple changes", async () => {
+  const overEditLimit = "旧".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 88);
+  const pathologicalNewText = "病".repeat(EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH + 1);
+  const withoutId = (effect) => {
+    const { id: _id, ...input } = effect;
+    return input;
+  };
+
+  assert.throws(() => MVU_REQUEST_PARSERS.addTemporaryEffect({
+    effect: withoutId(effectFixture({ reasonMode: "custom", reason: overEditLimit })),
+  }), /MVU_EFFECT_REASON_TOO_LONG/);
+  assert.deepEqual(MVU_REQUEST_PARSERS.updateTemporaryEffect({
+    id: "effect_warm",
+    patch: { reason: overEditLimit },
+  }), {
+    id: "effect_warm",
+    patch: { reason: overEditLimit },
+  });
+  assert.throws(() => MVU_REQUEST_PARSERS.updateTemporaryEffect({
+    id: "effect_warm",
+    patch: { reason: pathologicalNewText },
+  }), /MVU_EFFECT_REASON_TOO_LONG/);
+
+  const legacyV2 = legacyDatasetFixture();
+  legacyV2.temporaryEffects[0].reasonMode = "custom";
+  legacyV2.temporaryEffects[0].reasonTemplate = "relationship";
+  legacyV2.temporaryEffects[0].reason = overEditLimit;
+  const files = filesWithV2(legacyV2);
+  const store = v3Store(files, legacyV2);
+  const service = new MvuService(store, {});
+  await store.initialize();
+  const authoritativeEffect = (await service.getDataset()).temporaryEffects[0];
+  const authoritativeReasonTuple = {
+    reasonMode: authoritativeEffect.reasonMode,
+    reasonTemplate: authoritativeEffect.reasonTemplate,
+    reason: authoritativeEffect.reason,
+  };
+
+  await assert.rejects(
+    service.addTemporaryEffect(withoutId(effectFixture({
+      id: "ignored",
+      reasonMode: "custom",
+      reason: overEditLimit,
+    }))),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+  await assert.rejects(
+    service.addTemporaryEffect(withoutId(effectFixture({
+      id: "ignored",
+      reasonMode: "custom",
+      reason: pathologicalNewText,
+    }))),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+
+  await service.updateTemporaryEffect("effect_warm", { value: 1.5 });
+  await service.updateTemporaryEffect("effect_warm", { value: 1.6, reason: overEditLimit });
+  await assert.rejects(
+    service.updateTemporaryEffect("effect_warm", { reasonMode: "template" }),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+  await assert.rejects(
+    service.updateTemporaryEffect("effect_warm", { reasonTemplate: "environment" }),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+  await assert.rejects(
+    service.updateTemporaryEffect("effect_warm", { reason: "新".repeat(EFFECT_REASON_SOURCE_MAX_LENGTH + 1) }),
+    /MVU_EFFECT_REASON_TOO_LONG/,
+  );
+
+  const restarted = await v3Store(files, legacyV2).read();
+  assert.deepEqual({
+    reasonMode: restarted.dataset.temporaryEffects[0].reasonMode,
+    reasonTemplate: restarted.dataset.temporaryEffects[0].reasonTemplate,
+    reason: restarted.dataset.temporaryEffects[0].reason,
+  }, authoritativeReasonTuple);
+  assert.equal(authoritativeReasonTuple.reason, overEditLimit);
 });
 
 test("new query API keeps the 512 source limit while legacy definitions remain activatable", async () => {

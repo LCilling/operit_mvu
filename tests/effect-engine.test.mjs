@@ -72,7 +72,7 @@ test("T event changes only T and preserves U and V", () => {
     triggerActorId: "T",
     instanceId: "active_t",
     activatedAt: NOW,
-    reason: { mode: "template", template: "positive" },
+    reason: { mode: "template", template: "manual" },
   });
 
   assert.deepEqual(activation.immediateChanges, [{ actorId: "T", fieldId: "A", delta: -30 }]);
@@ -90,7 +90,7 @@ test("missing trigger actor skips dynamic targets and emits a diagnostic instead
     fields: [characterField()],
     instanceId: "active_missing_actor",
     activatedAt: NOW,
-    reason: { mode: "template", template: "positive" },
+    reason: { mode: "template", template: "manual" },
   });
 
   assert.deepEqual(activation.instances, []);
@@ -307,12 +307,12 @@ test("normalizes a field change even when no active effect target applies", () =
 
 test("renders template and custom reasons as immutable safe snapshots", () => {
   assert.deepEqual(resolveEffectReason({
-    reason: { mode: "template", template: "positive" },
+    reason: { mode: "template", template: "rule" },
     variables: { triggerActorName: "T", effectGroupName: "Rain walk", fieldName: "Desire", event: "message" },
   }), {
     mode: "template",
-    template: "positive",
-    text: "临时增益",
+    template: "rule",
+    text: "规则触发",
   });
   assert.deepEqual(resolveEffectReason({
     reason: { mode: "custom", template: "general", text: "{{triggerActorName}}: {{effectGroupName}} → {{fieldName}} ({{event}}) {{constructor}}" },

@@ -65,6 +65,6 @@ test("creates reusable condition definitions with deterministic migration output
     migratedRules: 1,
     migratedConditions: 1,
     migratedEffectGroups: 1,
-    warnings: [],
+    warnings: ["MVU_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:effect_warm:positive"],
   });
 });

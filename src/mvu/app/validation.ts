@@ -34,6 +34,7 @@ import {
   EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
   EFFECT_REASON_RENDERED_MAX_LENGTH,
   EFFECT_REASON_SOURCE_MAX_LENGTH,
+  V3_EFFECT_REASON_TEMPLATES,
   truncateEffectReasonText,
 } from "./model-v3";
 import {
@@ -910,8 +911,7 @@ function assertEffectReasonConfigWithin(
 ): asserts value is EffectReasonConfig {
   if (!isRecord(value) || !hasExactKeys(value, ["mode", "template", "text"]) ||
     (value.mode !== "template" && value.mode !== "custom") ||
-    (value.template !== "general" && value.template !== "positive" && value.template !== "negative" &&
-      value.template !== "environment" && value.template !== "relationship") ||
+    !isV3EffectReasonTemplate(value.template) ||
     typeof value.text !== "string" || value.text.length > maximumTextLength ||
     (value.mode === "custom" && value.text.trim().length === 0)) {
     fail(code);
@@ -979,8 +979,7 @@ function assertActiveEffectInstanceShape(
   }
   if (!hasExactKeys(value.reason, ["mode", "template", "text"]) ||
     (value.reason.mode !== "template" && value.reason.mode !== "custom") ||
-    (value.reason.template !== "general" && value.reason.template !== "positive" && value.reason.template !== "negative" &&
-      value.reason.template !== "environment" && value.reason.template !== "relationship") ||
+    !isV3EffectReasonTemplate(value.reason.template) ||
     typeof value.reason.text !== "string" || value.reason.text.trim().length === 0 ||
     value.reason.text.length > EFFECT_REASON_RENDERED_MAX_LENGTH) {
     fail("MVU_V3_ACTIVE_EFFECT_REASON_INVALID");
@@ -1015,36 +1014,72 @@ function assertActiveEffectInstanceShape(
  * Mutating normalization for a cloned, already-persisted legacy v3 document.
  * Never call this from validation or a normal transaction commit.
  */
-export function normalizeLegacyV3EffectReasonData(value: unknown): boolean {
-  if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.effectGroups)) return false;
-  let changed = false;
+export function normalizeLegacyV3EffectReasonData(value: unknown): string[] {
+  if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.effectGroups)) return [];
+  const warnings: string[] = [];
   for (const effectGroup of value.effectGroups) {
     if (!isRecord(effectGroup)) continue;
+    const effectGroupId = typeof effectGroup.id === "string" ? effectGroup.id : "unknown";
     if (!Object.prototype.hasOwnProperty.call(effectGroup, "defaultReason")) {
       effectGroup.defaultReason = { mode: "template", template: "general", text: "" };
-      changed = true;
+      warnings.push(`MVU_V3_EFFECT_REASON_DEFAULT_BACKFILLED:${effectGroupId}`);
       continue;
     }
-    if (isRecord(effectGroup.defaultReason) && typeof effectGroup.defaultReason.text === "string" &&
-      effectGroup.defaultReason.text.length > EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH) {
-      effectGroup.defaultReason.text = truncateEffectReasonText(
-        effectGroup.defaultReason.text,
+    const reason = effectGroup.defaultReason;
+    if (!isRecord(reason)) continue;
+    const legacyTemplate = legacyOnlyReasonTemplate(reason.template);
+    if (legacyTemplate !== null) {
+      if (reason.mode === "template") {
+        reason.mode = "custom";
+        reason.text = TEMPORARY_EFFECT_REASON_TEMPLATES[legacyTemplate];
+      }
+      reason.template = "general";
+      warnings.push(`MVU_V3_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:${effectGroupId}:${legacyTemplate}`);
+    }
+    if (typeof reason.text === "string" && reason.text.length > EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH) {
+      const originalLength = reason.text.length;
+      reason.text = truncateEffectReasonText(
+        reason.text,
         EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH,
       );
-      changed = true;
+      warnings.push(
+        `MVU_V3_EFFECT_REASON_LEGACY_TRUNCATED:${effectGroupId}:${originalLength}:${EFFECT_REASON_LEGACY_STORAGE_MAX_LENGTH}`,
+      );
     }
   }
-  if (!Array.isArray(value.activeEffects)) return changed;
+  if (!Array.isArray(value.activeEffects)) return warnings;
   for (const activeEffect of value.activeEffects) {
-    if (!isRecord(activeEffect) || !isRecord(activeEffect.reason) || typeof activeEffect.reason.text !== "string" ||
-      activeEffect.reason.text.length <= EFFECT_REASON_RENDERED_MAX_LENGTH) continue;
-    activeEffect.reason.text = truncateEffectReasonText(
-      activeEffect.reason.text,
-      EFFECT_REASON_RENDERED_MAX_LENGTH,
-    );
-    changed = true;
+    if (!isRecord(activeEffect) || !isRecord(activeEffect.reason)) continue;
+    const activeEffectId = typeof activeEffect.id === "string" ? activeEffect.id : "unknown";
+    const legacyTemplate = legacyOnlyReasonTemplate(activeEffect.reason.template);
+    if (legacyTemplate !== null) {
+      activeEffect.reason.mode = "custom";
+      activeEffect.reason.template = "general";
+      warnings.push(`MVU_V3_ACTIVE_EFFECT_REASON_LEGACY_TEMPLATE_CONVERTED:${activeEffectId}:${legacyTemplate}`);
+    }
+    if (typeof activeEffect.reason.text === "string" &&
+      activeEffect.reason.text.length > EFFECT_REASON_RENDERED_MAX_LENGTH) {
+      const originalLength = activeEffect.reason.text.length;
+      activeEffect.reason.text = truncateEffectReasonText(
+        activeEffect.reason.text,
+        EFFECT_REASON_RENDERED_MAX_LENGTH,
+      );
+      warnings.push(
+        `MVU_V3_ACTIVE_EFFECT_REASON_LEGACY_TRUNCATED:${activeEffectId}:${originalLength}:${EFFECT_REASON_RENDERED_MAX_LENGTH}`,
+      );
+    }
   }
-  return changed;
+  return warnings;
+}
+
+function legacyOnlyReasonTemplate(value: unknown): Exclude<keyof typeof TEMPORARY_EFFECT_REASON_TEMPLATES, "general"> | null {
+  return value === "positive" || value === "negative" || value === "environment" || value === "relationship"
+    ? value
+    : null;
+}
+
+function isV3EffectReasonTemplate(value: unknown): value is keyof typeof V3_EFFECT_REASON_TEMPLATES {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(V3_EFFECT_REASON_TEMPLATES, value);
 }
 
 function assertEffectDurationShape(value: unknown): asserts value is EffectDuration {
