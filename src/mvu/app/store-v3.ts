@@ -12,6 +12,8 @@ import type {
   EffectGroupDefinition,
   MigrationResult,
   MvuDatasetV3,
+  RuleActionV3,
+  RuleDefinitionV3,
 } from "./model-v3";
 import {
   createEmptyRecordManifest,
@@ -67,9 +69,15 @@ export class V3UnavailableError extends Error {
 }
 
 /**
- * Crash-safe v3 configuration store. It also implements the v2 MvuStore shape
- * as a temporary UI/service adapter until the bounded v3 query APIs own every
- * screen in Tasks 6-9.
+ * Crash-safe v3 configuration store for one persistent ToolPkg main runtime.
+ * The module path queue serializes store instances in that runtime and every
+ * transaction rereads the durable revision before staging records. Atomic host
+ * replacement is the publication boundary. This is deliberately not a
+ * cross-process or external-writer CAS guarantee; production relies on the
+ * host's unique `toolpkg_main:<container>` engine and owner-isolated storage.
+ *
+ * It also implements the v2 MvuStore shape as a temporary UI/service adapter
+ * until the bounded v3 query APIs own every screen in Tasks 6-9.
  */
 export class V3MvuStore implements MvuStore {
   private readonly getConfigDir: () => string;
@@ -197,12 +205,6 @@ export class V3MvuStore implements MvuStore {
         } catch (error) {
           if (!forceRebuild) throw error;
         }
-      }
-
-      if (!forceRebuild && !(await this.files.exists(v3Path)) &&
-        await this.files.exists(this.records.directoryPath())) {
-        // With no committed v3 config, every record path is an interrupted migration artifact.
-        await this.files.deleteFile(this.records.directoryPath());
       }
 
       const v2Path = `${configDir}/${V2_FILE_NAME}`;
@@ -373,8 +375,8 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
       scopeKey: target.scopeKey,
     }));
     if (targets.length === 0) continue;
-    const duration = instances[0]?.duration ?? { expiresAt: null, remainingTurns: null };
-    const reason = instances[0]?.reason;
+    const duration = compatibilityInstanceDuration(instances);
+    const reason = compatibilityInstanceReason(instances);
     effects.push({
       id: legacyEffectId(definition.id),
       targets: uniqueTargets(targets),
@@ -383,9 +385,9 @@ function compatibilityEffects(dataset: MvuDatasetV3): DataTemporaryEffect[] {
       enabled: definition.enabled && instances.length > 0,
       expiresAt: duration.expiresAt === null ? null : Date.parse(duration.expiresAt),
       remainingTurns: duration.remainingTurns,
-      reasonMode: reason?.mode ?? "template",
-      reasonTemplate: reason?.template ?? "general",
-      reason: reason?.mode === "custom" ? reason.text : "",
+      reasonMode: reason.mode,
+      reasonTemplate: reason.template,
+      reason: reason.mode === "custom" ? reason.text : "",
       createdAt: Date.parse(definition.createdAt),
     });
   }
@@ -562,24 +564,14 @@ function reconcileCompatibilityRules(
     patched.cooldownHours = nextRule.cooldownMs / 3_600_000;
     patched.executionOrder = nextRule.order;
     patched.updatedAt = migratedRule.updatedAt;
-    patched.actions = currentRule.actions.map((action, index) => {
-      if (action.kind !== "change_field") return klona(action);
-      const desired = migratedRule.actions[index];
-      if (desired === undefined || desired.kind !== "change_field") {
-        throw new Error(`MVU_V3_COMPAT_RULE_ACTION_MISSING:${id}:${index}`);
-      }
-      const hiddenEffectGroupIds = action.effectGroupIds.filter((effectGroupId) =>
-        !projectedEffectIds.has(legacyEffectId(effectGroupId)));
-      return {
-        ...klona(action),
-        fieldId: desired.fieldId,
-        delta: desired.delta,
-        effectGroupIds: uniqueStrings([
-          ...hiddenEffectGroupIds,
-          ...desired.effectGroupIds,
-        ]),
-      };
-    });
+    patched.actions = reconcileCompatibilityRuleActions(
+      id,
+      currentRule,
+      projectedRule,
+      nextRule,
+      migratedRule,
+      projectedEffectIds,
+    );
 
     if (JSON.stringify(projectedRule.condition) !== JSON.stringify(nextRule.condition)) {
       const currentConditionIndex = conditions.findIndex((condition) =>
@@ -697,6 +689,20 @@ function reconcileCompatibilityEffects(
         };
       }),
     }));
+    const representedFieldIds = new Set(
+      patchedGroup.fieldEffects.map((fieldEffect) => fieldEffect.fieldId),
+    );
+    for (const target of nextEffect.targets) {
+      if (representedFieldIds.has(target.fieldId)) continue;
+      const migratedFieldEffect = migratedGroup.fieldEffects.find((fieldEffect) =>
+        fieldEffect.fieldId === target.fieldId);
+      if (migratedFieldEffect === undefined || patchedGroup.fieldEffects.some((fieldEffect) =>
+        fieldEffect.id === migratedFieldEffect.id)) {
+        throw new Error(`MVU_V3_COMPAT_EFFECT_TARGET_DEFINITION_MISSING:${id}:${target.fieldId}`);
+      }
+      patchedGroup.fieldEffects.push(klona(migratedFieldEffect));
+      representedFieldIds.add(target.fieldId);
+    }
     patchedGroup.updatedAt = migratedGroup.updatedAt;
 
     const expirySettlement = projectedEffect.enabled && !nextEffect.enabled &&
@@ -720,11 +726,24 @@ function reconcileCompatibilityEffects(
         }
         const currentInstance = currentInstances[0];
         const migratedInstance = migratedInstances[0];
+        const targetsChanged = JSON.stringify(projectedEffect.targets) !==
+          JSON.stringify(nextEffect.targets);
+        const durationChanged = projectedEffect.expiresAt !== nextEffect.expiresAt ||
+          projectedEffect.remainingTurns !== nextEffect.remainingTurns;
+        const reasonChanged = projectedEffect.reasonMode !== nextEffect.reasonMode ||
+          projectedEffect.reasonTemplate !== nextEffect.reasonTemplate ||
+          projectedEffect.reason !== nextEffect.reason;
         const replacement = {
           ...klona(currentInstance),
-          resolvedTargets: klona(migratedInstance.resolvedTargets),
-          duration: klona(migratedInstance.duration),
-          reason: klona(migratedInstance.reason),
+          resolvedTargets: targetsChanged
+            ? klona(migratedInstance.resolvedTargets)
+            : klona(currentInstance.resolvedTargets),
+          duration: durationChanged
+            ? klona(migratedInstance.duration)
+            : klona(currentInstance.duration),
+          reason: reasonChanged
+            ? klona(migratedInstance.reason)
+            : klona(currentInstance.reason),
         };
         const instanceIndex = activeEffects.findIndex((instance) => instance.id === currentInstance.id);
         if (!nextEffect.enabled && replacement.duration.remainingTurns === 0) {
@@ -751,6 +770,111 @@ function compatibilityRecordMutation(
   return { kind: "replace", records: next };
 }
 
+function reconcileCompatibilityRuleActions(
+  ruleId: string,
+  currentRule: RuleDefinitionV3,
+  projectedRule: DataAutoRule,
+  nextRule: DataAutoRule,
+  migratedRule: RuleDefinitionV3,
+  projectedEffectIds: ReadonlySet<string>,
+): RuleActionV3[] {
+  if (currentRule.actions.length !== projectedRule.effects.length ||
+    migratedRule.actions.length !== nextRule.effects.length ||
+    currentRule.actions.some((action) => action.kind !== "change_field") ||
+    migratedRule.actions.some((action) => action.kind !== "change_field")) {
+    throw new Error(`MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS:${ruleId}`);
+  }
+  const oldEntries = projectedRule.effects.map((effect, index) => ({
+    index,
+    effect,
+    action: currentRule.actions[index] as Extract<RuleActionV3, { kind: "change_field" }>,
+  }));
+  const nextEntries = nextRule.effects.map((effect, index) => ({
+    index,
+    effect,
+    action: migratedRule.actions[index] as Extract<RuleActionV3, { kind: "change_field" }>,
+  }));
+  const oldMatch = new Map<number, number>();
+  const unmatchedOld = new Set(oldEntries.map(({ index }) => index));
+  const unmatchedNext = new Set(nextEntries.map(({ index }) => index));
+  const exactKeys = new Set([
+    ...oldEntries.map(({ effect }) => JSON.stringify(effect)),
+    ...nextEntries.map(({ effect }) => JSON.stringify(effect)),
+  ]);
+
+  for (const key of exactKeys) {
+    const oldIndices = oldEntries.filter(({ effect }) => JSON.stringify(effect) === key)
+      .map(({ index }) => index);
+    const nextIndices = nextEntries.filter(({ effect }) => JSON.stringify(effect) === key)
+      .map(({ index }) => index);
+    const pairCount = Math.min(oldIndices.length, nextIndices.length);
+    for (let position = 0; position < pairCount; position += 1) {
+      oldMatch.set(nextIndices[position], oldIndices[position]);
+      unmatchedOld.delete(oldIndices[position]);
+      unmatchedNext.delete(nextIndices[position]);
+    }
+  }
+
+  const remainingFieldIds = new Set(
+    [...unmatchedOld].map((index) => oldEntries[index].effect.fieldId)
+      .concat([...unmatchedNext].map((index) => nextEntries[index].effect.fieldId)),
+  );
+  for (const fieldId of remainingFieldIds) {
+    const oldIndices = [...unmatchedOld].filter((index) =>
+      oldEntries[index].effect.fieldId === fieldId);
+    const nextIndices = [...unmatchedNext].filter((index) =>
+      nextEntries[index].effect.fieldId === fieldId);
+    if (oldIndices.length === 0 || nextIndices.length === 0) continue;
+    if (oldIndices.length !== 1 || nextIndices.length !== 1) {
+      throw new Error(`MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS:${ruleId}`);
+    }
+    oldMatch.set(nextIndices[0], oldIndices[0]);
+    unmatchedOld.delete(oldIndices[0]);
+    unmatchedNext.delete(nextIndices[0]);
+  }
+
+  if (unmatchedOld.size === 1 && unmatchedNext.size === 1) {
+    const oldIndex = [...unmatchedOld][0];
+    const nextIndex = [...unmatchedNext][0];
+    oldMatch.set(nextIndex, oldIndex);
+    unmatchedOld.delete(oldIndex);
+    unmatchedNext.delete(nextIndex);
+  } else if (unmatchedOld.size > 0 && unmatchedNext.size > 0) {
+    throw new Error(`MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS:${ruleId}`);
+  }
+
+  for (const oldIndex of unmatchedOld) {
+    if (hasHiddenRuleActionSemantics(oldEntries[oldIndex].action, projectedEffectIds)) {
+      throw new Error(`MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS:${ruleId}`);
+    }
+  }
+
+  return nextEntries.map(({ index, action: migratedAction }) => {
+    const oldIndex = oldMatch.get(index);
+    if (oldIndex === undefined) return klona(migratedAction);
+    const currentAction = oldEntries[oldIndex].action;
+    const hiddenEffectGroupIds = currentAction.effectGroupIds.filter((effectGroupId) =>
+      !projectedEffectIds.has(legacyEffectId(effectGroupId)));
+    return {
+      ...klona(currentAction),
+      fieldId: migratedAction.fieldId,
+      delta: migratedAction.delta,
+      effectGroupIds: uniqueStrings([
+        ...hiddenEffectGroupIds,
+        ...migratedAction.effectGroupIds,
+      ]),
+    };
+  });
+}
+
+function hasHiddenRuleActionSemantics(
+  action: Extract<RuleActionV3, { kind: "change_field" }>,
+  projectedEffectIds: ReadonlySet<string>,
+): boolean {
+  return action.target.kind !== "trigger_actor" || action.effectGroupIds.some((effectGroupId) =>
+    !projectedEffectIds.has(legacyEffectId(effectGroupId)));
+}
+
 function validateMigrationResult(v2: MvuDataset, result: MigrationResult): void {
   assertMvuDatasetV3(result.dataset);
   if (result.dataset.fields.length !== v2.fields.length ||
@@ -770,6 +894,36 @@ function legacyEffectId(effectGroupId: string): string {
   return effectGroupId.startsWith("effect_group_")
     ? effectGroupId.slice("effect_group_".length)
     : effectGroupId;
+}
+
+function compatibilityInstanceDuration(
+  instances: MvuDatasetV3["activeEffects"],
+): { expiresAt: string | null; remainingTurns: number | null } {
+  const expiring = instances
+    .filter((instance) => instance.duration.expiresAt !== null)
+    .sort((left, right) =>
+      Date.parse(left.duration.expiresAt as string) - Date.parse(right.duration.expiresAt as string));
+  const turnLimited = instances
+    .map((instance) => instance.duration.remainingTurns)
+    .filter((remainingTurns): remainingTurns is number => remainingTurns !== null);
+  return {
+    expiresAt: expiring[0]?.duration.expiresAt ?? null,
+    remainingTurns: turnLimited.length === 0 ? null : Math.min(...turnLimited),
+  };
+}
+
+function compatibilityInstanceReason(
+  instances: MvuDatasetV3["activeEffects"],
+): MvuDatasetV3["activeEffects"][number]["reason"] {
+  const first = instances.at(0)?.reason;
+  if (first !== undefined && instances.every((instance) =>
+    JSON.stringify(instance.reason) === JSON.stringify(first))) {
+    return first;
+  }
+  // Legacy v2 can render only one reason. A neutral projection prevents a
+  // representable definition edit from borrowing one instance's reason and
+  // writing it over distinct v3 instance snapshots.
+  return { mode: "template", template: "general", text: "" };
 }
 
 function uniqueTargets(targets: DataTemporaryEffect["targets"]): DataTemporaryEffect["targets"] {

@@ -4,6 +4,7 @@ import type { MvuFileApi } from "./store";
 import { assertDataChangeRecord } from "./validation";
 
 export const RECORDS_PER_SEGMENT = 500;
+const MAX_SEGMENT_SCAN_COUNT = 1_024;
 
 export interface SegmentedRecordStoreOptions {
   getConfigDir: () => string;
@@ -68,11 +69,14 @@ export class SegmentedRecordStore {
     await this.ensureDirectory();
     const manifest = cloneManifest(currentManifest);
     const touchedSegmentPaths: string[] = [];
+    const operationId = nextRecordOperationId();
     let recordIndex = 0;
     while (recordIndex < records.length) {
       let segment = manifest.segments.at(-1);
+      let created = false;
       if (segment === undefined || segment.committedLineCount === RECORDS_PER_SEGMENT) {
         segment = await this.createSegment(manifest, commitRevision, records[recordIndex]);
+        created = true;
       }
       const available = RECORDS_PER_SEGMENT - segment.committedLineCount;
       const chunk = records.slice(recordIndex, recordIndex + available);
@@ -84,11 +88,30 @@ export class SegmentedRecordStore {
       if (!Number.isSafeInteger(manifest.recordCount + chunk.length)) {
         throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
       }
-      await this.files.appendText(path, content);
-      if (!touchedSegmentPaths.includes(path)) touchedSegmentPaths.push(path);
+      if (!Number.isSafeInteger(segment.committedLineCount + chunk.length)) {
+        throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
+      }
       updateSegmentMetadata(segment, chunk, commitRevision);
       manifest.recordCount += chunk.length;
       recordIndex += chunk.length;
+      if (created) {
+        const stagingPath = `${path}.stage.${operationId}.${touchedSegmentPaths.length}`;
+        await this.files.writeText(stagingPath, content);
+        try {
+          await this.files.replaceAtomically(stagingPath, path);
+        } catch (error) {
+          try {
+            if (await this.files.exists(stagingPath)) await this.files.deleteFile(stagingPath);
+          } catch {
+            // The unique transaction suffix prevents an unremovable staging file
+            // from colliding with a future writer.
+          }
+          throw error;
+        }
+      } else {
+        await this.files.appendText(path, content);
+      }
+      if (!touchedSegmentPaths.includes(path)) touchedSegmentPaths.push(path);
     }
     assertRecordManifest(manifest);
     return { manifest, touchedSegmentPaths };
@@ -104,7 +127,12 @@ export class SegmentedRecordStore {
     requireRevision(commitRevision);
     const requiredSegments = Math.ceil(records.length / RECORDS_PER_SEGMENT);
     let nextSegmentIndex = currentManifest.nextSegmentIndex;
+    let scanCount = 0;
     while (requiredSegments > 0 && await this.segmentRunExists(nextSegmentIndex, requiredSegments)) {
+      scanCount += 1;
+      if (scanCount >= MAX_SEGMENT_SCAN_COUNT) {
+        throw new Error("MVU_V3_RECORD_STAGING_SCAN_LIMIT");
+      }
       if (!Number.isSafeInteger(nextSegmentIndex + 1)) {
         throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
       }
@@ -147,15 +175,22 @@ export class SegmentedRecordStore {
     // config move was interrupted, none of these files are committed; remove
     // the complete contiguous orphan run before any later append can reuse it.
     let orphanIndex = manifest.nextSegmentIndex;
+    const orphanPaths: string[] = [];
     while (true) {
+      if (orphanPaths.length >= MAX_SEGMENT_SCAN_COUNT) {
+        throw new Error("MVU_V3_RECORD_ORPHAN_SCAN_LIMIT");
+      }
       const orphanName = `segment-${String(orphanIndex).padStart(6, "0")}.jsonl`;
       const orphanPath = this.segmentPath(orphanName);
       if (!(await this.files.exists(orphanPath))) break;
-      await this.files.deleteFile(orphanPath);
       if (!Number.isSafeInteger(orphanIndex + 1)) {
         throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
       }
+      orphanPaths.push(orphanPath);
       orphanIndex += 1;
+    }
+    for (const orphanPath of orphanPaths) {
+      await this.files.deleteFile(orphanPath);
     }
   }
 
@@ -344,9 +379,6 @@ function updateSegmentMetadata(
   for (const record of records) {
     segment.firstOccurredAt = Math.min(segment.firstOccurredAt, record.occurredAt);
     segment.lastOccurredAt = Math.max(segment.lastOccurredAt, record.occurredAt);
-  }
-  if (!Number.isSafeInteger(segment.committedLineCount + records.length)) {
-    throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
   }
   segment.committedLineCount += records.length;
   segment.lastRevision = revision;

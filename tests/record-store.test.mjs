@@ -253,6 +253,99 @@ test("repairs an orphan tail without parsing or exposing it", async () => {
   assert.deepEqual(result.items.map((record) => record.id), ["record_1", "record_2"]);
 });
 
+test("record segment creation uses unique transaction staging and atomic publication", async () => {
+  const files = createFakeMvuFileApi();
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+
+  const firstTransaction = await records.stageAppend(
+    createEmptyRecordManifest(),
+    Array.from({ length: 501 }, (_, index) => changeRecord(index)),
+    1,
+  );
+  await records.stageReplace(firstTransaction.manifest, [changeRecord(1_000)], 2);
+
+  const operations = files.operations();
+  const stagedWrites = operations.filter(({ operation, path }) =>
+    operation === "writeText" && path.includes(".stage."));
+  const publications = operations.filter(({ operation, destination }) =>
+    operation === "replaceAtomically" && destination?.startsWith(`${RECORD_DIRECTORY}/segment-`));
+  assert.equal(stagedWrites.length, 3);
+  assert.equal(new Set(stagedWrites.map(({ path }) => path)).size, 3);
+  const transactionIds = stagedWrites.map(({ path }) =>
+    path.match(/\.stage\.([^.]+)\.\d+$/)?.[1]);
+  assert.equal(transactionIds[0], transactionIds[1]);
+  assert.notEqual(transactionIds[1], transactionIds[2]);
+  assert.deepEqual(
+    publications.map(({ source, destination }) => ({ source, destination })),
+    stagedWrites.map(({ path }, index) => ({
+      source: path,
+      destination: `${RECORD_DIRECTORY}/segment-${String(index + 1).padStart(6, "0")}.jsonl`,
+    })),
+  );
+  assert.equal(operations.some(({ operation, path }) =>
+    operation === "appendText" && path.startsWith(`${RECORD_DIRECTORY}/segment-`)), false);
+});
+
+test("orphan recovery has a hard probe bound", async () => {
+  const backing = createFakeMvuFileApi();
+  let segmentProbes = 0;
+  const files = {
+    ...backing,
+    async exists(path) {
+      if (path.startsWith(`${RECORD_DIRECTORY}/segment-`)) {
+        segmentProbes += 1;
+        return segmentProbes <= 1_025;
+      }
+      return backing.exists(path);
+    },
+  };
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+
+  await assert.rejects(
+    records.validateAndRepair(createEmptyRecordManifest(), 0),
+    /MVU_V3_RECORD_ORPHAN_SCAN_LIMIT/,
+  );
+  assert.equal(segmentProbes <= 1_024, true);
+  assert.equal(backing.operations().some(({ operation }) => operation === "deleteFile"), false);
+});
+
+test("replacement allocation has a hard collision-probe bound", async () => {
+  const backing = createFakeMvuFileApi();
+  let segmentProbes = 0;
+  const files = {
+    ...backing,
+    async exists(path) {
+      if (path.startsWith(`${RECORD_DIRECTORY}/segment-`)) {
+        segmentProbes += 1;
+        return segmentProbes <= 1_025;
+      }
+      return backing.exists(path);
+    },
+  };
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+
+  await assert.rejects(
+    records.stageReplace(createEmptyRecordManifest(), [changeRecord(1)], 1),
+    /MVU_V3_RECORD_STAGING_SCAN_LIMIT/,
+  );
+  assert.equal(segmentProbes <= 1_024, true);
+});
+
+test("MAX_SAFE_INTEGER orphan guard runs before deletion", async () => {
+  const index = Number.MAX_SAFE_INTEGER;
+  const orphanPath = `${RECORD_DIRECTORY}/segment-${index}.jsonl`;
+  const files = createFakeMvuFileApi({ [orphanPath]: "orphan bytes\n" });
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+
+  await assert.rejects(
+    records.validateAndRepair(createEmptyRecordManifest(index), 0),
+    /MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW/,
+  );
+  assert.equal(files.snapshot()[orphanPath], "orphan bytes\n");
+  assert.equal(files.operations().some(({ operation, path }) =>
+    operation === "deleteFile" && path === orphanPath), false);
+});
+
 test("commits records and configuration together and rejects a stale CAS revision", async () => {
   const { files } = filesWithV2();
   const store = v3Store(files);
@@ -277,6 +370,33 @@ test("commits records and configuration together and rejects a stale CAS revisio
     (await store.queryRecords({ offset: 0, limit: 10, direction: "asc" })).items.map((record) => record.id),
     ["record_1"],
   );
+});
+
+test("store CAS deliberately excludes writers outside the persistent ToolPkg main runtime", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const next = structuredClone(before.dataset);
+  next.settings.aiEnabled = false;
+  const replacementBarrier = files.pauseNext(
+    "replaceAtomically",
+    ({ destination }) => destination === V3_PATH,
+  );
+
+  const transaction = store.transactV3(before.revision, next, []);
+  await replacementBarrier.entered;
+  const external = structuredClone(before.dataset);
+  external.revision = before.revision + 1;
+  external.settings.aiEnabled = true;
+  external.pendingBootstrapFieldIds = ["external_writer_marker"];
+  await files.writeText(V3_PATH, JSON.stringify(external));
+  replacementBarrier.release();
+
+  const committed = await transaction;
+  assert.equal(committed.dataset.settings.aiEnabled, false);
+  assert.deepEqual(committed.dataset.pendingBootstrapFieldIds, []);
+  assert.deepEqual((await store.readV3()).dataset.pendingBootstrapFieldIds, []);
 });
 
 test("a failed atomic config replace leaves state and records uncommitted, then restart repairs and retries", async () => {
@@ -468,6 +588,147 @@ test("legacy compatibility writes preserve v3-only conditions, rules, and effect
   assert.equal(after.dataset.rules.some(({ id }) => id === legacyRule.id), true);
 });
 
+test("legacy rule writes commit true action additions with migrated defaults", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.read();
+  const next = structuredClone(before.dataset);
+  next.autoRules[0].effects.push({
+    fieldId: "field_excite",
+    delta: 2,
+    temporaryEffectIds: [],
+  });
+
+  await store.transact(before.revision, next);
+
+  const after = await store.readV3();
+  const actions = after.dataset.rules.find(({ id }) => id === "auto_positive").actions;
+  assert.equal(actions.length, 2);
+  assert.deepEqual(actions[1], {
+    kind: "change_field",
+    fieldId: "field_excite",
+    target: { kind: "trigger_actor" },
+    delta: 2,
+    effectGroupIds: [],
+  });
+});
+
+test("legacy rule reordering keeps hidden action metadata attached to its matched action", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  configured.effectGroups.push({
+    id: "effect_group_hidden_action",
+    name: "Hidden immediate action metadata",
+    description: "",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_hidden_action",
+      fieldId: "field_affinity",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [{ kind: "immediate_delta", value: 1 }],
+    }],
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const rule = configured.rules.find(({ id }) => id === "auto_positive");
+  rule.actions = [
+    {
+      kind: "change_field",
+      fieldId: "field_affinity",
+      target: { kind: "selected", actorIds: ["actor_t"] },
+      delta: 4,
+      effectGroupIds: ["effect_group_effect_warm", "effect_group_hidden_action"],
+    },
+    {
+      kind: "change_field",
+      fieldId: "field_excite",
+      target: { kind: "trigger_actor" },
+      delta: 2,
+      effectGroupIds: [],
+    },
+  ];
+  await store.transactV3(before.revision, configured, []);
+  const compatibility = await store.read();
+  const reordered = structuredClone(compatibility.dataset);
+  reordered.autoRules[0].effects.reverse();
+
+  await store.transact(compatibility.revision, reordered);
+
+  const actions = (await store.readV3()).dataset.rules
+    .find(({ id }) => id === "auto_positive").actions;
+  assert.deepEqual(actions.map(({ fieldId }) => fieldId), ["field_excite", "field_affinity"]);
+  assert.deepEqual(actions[1].target, { kind: "selected", actorIds: ["actor_t"] });
+  assert.deepEqual(actions[1].effectGroupIds, [
+    "effect_group_hidden_action",
+    "effect_group_effect_warm",
+  ]);
+});
+
+test("legacy rule writes remove an unambiguous representable action", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  configured.rules.find(({ id }) => id === "auto_positive").actions.push({
+    kind: "change_field",
+    fieldId: "field_excite",
+    target: { kind: "trigger_actor" },
+    delta: 2,
+    effectGroupIds: [],
+  });
+  await store.transactV3(before.revision, configured, []);
+  const compatibility = await store.read();
+  const next = structuredClone(compatibility.dataset);
+  next.autoRules[0].effects = next.autoRules[0].effects.filter(({ fieldId }) =>
+    fieldId !== "field_excite");
+
+  await store.transact(compatibility.revision, next);
+
+  const actions = (await store.readV3()).dataset.rules
+    .find(({ id }) => id === "auto_positive").actions;
+  assert.deepEqual(actions.map(({ fieldId }) => fieldId), ["field_affinity"]);
+});
+
+test("legacy rule writes reject an ambiguous removal of hidden action semantics", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const rule = configured.rules.find(({ id }) => id === "auto_positive");
+  rule.actions = [
+    {
+      kind: "change_field",
+      fieldId: "field_affinity",
+      target: { kind: "selected", actorIds: ["actor_t"] },
+      delta: 4,
+      effectGroupIds: ["effect_group_effect_warm"],
+    },
+    {
+      kind: "change_field",
+      fieldId: "field_affinity",
+      target: { kind: "all_bound" },
+      delta: 4,
+      effectGroupIds: ["effect_group_effect_warm"],
+    },
+  ];
+  await store.transactV3(before.revision, configured, []);
+  const compatibility = await store.read();
+  const next = structuredClone(compatibility.dataset);
+  next.autoRules[0].effects.pop();
+
+  await assert.rejects(
+    store.transact(compatibility.revision, next),
+    /MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS:auto_positive/,
+  );
+});
+
 test("legacy temporary-effect writes preserve hidden v3 effect definitions", async () => {
   const legacy = legacyDatasetFixture();
   legacy.autoRules = [];
@@ -517,6 +778,108 @@ test("legacy temporary-effect writes preserve hidden v3 effect definitions", asy
   const after = await store.readV3();
   assert.equal(after.dataset.effectGroups.some(({ id }) => id === "effect_group_v3_hidden"), true);
   assert.equal(after.dataset.effectGroups.some(({ id }) => id === `effect_group_${legacyEffect.id}`), true);
+});
+
+test("legacy expiry settles an expired non-first active effect instance independently", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const definition = configured.effectGroups.find(({ id }) => id === "effect_group_effect_warm");
+  definition.fieldEffects[0].operations[0].sources = ["ai"];
+  definition.fieldEffects[1].operations[0].sources = ["rule"];
+  const first = configured.activeEffects.find(({ definitionId }) =>
+    definition.id === "effect_group_effect_warm");
+  first.id = "active_effect_future_first";
+  first.triggerActorId = "actor_t";
+  first.resolvedTargets = [first.resolvedTargets[0]];
+  first.duration = { expiresAt: new Date(NOW + HOUR).toISOString(), remainingTurns: 5 };
+  first.reason = { mode: "custom", template: "general", text: "future first reason" };
+  const expiredSecond = {
+    ...structuredClone(first),
+    id: "active_effect_expired_second",
+    resolvedTargets: [{
+      fieldId: "field_excite",
+      actorId: "actor_t",
+      scope: "character",
+      scopeKey: "character:actor_t",
+    }],
+    duration: { expiresAt: new Date(NOW - HOUR).toISOString(), remainingTurns: 2 },
+    reason: { mode: "custom", template: "general", text: "expired second reason" },
+  };
+  configured.activeEffects = [first, expiredSecond];
+  await store.transactV3(before.revision, configured, []);
+  const expectedSurvivor = structuredClone(first);
+  const expectedFieldEffects = structuredClone(definition.fieldEffects);
+  const runtime = createRuntime({ store });
+
+  await runtime.service.settleNatural({
+    chatId: "chat_main",
+    actorId: "actor_t",
+    groupId: "group_main",
+    actorName: "T",
+  }, NOW);
+
+  const after = await store.readV3();
+  assert.deepEqual(after.dataset.activeEffects, [expectedSurvivor]);
+  assert.deepEqual(
+    after.dataset.effectGroups.find(({ id }) => id === definition.id).fieldEffects,
+    expectedFieldEffects,
+  );
+});
+
+test("adding a legacy effect target adds a matching definition field effect", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  await store.initialize();
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const definition = configured.effectGroups.find(({ id }) => id === "effect_group_effect_warm");
+  definition.fieldEffects = [definition.fieldEffects.find(({ fieldId }) =>
+    fieldId === "field_affinity")];
+  definition.fieldEffects[0].operations[0].sources = ["ai"];
+  const instance = configured.activeEffects.find(({ definitionId }) =>
+    definitionId === definition.id);
+  instance.id = "active_effect_hidden_metadata";
+  instance.triggerActorId = "actor_t";
+  instance.resolvedTargets = [instance.resolvedTargets.find(({ fieldId }) =>
+    fieldId === "field_affinity")];
+  instance.duration = { expiresAt: null, remainingTurns: 7 };
+  instance.reason = { mode: "custom", template: "general", text: "keep this reason" };
+  await store.transactV3(before.revision, configured, []);
+  const compatibility = await store.read();
+  const next = structuredClone(compatibility.dataset);
+  next.temporaryEffects[0].targets.push({
+    fieldId: "field_excite",
+    scope: "character",
+    scopeKey: "character:actor_t",
+  });
+
+  await store.transact(compatibility.revision, next);
+
+  const after = await store.readV3();
+  const afterDefinition = after.dataset.effectGroups.find(({ id }) => id === definition.id);
+  assert.deepEqual(afterDefinition.fieldEffects[0], definition.fieldEffects[0]);
+  const addedFieldEffect = afterDefinition.fieldEffects.find(({ fieldId }) =>
+    fieldId === "field_excite");
+  assert.ok(addedFieldEffect);
+  assert.deepEqual(addedFieldEffect.actorSelector, { kind: "selected", actorIds: ["actor_t"] });
+  assert.equal(addedFieldEffect.operations[0].kind, "all_multiplier");
+  assert.equal(addedFieldEffect.operations[0].value, 1.25);
+  assert.deepEqual([...addedFieldEffect.operations[0].sources].sort(), [
+    "ai", "manual", "natural", "per_turn", "rule",
+  ]);
+  const afterInstance = after.dataset.activeEffects.find(({ id }) =>
+    id === "active_effect_hidden_metadata");
+  assert.equal(afterInstance.triggerActorId, "actor_t");
+  assert.deepEqual(afterInstance.duration, { expiresAt: null, remainingTurns: 7 });
+  assert.deepEqual(afterInstance.reason, {
+    mode: "custom", template: "general", text: "keep this reason",
+  });
+  assert.deepEqual(afterInstance.resolvedTargets.map(({ fieldId }) => fieldId), [
+    "field_affinity", "field_excite",
+  ]);
 });
 
 test("registered production chat hook commits legacy changes, v3 effects, AI rules, facts, and records atomically", async (t) => {
@@ -741,7 +1104,15 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
   assert.equal(fileCalls.filter((call) =>
     call.operation === "replaceAtomically" && call.destination === V3_PATH).length, 1);
   assert.equal(fileCalls.some((call) => call.operation === "move" && call.destination === V3_PATH), false);
-  assert.equal(fileCalls.some((call) => call.operation === "write" && call.append === true), true);
+  const stagedSegmentWriteIndex = fileCalls.findIndex((call) =>
+    call.operation === "write" && call.append === false && call.path.includes(".jsonl.stage."));
+  const segmentPublicationIndex = fileCalls.findIndex((call) =>
+    call.operation === "replaceAtomically" && call.destination.startsWith(`${RECORD_DIRECTORY}/segment-`));
+  const configPublicationIndex = fileCalls.findIndex((call) =>
+    call.operation === "replaceAtomically" && call.destination === V3_PATH);
+  assert.equal(stagedSegmentWriteIndex >= 0 &&
+    segmentPublicationIndex > stagedSegmentWriteIndex &&
+    configPublicationIndex > segmentPublicationIndex, true);
 
   const committedConfigBytes = files.snapshot()[V3_PATH];
   const failureCallStart = fileCalls.length;

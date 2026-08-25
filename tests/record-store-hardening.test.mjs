@@ -208,8 +208,8 @@ test("two store instances serialize one path and the stale writer cannot publish
   const secondNext = structuredClone(before.dataset);
   secondNext.settings.aiEnabled = true;
   const barrier = files.pauseNext(
-    "appendText",
-    ({ content }) => content.includes("hardening_record_1"),
+    "replaceAtomically",
+    ({ destination }) => destination === `${RECORD_DIRECTORY}/segment-000001.jsonl`,
   );
 
   const firstWrite = first.transactV3(before.revision, firstNext, [changeRecord(1)]);
