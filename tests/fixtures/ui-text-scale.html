@@ -10,7 +10,7 @@
         .then(function (response) { return response.text(); })
         .then(function (css) {
           const scaled = css
-            .replace(/((?:font-size|--type-body)\s*:\s*)(\d+(?:\.\d+)?)px/g, function (_match, prefix, value) {
+            .replace(/((?:font-size|line-height|--type-body)\s*:\s*)(\d+(?:\.\d+)?)px/g, function (_match, prefix, value) {
               return prefix + (Number(value) * 1.3).toFixed(2) + "px";
             })
             .replaceAll('url("./assets/', 'url("../../static/app_ui/assets/');

@@ -532,22 +532,33 @@ test("picker pagination uses normalized human sort and raw ID as the final tie-b
 
 test("actor picker can be restricted to authoritative members of one group", async () => {
   const fixture = createSource(makeDataset());
+  const members = Array.from({ length: 45 }, (_value, index) => ({
+    characterId: `member_${String(index).padStart(2, "0")}`,
+    name: `成员 ${String(index).padStart(2, "0")}`,
+    enabled: true,
+  }));
   const service = new MvuQueryService({
     ...fixture.source,
+    async listActors() {
+      return [...structuredClone(members), { characterId: "outsider", name: "外部角色", enabled: true }];
+    },
     async listActorsForGroup(groupId) {
       assert.equal(groupId, "group_007");
-      return [
-        { characterId: "member_b", name: "成员乙", enabled: true },
-        { characterId: "member_a", name: "成员甲", enabled: true },
-      ];
+      return structuredClone(members);
     },
   }, fixture.options);
 
   assert.deepEqual(MVU_REQUEST_PARSERS.queryActors({ filters: { groupId: "group_007" } }), {
     filters: { groupId: "group_007" },
   });
-  const result = await service.queryActors({ filters: { groupId: "group_007" } });
-  assert.deepEqual(result.items.map((actor) => actor.characterId), ["member_b", "member_a"]);
+  const first = await service.queryActors({ filters: { groupId: "group_007" } });
+  const tail = await service.queryActors({ filters: { groupId: "group_007" }, cursor: first.nextCursor });
+  const ids = [...first.items, ...tail.items].map((actor) => actor.characterId);
+  assert.equal(first.totalCount, 45);
+  assert.equal(first.loadedCount, 30);
+  assert.equal(tail.loadedCount, 15);
+  assert.equal(ids.includes("member_44"), true);
+  assert.equal(ids.includes("outsider"), false);
 });
 
 test("100,000-record paging reads only the needed committed line range", async () => {

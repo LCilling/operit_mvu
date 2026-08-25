@@ -91,6 +91,7 @@ h1, h2, h3 { font-weight: 500; letter-spacing: normal; }
 }
 .top-app-bar h1 {
   margin: 0;
+  padding-block: 1px;
   overflow: hidden;
   font-size: 21px;
   font-weight: 400;

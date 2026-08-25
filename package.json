@@ -12,12 +12,16 @@
     "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test:v3": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "test:dom": "pnpm run build:web && node tests/ui-task8-dom-behavior.cjs",
+    "smoke:task8": "pnpm run build:web && node tests/ui-task8-browser-smoke.cjs",
     "build:web": "node scripts/build-web.mjs",
     "build": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run build:web",
-    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run test:v3",
+    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run test:v3 && pnpm run test:dom",
     "pack": "pnpm run build && node scripts/pack.mjs"
   },
   "devDependencies": {
+    "happy-dom": "20.11.6",
+    "playwright-core": "1.62.1",
     "typescript": "5.9.3"
   }
 }

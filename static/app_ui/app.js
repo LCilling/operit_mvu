@@ -149,7 +149,46 @@
       render();
       return;
     }
+    const screenScroll = appRoot.querySelector(".screen-scroll");
+    const scrollTop = screenScroll ? screenScroll.scrollTop : 0;
+    const focusDescriptor = managementFocusDescriptor(document.activeElement);
     current.innerHTML = next.innerHTML;
+    const focusTarget = resolveManagementFocus(focusDescriptor);
+    if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus({ preventScroll: true });
+    if (screenScroll) screenScroll.scrollTop = scrollTop;
+  }
+
+  function managementFocusDescriptor(element) {
+    const data = element && element.dataset;
+    if (!data) return null;
+    if (data.pageRoute && data.pageDirection) {
+      return { kind: "page", route: data.pageRoute, direction: data.pageDirection };
+    }
+    if (data.listFilterRoute && data.listFilterKey) {
+      return { kind: "filter", route: data.listFilterRoute, key: data.listFilterKey };
+    }
+    if (data.listSearchRoute) return { kind: "search", route: data.listSearchRoute };
+    return null;
+  }
+
+  function resolveManagementFocus(descriptor) {
+    if (!descriptor) return null;
+    const selector = descriptor.kind === "page" ? "[data-page-route]" :
+      descriptor.kind === "filter" ? "[data-list-filter-route]" : "[data-list-search-route]";
+    const candidates = Array.from(appRoot.querySelectorAll(selector));
+    const exact = candidates.find(function (candidate) {
+      if (descriptor.kind === "page") {
+        return candidate.dataset.pageRoute === descriptor.route && candidate.dataset.pageDirection === descriptor.direction;
+      }
+      if (descriptor.kind === "filter") {
+        return candidate.dataset.listFilterRoute === descriptor.route && candidate.dataset.listFilterKey === descriptor.key;
+      }
+      return candidate.dataset.listSearchRoute === descriptor.route;
+    }) || null;
+    if (descriptor.kind !== "page" || (exact && !exact.disabled)) return exact;
+    return candidates.find(function (candidate) {
+      return candidate.dataset.pageRoute === descriptor.route && !candidate.disabled;
+    }) || null;
   }
 
   async function handleClick(event) {
@@ -286,10 +325,13 @@
 
   async function openStatusPicker(action, element) {
     const groupMode = action === "open-status-group-picker";
+    const activeGroupId = ui.state.snapshot.activeContext.groupId;
     await ui.openEntityPicker({
       entity: groupMode ? "groups" : "actors",
       title: groupMode ? "查找群组" : "查找角色",
       mode: "single",
+      filters: !groupMode && activeGroupId ? { groupId: activeGroupId } : {},
+      lockedFilterKeys: !groupMode && activeGroupId ? ["groupId"] : [],
       selectedIds: groupMode
         ? [ui.state.snapshot.activeContext.groupId].filter(Boolean)
         : [ui.state.snapshot.activeContext.actorId].filter(Boolean),
@@ -300,8 +342,7 @@
         if (groupMode) {
           await reloadContext({ groupId: id }, id, "group");
         } else {
-          const groupId = ui.state.snapshot.activeContext.groupId;
-          await reloadContext({ groupId, actorId: id }, groupId, "character");
+          await reloadContext({ groupId: activeGroupId, actorId: id }, activeGroupId, "character");
         }
       },
     });
@@ -519,7 +560,7 @@
       if (!directoryLoaded) await ui.loadDirectory(directoryGroupId || null);
       await ui.loadRouteData(ui.state.route);
       if (nextMode) ui.state.statusMode = nextMode;
-      ui.transition(function () { render({ resetScroll: false }); });
+      await ui.transition(function () { render({ resetScroll: false }); });
     } catch (error) {
       ui.showFatal(error);
     } finally {
