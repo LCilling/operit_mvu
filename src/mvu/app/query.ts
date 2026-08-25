@@ -522,6 +522,7 @@ export class MvuQueryService {
   }
 
   async deleteCondition(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    requireEntityId(request.id);
     const committed = await this.mutate(request.expectedRevision, (draft) => {
       if (draft.rules.some((rule) => rule.conditionId === request.id)) {
         throw new Error("MVU_CONDITION_REFERENCED");
@@ -532,6 +533,7 @@ export class MvuQueryService {
   }
 
   async getConditionReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
+    requireEntityId(request.id);
     const dataset = (await this.source.readV3()).dataset;
     requireById(dataset.conditions, request.id, "MVU_CONDITION_NOT_FOUND");
     return pageReferences(sortReferences(dataset.rules.filter((rule) => rule.conditionId === request.id).map((rule) => ({
@@ -559,6 +561,7 @@ export class MvuQueryService {
   }
 
   async deleteEffectGroup(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    requireEntityId(request.id);
     const committed = await this.mutate(request.expectedRevision, (draft) => {
       const ruleReference = draft.rules.some((rule) => rule.actions.some((action) =>
         action.kind === "activate_effect_group"
@@ -573,6 +576,7 @@ export class MvuQueryService {
   }
 
   async getEffectGroupReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
+    requireEntityId(request.id);
     const dataset = (await this.source.readV3()).dataset;
     requireById(dataset.effectGroups, request.id, "MVU_EFFECT_GROUP_NOT_FOUND");
     const ruleReferences = dataset.rules.filter((rule) => rule.actions.some((action) =>
@@ -611,11 +615,13 @@ export class MvuQueryService {
   }
 
   async deleteRule(request: RevisionedIdRequest): Promise<DeleteMutationResponse> {
+    requireEntityId(request.id);
     const committed = await this.mutate(request.expectedRevision, (draft) => removeRequired(draft.rules, request.id, "MVU_RULE_NOT_FOUND"));
     return { revision: committed.revision };
   }
 
   async getRuleReferences(request: { id: string }): Promise<EntityReferenceSummary[]> {
+    requireEntityId(request.id);
     const dataset = (await this.source.readV3()).dataset;
     const rule = requireById(dataset.rules, request.id, "MVU_RULE_NOT_FOUND");
     const references: EntityReferenceSummary[] = [];
@@ -679,6 +685,7 @@ export class MvuQueryService {
     patch: object,
     select: (draft: MvuDatasetV3) => TEntity[],
   ): Promise<MutationResponse<TEntity>> {
+    requireEntityId(id);
     const committed = await this.mutate(expectedRevision, (draft) => {
       const entity = requireById(select(draft), id, `MVU_${prefix.toUpperCase()}_NOT_FOUND`);
       Object.assign(entity, klona(patch), { updatedAt: new Date(this.now()).toISOString() });
@@ -695,6 +702,7 @@ export class MvuQueryService {
     id: string,
     select: (draft: MvuDatasetV3) => TEntity[],
   ): Promise<MutationResponse<TEntity>> {
+    requireEntityId(id);
     const copiedId = this.createId(prefix);
     const committed = await this.mutate(expectedRevision, (draft) => {
       const source = requireById(select(draft), id, `MVU_${prefix.toUpperCase()}_NOT_FOUND`);

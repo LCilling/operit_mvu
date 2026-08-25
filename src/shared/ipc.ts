@@ -672,7 +672,7 @@ function parseUpdateFieldRequest(value: unknown): UpdateFieldRequest {
 function parseIdRequest(value: unknown): IdRequest {
   const record = requireRecord(value, "MVU_ID_REQUEST_INVALID");
   assertKeys(record, ["id"], [], "MVU_ID_REQUEST_INVALID");
-  return { id: requireNonEmptyString(record, "id", "MVU_ID_REQUIRED") };
+  return { id: requireBoundedNonEmptyString(record, "id", 256, "MVU_ID_REQUIRED") };
 }
 
 function requireExpectedRevision(record: UnknownRecord, code: string): number {
