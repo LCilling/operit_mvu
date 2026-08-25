@@ -232,6 +232,111 @@ test("import and export honor the native JSON/path contracts", async () => {
   assert.equal(exported.savedPath, "/sdcard/Download/Operit/exports/mvu.json");
 });
 
+test("a superseded snapshot response cannot overwrite the latest context", async () => {
+  const { ui } = createHarness("?route=status");
+  const first = deferred();
+  const second = deferred();
+  ui.native.call = async (method, payload) => {
+    assert.equal(method, "snapshot");
+    return payload.actorId === "actor_a" ? first.promise : second.promise;
+  };
+  const actorA = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: "actor_a", groupId: null, actorName: "角色甲", truncated: false },
+  });
+  const actorB = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: "actor_b", groupId: null, actorName: "角色乙", truncated: false },
+    selected: {
+      actor: { characterId: "actor_b", name: "角色乙", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
+      group: null,
+    },
+    contextLabels: { groupName: null, chatName: "角色乙的会话", truncated: false },
+  });
+
+  const older = ui.loadSnapshot({ actorId: "actor_a" });
+  const latest = ui.loadSnapshot({ actorId: "actor_b" });
+  second.resolve(actorB);
+  await latest;
+  first.resolve(actorA);
+
+  await assert.rejects(older, /MVU_SNAPSHOT_REQUEST_SUPERSEDED/);
+  assert.equal(ui.state.snapshot.activeContext.actorId, "actor_b");
+});
+
+test("an old field response cannot repopulate the cache after context changes", async () => {
+  const { ui } = createHarness("?route=status");
+  const fieldReply = deferred();
+  ui.state.snapshot = validSnapshot();
+  ui.native.call = async (method) => {
+    if (method === "getEntityById") return fieldReply.promise;
+    if (method === "snapshot") {
+      return validSnapshot({
+        activeContext: { chatId: "chat_a", actorId: "actor_b", groupId: null, actorName: "角色乙", truncated: false },
+        selected: {
+          actor: { characterId: "actor_b", name: "角色乙", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
+          group: null,
+        },
+        contextLabels: { groupName: null, chatName: "角色乙的会话", truncated: false },
+      });
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+
+  const pendingField = ui.getEntity("field", "field_a");
+  await new Promise((resolve) => setImmediate(resolve));
+  await ui.loadSnapshot({ actorId: "actor_b" });
+  fieldReply.resolve(validFieldEntity({ currentValue: 4, scopeKey: "character:actor_a" }));
+
+  await assert.rejects(pendingField, /MVU_ENTITY_CACHE_SUPERSEDED/);
+  assert.equal(ui.state.entities.has("field:field_a"), false);
+});
+
+test("an old non-field response cannot repopulate a cache cleared by a revision refresh", async () => {
+  const { ui } = createHarness("?route=status");
+  const conditionReply = deferred();
+  ui.state.snapshot = validSnapshot();
+  ui.native.call = async (method) => {
+    if (method === "getEntityById") return conditionReply.promise;
+    if (method === "snapshot") return validSnapshot({ revision: 2 });
+    throw new Error(`unexpected method ${method}`);
+  };
+
+  const pendingCondition = ui.getEntity("condition", "condition_a");
+  await new Promise((resolve) => setImmediate(resolve));
+  await ui.loadSnapshot();
+  conditionReply.resolve(validConditionEntity());
+
+  await assert.rejects(pendingCondition, /MVU_ENTITY_CACHE_SUPERSEDED/);
+  assert.equal(ui.state.entities.has("condition:condition_a"), false);
+});
+
+test("a post-refresh entity lookup never deduplicates onto the pre-refresh native request", async () => {
+  const { ui } = createHarness("?route=status");
+  const staleReply = deferred();
+  const freshEntity = validConditionEntity({ name: "刷新后的条件" });
+  let entityCalls = 0;
+  ui.state.snapshot = validSnapshot();
+  ui.native.call = async (method) => {
+    if (method === "getEntityById") {
+      entityCalls += 1;
+      return entityCalls === 1 ? staleReply.promise : freshEntity;
+    }
+    if (method === "snapshot") return validSnapshot({ revision: 2 });
+    throw new Error(`unexpected method ${method}`);
+  };
+
+  const staleLookup = ui.getEntity("condition", "condition_a");
+  await new Promise((resolve) => setImmediate(resolve));
+  await ui.loadSnapshot();
+  const freshLookup = ui.getEntity("condition", "condition_a");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(entityCalls, 2);
+  assert.equal((await freshLookup).name, "刷新后的条件");
+  staleReply.resolve(validConditionEntity({ name: "刷新前的条件" }));
+  await assert.rejects(staleLookup, /MVU_ENTITY_CACHE_SUPERSEDED/);
+  assert.equal(ui.state.entities.get("condition:condition_a").name, "刷新后的条件");
+});
+
 test("group mode immediately loads a group projection and group-member directory", async () => {
   const { context, ui } = createHarness();
   const requests = [];
@@ -378,6 +483,58 @@ test("field detail and field management send the selected UI projection context"
   assert.deepEqual({ ...fieldListRequest[1].scopeContext }, {
     chatId: "chat_a", actorId: "member_b", groupId: "group_b", actorName: "成员乙",
   });
+});
+
+test("field detail finds a bound group member beyond the first directory page", async () => {
+  const { context, ui } = createHarness("?route=field-detail&field=field_a");
+  const requests = [];
+  const groupSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: null, groupId: "group_b", actorName: "群组乙", truncated: false },
+    selected: { actor: null, group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false } },
+    contextLabels: { groupName: "群组乙", chatName: "群组乙会话", truncated: false },
+    pages: { ...validSnapshot().pages, fields: page([]) },
+  });
+  const tailSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: "member_031", groupId: "group_b", actorName: "成员 031", truncated: false },
+    selected: {
+      actor: { characterId: "member_031", name: "成员 031", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
+      group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false },
+    },
+    contextLabels: { groupName: "群组乙", chatName: "成员 031 会话", truncated: false },
+  });
+  ui.native.call = async (method, payload) => {
+    requests.push([method, payload]);
+    if (method === "snapshot") return payload.actorId === "member_031" ? tailSnapshot : groupSnapshot;
+    if (method === "queryActors") {
+      if (payload.filters?.fieldId === "field_a") {
+        return page([{ characterId: "member_031", name: "成员 031", enabled: true }]);
+      }
+      return page(Array.from({ length: 30 }, (_value, index) => ({
+        characterId: `member_${String(index).padStart(3, "0")}`,
+        name: `成员 ${String(index).padStart(3, "0")}`,
+        enabled: true,
+      })));
+    }
+    if (method === "queryGroups") return page([{ characterGroupId: "group_b", name: "群组乙" }]);
+    if (method === "getEntityById") {
+      if (payload.scopeContext?.actorId === "member_031") {
+        return validFieldEntity({ bindingIds: ["member_031"], currentValue: 42, scopeKey: "character:member_031" });
+      }
+      return validFieldEntity({ bindingIds: ["member_031"], currentValue: null, currentStage: null, scopeKey: null });
+    }
+    if (method === "queryRecords") return page([]);
+    return page([]);
+  };
+
+  vm.runInContext(appSource, context, { filename: "app.js" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const filtered = requests.find(([method, payload]) =>
+    method === "queryActors" && payload.filters?.fieldId === "field_a");
+  assert.deepEqual({ ...filtered[1].filters }, { groupId: "group_b", fieldId: "field_a" });
+  assert.equal(ui.state.snapshot.activeContext.actorId, "member_031");
+  assert.equal(ui.state.routeError, null);
 });
 
 test("group to character with no valid history selects the first current-group member before rendering", async () => {

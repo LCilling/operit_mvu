@@ -352,6 +352,23 @@ function createQuerySource(
     async activeContext() {
       return fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
     },
+    async resolveProjectionContext(requested) {
+      if (requested.chatId === null) {
+        throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+      }
+      const requestedSnapshot = requested.groupId !== null
+        ? await ToolPkg.chatContext.snapshot({ groupId: requested.groupId })
+        : await ToolPkg.chatContext.snapshot({ chatId: requested.chatId });
+      const resolved = requested.groupId !== null && requested.actorId !== null
+        ? activeContextFromHostSnapshot(requestedSnapshot, requested.actorId)
+        : activeContextFromHostSnapshot(requestedSnapshot);
+      if (resolved.chatId !== requested.chatId ||
+          resolved.actorId !== requested.actorId ||
+          resolved.groupId !== requested.groupId) {
+        throw new Error("MVU_QUERY_SCOPE_CONTEXT_NOT_AUTHORIZED");
+      }
+      return resolved;
+    },
     async modelBudget() {
       const snapshot = await hostSnapshot();
       const context = fixedContext ?? activeContextFromHostSnapshot(snapshot);
