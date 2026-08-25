@@ -566,7 +566,7 @@ git add static/app_ui/runtime.js static/app_ui/components.js static/app_ui/pages
 git commit -m "feat: add searchable paged MVU lists"
 ```
 
-### Task 9: Complete field scopes, condition CRUD, rule binding, and effect-group editors
+### Task 9: Complete field scopes, portable field templates, condition CRUD, rule binding, and effect-group editors
 
 **Files:**
 - Modify: `static/app_ui/pages-config.js`
@@ -575,15 +575,20 @@ git commit -m "feat: add searchable paged MVU lists"
 - Modify: `static/app_ui/components.js`
 - Modify: `static/app_ui/styles.css`
 - Modify: `scripts/audit-v3-ui.mjs`
+- Modify: `src/mvu/app/query.ts`
+- Modify: `src/mvu/app/store-v3.ts`
 - Modify: `src/shared/ipc.ts`
+- Modify: `src/ui/web_container/index.ui.ts`
+- Modify: `src/main.ts`
+- Create: `tests/field-template.test.mjs`
 
 **Interfaces:**
 - Consumes: CRUD/query IPC and searchable picker.
-- Produces: complete visual editors matching the v3 contracts.
+- Produces: complete visual editors matching the v3 contracts plus atomic portable field-template preview/import/export.
 
 - [ ] **Step 1: Add failing audit cases for every approved editor behavior**
 
-Assert current-session auto-bind and collapsed advanced binding; readable group/chat labels; condition create/copy/edit/toggle/delete/reference actions; nested AND/OR/NOT controls; AI type/requirement/confidence fields; rule actor binding; field-first effect rows; actor selector default `all_bound`; multiple operations; visible default/custom reason mode and preview; repair badges for missing references.
+Assert current-session auto-bind and collapsed advanced binding; readable group/chat labels; portable field-template export options and per-actor enable/value matrix; import preview/conflict/actor mapping; condition create/copy/edit/toggle/delete/reference actions; nested AND/OR/NOT controls; AI type/requirement/confidence fields; rule actor binding; field-first effect rows; actor selector default `all_bound`; multiple operations; visible default/custom reason mode and preview; repair badges for missing references.
 
 - [ ] **Step 2: Run UI audit RED**
 
@@ -595,25 +600,29 @@ Expected: FAIL on missing v3 editors.
 
 Selecting current session immediately binds the open chat and displays its title. Keep multi-chat management inside a collapsed `<details>`. Use the same section-heading component for basic info, scope, appearance, and detailed configuration; keep role/group IDs secondary.
 
-- [ ] **Step 4: Implement condition and rule editors**
+- [ ] **Step 4: Implement portable field-template import/export**
+
+Before the rule editor, implement field-template export and import inside the existing configuration flow. Keep full-dataset backup in Advanced. Export definition/config by default and values only for explicitly selected actors; import uses preview, explicit conflict strategy, per-actor/group enable mapping, per-target value policy, `expectedRevision`, and one atomic transaction. Reuse searchable pickers and host file save responses; never use an unbounded inline actor list.
+
+- [ ] **Step 5: Implement condition and rule editors**
 
 Render recursive expression groups as nested cards with direct add-condition/add-group actions. Show affected rule references before shared edits/deletes. Put trigger actor binding before condition selection, then render actions separately under `触发后改变的字段内容`.
 
-- [ ] **Step 5: Implement effect-group editor**
+- [ ] **Step 6: Implement effect-group editor**
 
 Require name, render each target field as a parent card, default actor selection to all bound actors, support trigger actor and explicit actor search, add multiple operations per field, and keep default/custom reason controls directly visible with a rendered preview.
 
-- [ ] **Step 6: Run UI and TypeScript checks GREEN**
+- [ ] **Step 7: Run UI, template, and TypeScript checks GREEN**
 
-Run: `node scripts/audit-v3-ui.mjs; pnpm run typecheck; pnpm run build:web`
+Run: `node scripts/audit-v3-ui.mjs; pnpm run typecheck; node --test tests/field-template.test.mjs; pnpm run build:web`
 
 Expected: all approved editor interactions are represented and all IPC payloads typecheck.
 
-- [ ] **Step 7: Commit complete editors**
+- [ ] **Step 8: Commit complete editors**
 
 ```powershell
-git add static/app_ui/pages-config.js static/app_ui/pages-rules.js static/app_ui/pages-advanced.js static/app_ui/components.js static/app_ui/styles.css scripts/audit-v3-ui.mjs src/shared/ipc.ts
-git commit -m "feat: complete MVU v3 visual editors"
+git add static/app_ui/pages-config.js static/app_ui/pages-rules.js static/app_ui/pages-advanced.js static/app_ui/components.js static/app_ui/styles.css scripts/audit-v3-ui.mjs src/mvu/app/query.ts src/mvu/app/store-v3.ts src/shared/ipc.ts src/ui/web_container/index.ui.ts src/main.ts tests/field-template.test.mjs
+git commit -m "feat: complete MVU v3 editors and field templates"
 ```
 
 ### Task 10: Bound model input and finish migration/diagnostic UI
