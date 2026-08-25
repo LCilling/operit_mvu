@@ -2,12 +2,15 @@
 import type { MvuRuntime } from "../mvu/app/index";
 import {
   FULL_BACKUP_MAX_BYTES,
+  FULL_BACKUP_MAX_FILENAME_PROBES,
   FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  deriveFullBackupFileName,
   fullBackupUtf8ByteLength,
   parseDatasetImport,
   type DatasetImportPreview,
   type DatasetImportRestoreRequest,
   type DatasetImportRestoreResult,
+  type ParsedFullV3Import,
   type FullBackupSummary,
 } from "../mvu/app/full-backup";
 import type {
@@ -218,6 +221,10 @@ export interface MvuIpcDependencies {
 type UnknownRecord = Record<string, unknown>;
 
 const MVU_EXPORT_DIRECTORY = "/sdcard/Download/Operit/exports";
+const FULL_BACKUP_BASE_FILENAME_PATTERN =
+  /^operit-mvu-full-backup-v3-schema1-\d{8}-\d{9}Z-r\d+-[a-f0-9]{12}\.json$/;
+const FULL_BACKUP_TARGET_FILENAME_PATTERN =
+  /^operit-mvu-full-backup-v3-schema1-\d{8}-\d{9}Z-r\d+-[a-f0-9]{12}(?:-(?:[2-9]|[1-9]\d|100))?\.json$/;
 
 interface FileOperationResult {
   successful: boolean;
@@ -231,6 +238,42 @@ function requireSuccessfulFileOperation(
   if (!result.successful) {
     throw new Error(`MVU_EXPORT_${operation}_FAILED:${result.details}`);
   }
+}
+
+function expectedFullBackupSummary(parsed: ParsedFullV3Import, json: string): FullBackupSummary {
+  return {
+    sourceRevision: parsed.sourceRevision,
+    fieldCount: parsed.config.fields.length,
+    conditionCount: parsed.config.conditions.length,
+    ruleCount: parsed.config.rules.length,
+    effectGroupCount: parsed.config.effectGroups.length,
+    activeEffectCount: parsed.config.activeEffects.length,
+    recordCount: parsed.records.length,
+    byteCount: fullBackupUtf8ByteLength(json),
+  };
+}
+
+function requireMatchingFullBackupSummary(value: unknown, expected: FullBackupSummary): void {
+  const code = "MVU_FULL_BACKUP_EXPORT_SUMMARY_INVALID";
+  const summary = requireRecord(value, code);
+  const keys = [
+    "sourceRevision", "fieldCount", "conditionCount", "ruleCount", "effectGroupCount",
+    "activeEffectCount", "recordCount", "byteCount",
+  ] as const;
+  assertKeys(summary, keys, [], code);
+  if (keys.some((key) => summary[key] !== expected[key])) fail(code);
+}
+
+async function resolveAvailableFullBackupTarget(baseFileName: string): Promise<{ fileName: string; savedPath: string }> {
+  for (let probe = 1; probe <= FULL_BACKUP_MAX_FILENAME_PROBES; probe += 1) {
+    const fileName = probe === 1 ? baseFileName : baseFileName.replace(/\.json$/, `-${probe}.json`);
+    if (!FULL_BACKUP_TARGET_FILENAME_PATTERN.test(fileName)) fail("MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID");
+    const savedPath = `${MVU_EXPORT_DIRECTORY}/${fileName}`;
+    const result = await Tools.Files.exists(savedPath, "android");
+    if (typeof result?.exists !== "boolean") fail("MVU_FULL_BACKUP_EXPORT_EXISTS_CHECK_INVALID");
+    if (!result.exists) return { fileName, savedPath };
+  }
+  throw new Error("MVU_FULL_BACKUP_EXPORT_COLLISION_LIMIT");
 }
 
 function fail(code: string): never {
@@ -1516,6 +1559,12 @@ function guarded<TRequest, TResult>(
 }
 
 export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): () => void {
+  let fullBackupExportQueue: Promise<void> = Promise.resolve();
+  function enqueueFullBackupExport<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+    const run = fullBackupExportQueue.then(operation, operation);
+    fullBackupExportQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
   const unsubscribers = [
     ToolPkg.ipc.on<unknown, MvuPageSnapshot>(
       MVU_IPC.snapshot,
@@ -1623,19 +1672,32 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
     ),
     ToolPkg.ipc.on<unknown, ExportDatasetResponse>(
       MVU_IPC.exportDataset,
-      guarded("exportDataset", MVU_REQUEST_PARSERS.exportDataset, async () => {
-        const exported = await runtime.exportDataset();
-        parseDatasetImport(exported.json, Date.now());
-        if (!/^operit-mvu-full-backup-v3-schema1-\d{8}-\d{6}Z\.json$/.test(exported.fileName)) {
-          throw new Error("MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID");
-        }
-        const savedPath = `${MVU_EXPORT_DIRECTORY}/${exported.fileName}`;
-        const directoryResult = await Tools.Files.mkdir(MVU_EXPORT_DIRECTORY, true, "android");
-        requireSuccessfulFileOperation("DIRECTORY_CREATE", directoryResult);
-        const writeResult = await Tools.Files.write(savedPath, exported.json, false, "android");
-        requireSuccessfulFileOperation("WRITE", writeResult);
-        return { fileName: exported.fileName, savedPath, summary: { ...exported.summary } };
-      })
+      guarded("exportDataset", MVU_REQUEST_PARSERS.exportDataset, () =>
+        enqueueFullBackupExport(async () => {
+          const exported = await runtime.exportDataset();
+          const parsed = parseDatasetImport(exported.json, Date.now());
+          if (parsed.kind !== "full_v3" || parsed.schemaVersion !== 1) {
+            throw new Error("MVU_FULL_BACKUP_EXPORT_KIND_INVALID");
+          }
+          const expectedFileName = deriveFullBackupFileName(
+            parsed.exportedAt,
+            parsed.sourceRevision,
+            parsed.checksum,
+          );
+          if (typeof exported.fileName !== "string" ||
+            !FULL_BACKUP_BASE_FILENAME_PATTERN.test(exported.fileName) ||
+            exported.fileName !== expectedFileName) {
+            throw new Error("MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID");
+          }
+          const summary = expectedFullBackupSummary(parsed, exported.json);
+          requireMatchingFullBackupSummary(exported.summary, summary);
+          const target = await resolveAvailableFullBackupTarget(expectedFileName);
+          const directoryResult = await Tools.Files.mkdir(MVU_EXPORT_DIRECTORY, true, "android");
+          requireSuccessfulFileOperation("DIRECTORY_CREATE", directoryResult);
+          const writeResult = await Tools.Files.write(target.savedPath, exported.json, false, "android");
+          requireSuccessfulFileOperation("WRITE", writeResult);
+          return { ...target, summary };
+        }))
     ),
     ToolPkg.ipc.on<unknown, DatasetImportPreview>(
       MVU_IPC.previewDatasetImport,

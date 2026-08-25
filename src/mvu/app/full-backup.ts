@@ -26,6 +26,7 @@ export const FULL_BACKUP_MAX_TEXT_LENGTH = 1_048_576;
 export const FULL_BACKUP_MAX_DEPTH = 64;
 export const FULL_BACKUP_REPLACEMENT_CONFIRMATION = "replace-all-mvu-data";
 export const FULL_BACKUP_MAX_PREVIEW_WARNINGS = 100;
+export const FULL_BACKUP_MAX_FILENAME_PROBES = 100;
 
 const FULL_BACKUP_MAX_ARRAY_ITEMS = 1_000_000;
 const FULL_BACKUP_MAX_NODES = 10_000_000;
@@ -55,11 +56,17 @@ export interface FullBackupExport {
   summary: FullBackupSummary;
 }
 
+/** Optional stricter boundary for low-cost boundary tests and constrained callers. */
+export interface FullBackupResourceLimits {
+  maxBytes: number;
+}
+
 export interface ParsedFullV3Import {
   kind: "full_v3";
   sourceFormatVersion: 3;
   schemaVersion: 1;
   exportedAt: string;
+  checksum: string;
   sourceRevision: number;
   config: FullBackupV3Config;
   records: DataChangeRecord[];
@@ -146,7 +153,12 @@ const RECORD_KEYS = [
   "messageId", "variantId", "occurredAt",
 ] as const;
 
-export function createFullBackupExport(snapshot: FullBackupSourceSnapshot, now: number): FullBackupExport {
+export function createFullBackupExport(
+  snapshot: FullBackupSourceSnapshot,
+  now: number,
+  limits?: FullBackupResourceLimits,
+): FullBackupExport {
+  const maxBytes = resolveMaxBytes(limits);
   requireSafeRevision(snapshot.revision, "MVU_FULL_BACKUP_SOURCE_REVISION_INVALID");
   if (snapshot.dataset.revision !== snapshot.revision) {
     throw new Error("MVU_FULL_BACKUP_SNAPSHOT_REVISION_MISMATCH");
@@ -184,20 +196,25 @@ export function createFullBackupExport(snapshot: FullBackupSourceSnapshot, now: 
   };
   const json = JSON.stringify(document, null, 2);
   const byteCount = fullBackupUtf8ByteLength(json);
-  if (byteCount > FULL_BACKUP_MAX_BYTES) throw new Error("MVU_FULL_BACKUP_TOO_LARGE");
+  if (byteCount > maxBytes) throw new Error("MVU_FULL_BACKUP_TOO_LARGE");
 
   // This is deliberately a full public-boundary parse, not an internal assertion.
   // No caller can receive bytes that the restore endpoint would reject.
-  parseDatasetImport(json, now);
+  parseDatasetImport(json, now, limits);
   return {
-    fileName: buildFullBackupFileName(exportedAt),
+    fileName: deriveFullBackupFileName(exportedAt, snapshot.revision, document.checksum.value),
     json,
     summary: summaryOf(snapshot.revision, config, snapshot.records.length, byteCount),
   };
 }
 
-export function parseDatasetImport(json: string, now: number): ParsedDatasetImport {
-  if (typeof json !== "string" || fullBackupUtf8ByteLength(json) > FULL_BACKUP_MAX_BYTES) {
+export function parseDatasetImport(
+  json: string,
+  now: number,
+  limits?: FullBackupResourceLimits,
+): ParsedDatasetImport {
+  const maxBytes = resolveMaxBytes(limits);
+  if (typeof json !== "string" || fullBackupUtf8ByteLength(json) > maxBytes) {
     throw new Error("MVU_FULL_BACKUP_TOO_LARGE");
   }
   let parsed: unknown;
@@ -244,6 +261,7 @@ export function parseDatasetImport(json: string, now: number): ParsedDatasetImpo
     sourceFormatVersion: 3,
     schemaVersion: 1,
     exportedAt: document.exportedAt,
+    checksum: checksum.value,
     sourceRevision: payload.sourceRevision,
     config: klona(config),
     records: klona(payload.records),
@@ -709,6 +727,10 @@ function assertJsonResourceBounds(root: unknown): void {
     if (typeof current.value === "number" && !Number.isFinite(current.value)) {
       throw new Error("MVU_FULL_BACKUP_UNSAFE_NUMBER");
     }
+    if (typeof current.value === "number" && Number.isInteger(current.value) &&
+      !Number.isSafeInteger(current.value)) {
+      throw new Error("MVU_FULL_BACKUP_UNSAFE_INTEGER");
+    }
     if (typeof current.value === "string" && current.value.length > FULL_BACKUP_MAX_TEXT_LENGTH) {
       throw new Error("MVU_FULL_BACKUP_TEXT_LIMIT");
     }
@@ -750,6 +772,17 @@ function requireSafeRevision(value: unknown, code: string): asserts value is num
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(code);
 }
 
+function resolveMaxBytes(limits: FullBackupResourceLimits | undefined): number {
+  if (limits === undefined) return FULL_BACKUP_MAX_BYTES;
+  const record = requirePlainRecord(limits, "MVU_FULL_BACKUP_LIMITS_INVALID");
+  assertExactKeys(record, ["maxBytes"]);
+  if (typeof record.maxBytes !== "number" || !Number.isSafeInteger(record.maxBytes) ||
+    record.maxBytes <= 0 || record.maxBytes > FULL_BACKUP_MAX_BYTES) {
+    throw new Error("MVU_FULL_BACKUP_LIMITS_INVALID");
+  }
+  return record.maxBytes;
+}
+
 function isoTimestamp(now: number): string {
   if (!Number.isFinite(now)) throw new Error("MVU_FULL_BACKUP_TIME_INVALID");
   const value = new Date(now).toISOString();
@@ -758,12 +791,16 @@ function isoTimestamp(now: number): string {
 }
 
 function isIsoTimestamp(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 }
 
-function buildFullBackupFileName(exportedAt: string): string {
-  const compact = exportedAt.replace(/[-:]/g, "").replace("T", "-").replace(/\.\d{3}Z$/, "Z");
-  return `operit-mvu-full-backup-v3-schema1-${compact}.json`;
+export function deriveFullBackupFileName(exportedAt: string, sourceRevision: number, checksum: string): string {
+  if (!isIsoTimestamp(exportedAt)) throw new Error("MVU_FULL_BACKUP_EXPORTED_AT_INVALID");
+  requireSafeRevision(sourceRevision, "MVU_FULL_BACKUP_SOURCE_REVISION_INVALID");
+  if (!/^[a-f0-9]{64}$/.test(checksum)) throw new Error("MVU_FULL_BACKUP_CHECKSUM_INVALID");
+  const compact = exportedAt.replace(/[-:.]/g, "").replace("T", "-");
+  return `operit-mvu-full-backup-v3-schema1-${compact}-r${sourceRevision}-${checksum.slice(0, 12)}.json`;
 }
 
 export function fullBackupUtf8ByteLength(value: string): number {

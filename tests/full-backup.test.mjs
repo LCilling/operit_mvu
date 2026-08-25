@@ -186,7 +186,11 @@ test("full v3 envelope preserves native config/runtime data and logical records"
   assert.deepEqual(Object.keys(document.payload).sort(), ["config", "records", "sourceRevision"]);
   assert.equal(Object.hasOwn(document.payload.config, "recordManifest"), false);
   assert.equal(Object.hasOwn(document.payload.config, "revision"), false);
-  assert.equal(exported.fileName, "operit-mvu-full-backup-v3-schema1-20330518-033320Z.json");
+  const { checksum: _checksum, ...unsigned } = document;
+  const expectedChecksum = createHash("sha256").update(canonicalJson(unsigned), "utf8").digest("hex");
+  assert.equal(document.checksum.value, expectedChecksum);
+  assert.equal(exported.fileName,
+    `operit-mvu-full-backup-v3-schema1-20330518-033320000Z-r${dataset.revision}-${expectedChecksum.slice(0, 12)}.json`);
   assert.equal(parsed.kind, "full_v3");
   assert.equal(parsed.sourceRevision, dataset.revision);
   assert.deepEqual(parsed.config, document.payload.config);
@@ -206,6 +210,40 @@ test("full v3 envelope preserves native config/runtime data and logical records"
     recordCount: 2,
     byteCount: Buffer.byteLength(exported.json, "utf8"),
   });
+});
+
+test("full backup filenames bind milliseconds, source revision, and checksum identity", () => {
+  const firstDataset = richV3Fixture();
+  const first = createFullBackupExport({
+    revision: firstDataset.revision,
+    dataset: firstDataset,
+    records: [],
+  }, NOW);
+  const nextRevisionDataset = structuredClone(firstDataset);
+  nextRevisionDataset.revision += 1;
+  const nextRevision = createFullBackupExport({
+    revision: nextRevisionDataset.revision,
+    dataset: nextRevisionDataset,
+    records: [],
+  }, NOW);
+  const changedDataset = structuredClone(firstDataset);
+  changedDataset.settings.aiEnabled = !changedDataset.settings.aiEnabled;
+  const changedChecksum = createFullBackupExport({
+    revision: changedDataset.revision,
+    dataset: changedDataset,
+    records: [],
+  }, NOW);
+  const repeated = createFullBackupExport({
+    revision: firstDataset.revision,
+    dataset: firstDataset,
+    records: [],
+  }, NOW);
+
+  assert.match(first.fileName,
+    /^operit-mvu-full-backup-v3-schema1-\d{8}-\d{9}Z-r\d+-[a-f0-9]{12}\.json$/);
+  assert.notEqual(first.fileName, nextRevision.fileName);
+  assert.notEqual(first.fileName, changedChecksum.fileName);
+  assert.equal(first.fileName, repeated.fileName);
 });
 
 test("full backup checksum is stable across object key ordering and whitespace", () => {
@@ -254,6 +292,56 @@ test("full backup rejects unknown schema versions, unsafe numbers, excessive dep
   assert.throws(() => parseDatasetImport(JSON.stringify(duplicateRecords), NOW), /MVU_FULL_BACKUP_RECORD_ID_DUPLICATE/);
 });
 
+test("restore rejects re-signed unsafe integers in config state, timestamps, and records without mutation", async () => {
+  const files = filesWithLegacy(legacyDatasetFixture());
+  const store = createV3Store(files);
+  await store.initialize();
+  const before = await store.readFullBackup();
+  const dataset = richV3Fixture();
+  const incomingRecord = changeRecord(1);
+  dataset.recordManifest = {
+    segments: [{
+      index: 1,
+      fileName: "segment-000001.jsonl",
+      committedLineCount: 1,
+      firstOccurredAt: incomingRecord.occurredAt,
+      lastOccurredAt: incomingRecord.occurredAt,
+      firstRevision: dataset.revision,
+      lastRevision: dataset.revision,
+      filterCounts: { "field_affinity\u0000character:actor_t": 1 },
+    }],
+    recordCount: 1,
+    nextSegmentIndex: 2,
+  };
+  const valid = createFullBackupExport({
+    revision: dataset.revision,
+    dataset,
+    records: [incomingRecord],
+  }, NOW);
+  const unsafeInteger = 9_007_199_254_740_992;
+  const mutations = [
+    (document) => { document.payload.config.stateValues["character:actor_t"].field_affinity = unsafeInteger; },
+    (document) => { document.payload.config.hourlyMessageBuckets["character:actor_t"][0].startedAt = unsafeInteger; },
+    (document) => { document.payload.records[0].before = unsafeInteger; },
+  ];
+
+  for (const mutate of mutations) {
+    const document = JSON.parse(valid.json);
+    mutate(document);
+    const json = JSON.stringify(resign(document));
+    assert.throws(() => parseDatasetImport(json, NOW), /MVU_FULL_BACKUP_UNSAFE_INTEGER/);
+    files.clearOperations();
+    await assert.rejects(store.restoreDatasetImport({
+      json,
+      expectedRevision: before.revision,
+      confirmation: FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+    }), /MVU_FULL_BACKUP_UNSAFE_INTEGER/);
+    assert.equal(files.operations().some(({ operation }) =>
+      operation === "writeText" || operation === "appendText" || operation === "replaceAtomically"), false);
+    assert.deepEqual(await store.readFullBackup(), before);
+  }
+});
+
 test("full backup export rejects prototype-bearing nested configuration", () => {
   const dataset = richV3Fixture();
   dataset.settings = Object.assign(Object.create({ inherited: true }), { aiEnabled: true });
@@ -275,6 +363,28 @@ test("full backup enforces one import/export byte and record bound", () => {
   assert.throws(
     () => createFullBackupExport({ revision: dataset.revision, dataset, records: [] }, NOW),
     /MVU_FULL_BACKUP_RECORD_LIMIT/,
+  );
+});
+
+test("own multibyte export accepts the exact injected byte limit and rejects one byte less", () => {
+  const dataset = richV3Fixture();
+  dataset.fields[0].description = `多字节边界：${"界".repeat(512)}`;
+  const snapshot = { revision: dataset.revision, dataset, records: [] };
+  const baseline = createFullBackupExport(snapshot, NOW);
+  const exactBytes = Buffer.byteLength(baseline.json, "utf8");
+  assert.equal(exactBytes > baseline.json.length, true);
+
+  const atLimit = createFullBackupExport(snapshot, NOW, { maxBytes: exactBytes });
+  assert.equal(Buffer.byteLength(atLimit.json, "utf8"), exactBytes);
+  assert.equal(atLimit.summary.byteCount, exactBytes);
+  assert.equal(parseDatasetImport(atLimit.json, NOW, { maxBytes: exactBytes }).kind, "full_v3");
+  assert.throws(
+    () => createFullBackupExport(snapshot, NOW, { maxBytes: exactBytes - 1 }),
+    /MVU_FULL_BACKUP_TOO_LARGE/,
+  );
+  assert.throws(
+    () => parseDatasetImport(atLimit.json, NOW, { maxBytes: exactBytes - 1 }),
+    /MVU_FULL_BACKUP_TOO_LARGE/,
   );
 });
 
@@ -637,7 +747,11 @@ test("runtime exports a self-importable full v3 file and exposes preview plus co
     confirmation: FULL_BACKUP_REPLACEMENT_CONFIRMATION,
   });
 
-  assert.match(exported.fileName, /^operit-mvu-full-backup-v3-schema1-\d{8}-\d{6}Z\.json$/);
+  const compactExportedAt = parsed.exportedAt.replace(/[-:.]/g, "").replace("T", "-");
+  assert.equal(exported.fileName,
+    `operit-mvu-full-backup-v3-schema1-${compactExportedAt}-r${parsed.sourceRevision}-${parsed.checksum.slice(0, 12)}.json`);
+  assert.match(exported.fileName,
+    /^operit-mvu-full-backup-v3-schema1-\d{8}-\d{9}Z-r\d+-[a-f0-9]{12}\.json$/);
   assert.equal(parsed.kind, "full_v3");
   assert.equal(parsed.records.length, 501);
   assert.equal(preview.summary.recordCount, 501);
@@ -696,6 +810,7 @@ test("main IPC validates a self-importable safe full-backup export before host m
   });
   const handlers = {};
   const fileCalls = [];
+  const existingPaths = new Set();
   globalThis.ToolPkg = {
     ipc: {
       on(channel, handler) {
@@ -706,12 +821,17 @@ test("main IPC validates a self-importable safe full-backup export before host m
   };
   globalThis.Tools = {
     Files: {
+      async exists(path, root) {
+        fileCalls.push({ operation: "exists", path, root });
+        return { exists: existingPaths.has(path) };
+      },
       async mkdir(path, recursive, root) {
         fileCalls.push({ operation: "mkdir", path, recursive, root });
         return { successful: true, details: "ok" };
       },
       async write(path, content, append, root) {
         fileCalls.push({ operation: "write", path, content, append, root });
+        existingPaths.add(path);
         return { successful: true, details: "ok" };
       },
     },
@@ -741,10 +861,35 @@ test("main IPC validates a self-importable safe full-backup export before host m
     summary: validExport.summary,
   });
   assert.deepEqual(fileCalls.map(({ operation, path, append, root }) => ({ operation, path, append, root })), [
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${validExport.fileName}`, append: undefined, root: "android" },
     { operation: "mkdir", path: "/sdcard/Download/Operit/exports", append: undefined, root: "android" },
     { operation: "write", path: `/sdcard/Download/Operit/exports/${validExport.fileName}`, append: false, root: "android" },
   ]);
-  assert.equal(fileCalls[1].content, validExport.json);
+  assert.equal(fileCalls[2].content, validExport.json);
+
+  fileCalls.length = 0;
+  const repeatedResponse = await handlers[MVU_IPC.exportDataset]({});
+  const suffixedName = validExport.fileName.replace(/\.json$/, "-2.json");
+  assert.equal(repeatedResponse.fileName, suffixedName);
+  assert.equal(repeatedResponse.savedPath, `/sdcard/Download/Operit/exports/${suffixedName}`);
+  assert.deepEqual(fileCalls.map(({ operation, path }) => ({ operation, path })), [
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${validExport.fileName}` },
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${suffixedName}` },
+    { operation: "mkdir", path: "/sdcard/Download/Operit/exports" },
+    { operation: "write", path: `/sdcard/Download/Operit/exports/${suffixedName}` },
+  ]);
+
+  fileCalls.length = 0;
+  const thirdResponse = await handlers[MVU_IPC.exportDataset]({});
+  const thirdName = validExport.fileName.replace(/\.json$/, "-3.json");
+  assert.equal(thirdResponse.fileName, thirdName);
+  assert.deepEqual(fileCalls.map(({ operation, path }) => ({ operation, path })), [
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${validExport.fileName}` },
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${suffixedName}` },
+    { operation: "exists", path: `/sdcard/Download/Operit/exports/${thirdName}` },
+    { operation: "mkdir", path: "/sdcard/Download/Operit/exports" },
+    { operation: "write", path: `/sdcard/Download/Operit/exports/${thirdName}` },
+  ]);
 
   const previewRequest = { json: validExport.json };
   const importRequest = {
@@ -761,6 +906,24 @@ test("main IPC validates a self-importable safe full-backup export before host m
   await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID/);
   assert.deepEqual(fileCalls, []);
 
+  runtime.exportDataset = async () => ({
+    ...validExport,
+    fileName: validExport.fileName.replace(/-[a-f0-9]{12}\.json$/, "-000000000000.json"),
+  });
+  await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID/);
+  assert.deepEqual(fileCalls, []);
+
+  runtime.exportDataset = async () => ({ ...validExport, json: JSON.stringify(legacyDatasetFixture()) });
+  await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_FULL_BACKUP_EXPORT_KIND_INVALID/);
+  assert.deepEqual(fileCalls, []);
+
+  runtime.exportDataset = async () => ({
+    ...validExport,
+    summary: { ...validExport.summary, recordCount: validExport.summary.recordCount + 1 },
+  });
+  await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_FULL_BACKUP_EXPORT_SUMMARY_INVALID/);
+  assert.deepEqual(fileCalls, []);
+
   runtime.exportDataset = async () => ({ ...validExport, json: "{\"format\":\"tampered\"}" });
   await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_DATASET_IMPORT_FORMAT_UNKNOWN/);
   assert.deepEqual(fileCalls, []);
@@ -770,6 +933,22 @@ test("main IPC validates a self-importable safe full-backup export before host m
   assert.deepEqual(fileCalls, []);
 
   runtime.exportDataset = async () => validExport;
+  globalThis.Tools.Files.mkdir = async () => ({ successful: false, details: "permission denied" });
+  await assert.rejects(handlers[MVU_IPC.exportDataset]({}),
+    /MVU_EXPORT_DIRECTORY_CREATE_FAILED:permission denied/);
+  assert.equal(fileCalls.some(({ operation }) => operation === "write"), false);
+
+  fileCalls.length = 0;
+  globalThis.Tools.Files.mkdir = async () => ({ successful: true, details: "ok" });
   globalThis.Tools.Files.write = async () => ({ successful: false, details: "disk full" });
   await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_EXPORT_WRITE_FAILED:disk full/);
+
+  for (let probe = 1; probe <= 100; probe += 1) {
+    const name = probe === 1 ? validExport.fileName : validExport.fileName.replace(/\.json$/, `-${probe}.json`);
+    existingPaths.add(`/sdcard/Download/Operit/exports/${name}`);
+  }
+  fileCalls.length = 0;
+  await assert.rejects(handlers[MVU_IPC.exportDataset]({}), /MVU_FULL_BACKUP_EXPORT_COLLISION_LIMIT/);
+  assert.equal(fileCalls.length, 100);
+  assert.equal(fileCalls.every(({ operation }) => operation === "exists"), true);
 });
