@@ -79,6 +79,10 @@ import {
   validateLinkRule,
   validateTemporaryEffect,
 } from "./validation";
+import {
+  selectModelFields,
+  type ModelFieldBudgetStats,
+} from "./state-prompt";
 
 export function makeId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -166,6 +170,11 @@ export interface FieldStateProjection {
   scopeKey: string | null;
   currentValue: number | null;
   currentStage: DataStage | null;
+}
+
+export interface ModelFieldProjectionResult {
+  fields: FieldStateProjection[];
+  budget: ModelFieldBudgetStats;
 }
 
 interface PendingFieldChange {
@@ -434,8 +443,26 @@ export class MvuService {
   }
 
   async projectFields(context: StateScopeContext): Promise<FieldStateProjection[]> {
-    const dataset = await this.getDataset();
-    return dataset.fields.map((field) => {
+    return (await this.projectModelFields(context)).fields;
+  }
+
+  /** Bounded model projection; statistics are exposed separately from compact UI snapshots. */
+  async projectModelFields(context: StateScopeContext): Promise<ModelFieldProjectionResult> {
+    let dataset: MvuDataset | MvuDatasetV3;
+    let recentChanges: readonly Pick<DataChangeRecord, "fieldId" | "occurredAt">[] = [];
+    if (isV3MvuStore(this.store) && (await this.store.migrationStatus()).mode === "v3") {
+      const [snapshot, records] = await Promise.all([
+        this.store.readV3(),
+        this.store.queryRecords({ limit: 500, direction: "desc" }),
+      ]);
+      dataset = snapshot.dataset;
+      recentChanges = records.items;
+    } else {
+      dataset = await this.getDataset();
+      recentChanges = dataset.records;
+    }
+    const selection = selectModelFields(dataset, context, { recentChanges });
+    const fields = selection.fields.map((field) => {
       const bound = fieldAppliesToContext(field, context);
       if (!bound) {
         return {
@@ -455,6 +482,7 @@ export class MvuService {
         currentStage: deriveStage(field, value),
       };
     });
+    return { fields, budget: selection.stats };
   }
 
   async getApplicableAiRules(
