@@ -19,6 +19,14 @@
   ui.exportDataset = exportDataset;
   ui.importFieldTemplateText = importFieldTemplateText;
   ui.validateFieldRangeDraft = validateFieldRangeDraft;
+  ui.hydrateConditionRows = hydrateConditionRows;
+  ui.prepareConditionEditor = prepareConditionEditor;
+  ui.resetConditionEditorDraft = resetConditionEditorDraft;
+  ui.conditionEditor = {
+    serializeExpression: serializeConditionExpression,
+    defaultPredicate: defaultConditionPredicate,
+    nodeAt: conditionNodeAt,
+  };
 
   function render(options) {
     const previous = appRoot.querySelector(".screen-scroll");
@@ -210,6 +218,7 @@
     const entityButton = target.closest("[data-open-entity]");
     if (entityButton) {
       ui.state.selectedEntityId = entityButton.dataset.entityId;
+      if (entityButton.dataset.openEntity === "condition") resetConditionEditorDraft();
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[entityButton.dataset.openEntity];
       await ui.navigate(route);
       return;
@@ -217,6 +226,7 @@
     const newEntityButton = target.closest("[data-new-entity]");
     if (newEntityButton) {
       ui.state.selectedEntityId = "";
+      if (newEntityButton.dataset.newEntity === "condition") resetConditionEditorDraft();
       const route = { rule: "rule-editor", condition: "condition-editor", effectGroup: "effect-editor" }[newEntityButton.dataset.newEntity];
       await ui.navigate(route);
       return;
@@ -362,6 +372,41 @@
       await refreshFieldTemplatePreview();
     } else if (action === "finish-field-template-import") {
       closeFieldTemplateFlow();
+    } else if (action === "delete-condition") {
+      await openConditionDelete(element.dataset.conditionId);
+    } else if (action === "confirm-condition-delete") {
+      await confirmConditionDelete(element.dataset.conditionId);
+    } else if (action === "toggle-condition") {
+      await mutateConditionFromList("toggleCondition", {
+        id: element.dataset.conditionId,
+        enabled: element.dataset.conditionEnabled !== "true",
+      });
+    } else if (action === "copy-condition") {
+      await mutateConditionFromList("copyCondition", { id: element.dataset.conditionId });
+    } else if (action === "add-condition-predicate") {
+      addConditionChild(element.dataset.conditionPath, "predicate");
+    } else if (action === "add-condition-group") {
+      addConditionChild(element.dataset.conditionPath, element.dataset.conditionGroupKind);
+    } else if (action === "change-condition-group") {
+      changeConditionGroup(element.dataset.conditionPath);
+    } else if (action === "remove-condition-node") {
+      removeConditionNode(element.dataset.conditionPath);
+    } else if (action === "reset-condition-root") {
+      const draft = ui.state.conditionEditorDraft;
+      if (draft) {
+        draft.expression = { kind: "and", children: [] };
+        draft.error = "";
+        renderConditionDraftChange("");
+      }
+    } else if (action === "reload-condition-after-save") {
+      await reloadConditionAfterCommittedSave();
+    } else if (action === "reload-condition-library") {
+      await reloadConditionLibrary();
+    } else if (action === "page-condition-references") {
+      await pageConditionReferences(Number(element.dataset.referencePageNumber));
+    } else if (action === "close-condition-dialog") {
+      ui.state.conditionDeleteDialog = null;
+      render();
     } else if (action === "open-status-actor-picker" || action === "open-status-group-picker") {
       await openStatusPicker(action, element);
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
@@ -373,6 +418,569 @@
     } else if (action === "confirm-entity-picker") {
       ui.confirmEntityPicker();
     }
+  }
+
+  function resetConditionEditorDraft() {
+    ui.state.conditionEditorDraft = null;
+    Object.keys(ui.state.editorSelections).forEach(function (key) {
+      if (key.startsWith("condition-")) delete ui.state.editorSelections[key];
+    });
+  }
+
+  async function prepareConditionEditor(entity) {
+    const identity = entity && entity.id ? entity.id : "__new__";
+    if (ui.state.conditionEditorDraft && ui.state.conditionEditorDraft.identity === identity) return ui.state.conditionEditorDraft;
+    const draft = {
+      identity,
+      id: entity ? entity.id : "",
+      name: entity ? entity.name : "",
+      description: entity ? entity.description : "",
+      enabled: entity ? entity.enabled : true,
+      expression: entity ? plainClone(entity.expression) : { kind: "and", children: [] },
+      error: "",
+      references: null,
+      referencePage: 1,
+      referenceSearch: "",
+      submitting: false,
+      mutationCommitted: false,
+      committedEntityId: "",
+      transitionPath: "",
+    };
+    ui.state.conditionEditorDraft = draft;
+    if (entity) {
+      try {
+        const response = await ui.native.call("getConditionReferences", { id: entity.id, page: 1 });
+        draft.references = validateConditionReferenceResponse(response);
+      } catch (error) {
+        draft.referenceError = "引用读取失败：" + conditionErrorMessage(error);
+      }
+      await hydrateConditionExpressionLabels(draft.expression);
+    }
+    return draft;
+  }
+
+  function plainClone(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  async function hydrateConditionExpressionLabels(expression) {
+    const references = [];
+    (function visit(node) {
+      if (!node || references.length >= 100) return;
+      if (node.kind === "and" || node.kind === "or") return node.children.forEach(visit);
+      if (node.kind === "not") return visit(node.child);
+      if (node.kind !== "predicate") return;
+      const predicate = node.predicate;
+      if (predicate.kind === "field_comparison" && predicate.fieldId) references.push(["field", predicate.fieldId]);
+      if (predicate.kind === "actor") predicate.actorIds.forEach(function (id) { references.push(["actor", id]); });
+      if (predicate.kind === "group") predicate.groupIds.forEach(function (id) { references.push(["group", id]); });
+    }(expression));
+    await Promise.all(references.slice(0, 100).map(async function (reference) {
+      try { await ui.getEntity(reference[0], reference[1]); } catch (_error) { /* keep the stable ID visible */ }
+    }));
+  }
+
+  function nextConditionAiId() {
+    const draft = ui.state.conditionEditorDraft;
+    const existing = new Set();
+    if (draft) {
+      (function visit(node) {
+        if (node.kind === "and" || node.kind === "or") return node.children.forEach(visit);
+        if (node.kind === "not") return visit(node.child);
+        if (node.kind === "predicate" && node.predicate.kind === "ai_semantic") existing.add(node.predicate.id);
+      }(draft.expression));
+    }
+    let id;
+    do {
+      nextConditionAiId.sequence = (nextConditionAiId.sequence || 0) + 1;
+      id = "ai_condition_" + Date.now().toString(36) + "_" + nextConditionAiId.sequence.toString(36);
+    } while (existing.has(id));
+    return id.slice(0, 128);
+  }
+
+  function defaultConditionPredicate(kind) {
+    if (kind === "long_inactive") return { kind, hours: 24 };
+    if (kind === "user_care" || kind === "special_day") return { kind };
+    if (kind === "high_frequency") return { kind, messages: 10, windowHours: 24, bucketHours: 1 };
+    if (kind === "field_comparison") return { kind, fieldId: "", operator: ">=", value: 0 };
+    if (kind === "message_count") return { kind, count: 1, windowHours: 1 };
+    if (kind === "keywords") return { kind, includeAny: [], includeAll: [], exclude: [], caseSensitive: false };
+    if (kind === "sender") return { kind, senders: ["user"] };
+    if (kind === "actor") return { kind, actorIds: [] };
+    if (kind === "group") return { kind, groupIds: [] };
+    if (kind === "concrete_date") return { kind, dates: [] };
+    if (kind === "repeating_date") return { kind, month: 1, day: 1 };
+    if (kind === "ai_semantic") return {
+      kind, id: nextConditionAiId(), triggerType: "情绪变化", requirement: "", minimumConfidence: 0.75,
+    };
+    return { kind: "recent_positive", count: 1 };
+  }
+
+  function decodeConditionPath(pathValue) {
+    if (pathValue === undefined || pathValue === null || pathValue === "") return [];
+    const parts = String(pathValue).split(".").map(Number);
+    if (parts.some(function (part) { return !Number.isSafeInteger(part) || part < 0; })) throw new Error("条件节点路径无效");
+    return parts;
+  }
+
+  function conditionNodeAt(expression, pathValue) {
+    const path = Array.isArray(pathValue) ? pathValue : decodeConditionPath(pathValue);
+    let node = expression;
+    path.forEach(function (index) {
+      if (node.kind === "and" || node.kind === "or") node = node.children[index];
+      else if (node.kind === "not" && index === 0) node = node.child;
+      else node = null;
+      if (!node) throw new Error("条件节点不存在");
+    });
+    return node;
+  }
+
+  function addConditionChild(pathValue, kind) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft) return;
+    const node = conditionNodeAt(draft.expression, pathValue);
+    const child = kind === "predicate" ? { kind: "predicate", predicate: defaultConditionPredicate("recent_positive") }
+      : kind === "not" ? { kind: "not", child: { kind: "predicate", predicate: defaultConditionPredicate("recent_positive") } }
+        : { kind: kind === "or" ? "or" : "and", children: [] };
+    if (node.kind === "and" || node.kind === "or") node.children.push(child);
+    else if (node.kind === "not") {
+      node.child = kind === "not" ? { kind: "not", child: node.child }
+        : kind === "predicate" ? { kind: "and", children: [node.child, child] }
+          : { kind: child.kind, children: [node.child] };
+    } else return;
+    draft.error = "";
+    renderConditionDraftChange(pathValue);
+  }
+
+  function changeConditionGroup(pathValue) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft) return;
+    const node = conditionNodeAt(draft.expression, pathValue);
+    if (node.kind === "and") node.kind = "or";
+    else if (node.kind === "or") node.kind = "and";
+    else return;
+    draft.error = "";
+    renderConditionDraftChange(pathValue);
+  }
+
+  function removeConditionNode(pathValue) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft) return;
+    const path = decodeConditionPath(pathValue);
+    if (path.length === 0) {
+      draft.expression = { kind: "and", children: [] };
+      renderConditionDraftChange("");
+      return;
+    }
+    const index = path.pop();
+    const parent = conditionNodeAt(draft.expression, path);
+    if (parent.kind === "and" || parent.kind === "or") parent.children.splice(index, 1);
+    else if (parent.kind === "not") parent.child = { kind: "predicate", predicate: defaultConditionPredicate("recent_positive") };
+    draft.error = "";
+    renderConditionDraftChange(path.join("."));
+  }
+
+  function renderConditionDraftChange(pathValue) {
+    const draft = ui.state.conditionEditorDraft;
+    if (draft) draft.transitionPath = String(pathValue || "");
+    void ui.transition(render);
+    window.setTimeout(function () {
+      if (draft) draft.transitionPath = "__settled__";
+    }, 220);
+  }
+
+  function captureConditionEditorControl(target) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft) return;
+    if (target.name === "conditionName") draft.name = target.value;
+    else if (target.name === "conditionDescription") draft.description = target.value;
+    else if (target.name === "conditionEnabled") draft.enabled = target.checked;
+    else if (target.matches("[data-condition-predicate-kind]")) {
+      const node = conditionNodeAt(draft.expression, target.dataset.conditionPath);
+      node.predicate = defaultConditionPredicate(target.value);
+    } else if (target.dataset.conditionSender) {
+      const predicate = conditionNodeAt(draft.expression, target.dataset.conditionPath).predicate;
+      const selected = new Set(predicate.senders || []);
+      if (target.checked) selected.add(target.dataset.conditionSender);
+      else selected.delete(target.dataset.conditionSender);
+      predicate.senders = Array.from(selected);
+    } else if (target.dataset.conditionProp) {
+      const predicate = conditionNodeAt(draft.expression, target.dataset.conditionPath).predicate;
+      const property = target.dataset.conditionProp;
+      if (["includeAny", "includeAll", "exclude", "dates"].includes(property)) predicate[property] = splitConditionList(target.value);
+      else if (target.type === "checkbox") predicate[property] = target.checked;
+      else if (target.dataset.conditionOptional === "true" && target.value === "") delete predicate[property];
+      else predicate[property] = target.value;
+    }
+    draft.error = "";
+  }
+
+  function splitConditionList(value) {
+    return String(value).split(/[，,\n]/).map(function (entry) { return entry.trim(); }).filter(Boolean);
+  }
+
+  function commitConditionPicker(pathValue, pickerKind, ids, items) {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft) return;
+    const predicate = conditionNodeAt(draft.expression, pathValue).predicate;
+    if (pickerKind === "field") predicate.fieldId = ids[0] || "";
+    else if (pickerKind === "actor") predicate.actorIds = ids.slice();
+    else if (pickerKind === "group") predicate.groupIds = ids.slice();
+    items.forEach(function (item) {
+      const entityType = pickerKind === "field" ? "field" : pickerKind;
+      const idKey = pickerKind === "actor" ? "characterId" : pickerKind === "group" ? "characterGroupId" : "id";
+      if (item && item[idKey]) ui.state.entities.set(entityType + ":" + item[idKey], item);
+    });
+    draft.error = "";
+  }
+
+  async function saveConditionEditor() {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft || draft.submitting || draft.mutationCommitted) return;
+    let condition;
+    try {
+      condition = buildConditionInput(draft);
+    } catch (error) {
+      draft.error = conditionErrorMessage(error);
+      render();
+      return;
+    }
+    draft.submitting = true;
+    draft.error = "";
+    render();
+    const method = draft.id ? "updateCondition" : "createCondition";
+    const request = draft.id
+      ? { id: draft.id, patch: condition, expectedRevision: ui.state.snapshot.revision }
+      : { condition, expectedRevision: ui.state.snapshot.revision };
+    try {
+      const response = validateConditionMutationResponse(await ui.native.call(method, request), true);
+      draft.mutationCommitted = true;
+      draft.committedEntityId = response.entity.id;
+      draft.committedRevision = response.revision;
+      draft.submitting = false;
+      ui.state.entities.delete("condition:" + response.entity.id);
+      await ui.getEntity("condition", response.entity.id);
+      await ui.loadSnapshot();
+      ui.state.conditionEditorDraft = null;
+      ui.state.selectedEntityId = "";
+      await ui.navigate("condition-library");
+    } catch (error) {
+      draft.submitting = false;
+      if (draft.mutationCommitted) {
+        draft.error = "条件已经保存，但列表刷新失败。请只重新载入，不要再次提交。";
+      } else if (/MVU_STALE_REVISION/.test(error instanceof Error ? error.message : String(error))) {
+        try {
+          await ui.loadSnapshot();
+          draft.error = "检测到修订冲突，已载入最新修订；当前草稿仍保留，请检查后重试。";
+        } catch (refreshError) {
+          draft.error = "检测到修订冲突，但最新修订载入失败；当前草稿仍保留，请稍后重试。";
+        }
+      } else {
+        draft.error = conditionErrorMessage(error);
+      }
+      render();
+    }
+  }
+
+  function buildConditionInput(draft) {
+    const name = String(draft.name || "").trim();
+    if (!name) throw new Error("请输入条件名称");
+    if (name.length > 256) throw new Error("条件名称不能超过 256 个字符");
+    const description = String(draft.description || "");
+    if (description.length > 4096) throw new Error("条件说明不能超过 4096 个字符");
+    const expression = serializeConditionExpression(draft.expression);
+    validateConditionExpressionForSubmit(expression);
+    return { name, description, enabled: Boolean(draft.enabled), expression };
+  }
+
+  function validateConditionExpressionForSubmit(expression) {
+    let nodes = 0;
+    const aiIds = new Set();
+    (function visit(node, depth) {
+      nodes += 1;
+      if (nodes > 100) throw new Error("条件节点不能超过 100 个");
+      if (depth > 12) throw new Error("条件嵌套不能超过 12 层");
+      if (node.kind === "and" || node.kind === "or") {
+        if (node.children.length === 0) throw new Error("条件组合至少需要一个子条件");
+        return node.children.forEach(function (child) { visit(child, depth + 1); });
+      }
+      if (node.kind === "not") return visit(node.child, depth + 1);
+      validateConditionPredicateForSubmit(node.predicate, aiIds);
+    }(expression, 0));
+  }
+
+  function validateConditionPredicateForSubmit(predicate, aiIds) {
+    function finite(value, label, minimum, integer) {
+      if (!Number.isFinite(value) || value < minimum || (integer && !Number.isInteger(value))) throw new Error(label + "数值无效");
+    }
+    if (predicate.kind === "recent_positive") finite(predicate.count, "最近正向次数", 0, true);
+    else if (predicate.kind === "long_inactive") finite(predicate.hours, "不活跃小时", 0, false);
+    else if (predicate.kind === "high_frequency") {
+      finite(predicate.messages, "高频消息数", 0, true);
+      if (predicate.windowHours !== undefined) finite(predicate.windowHours, "统计窗口", 0, false);
+      if (predicate.bucketHours !== undefined) finite(predicate.bucketHours, "统计桶", Number.EPSILON, false);
+    } else if (predicate.kind === "field_comparison") {
+      if (!predicate.fieldId) throw new Error("请选择比较字段");
+      finite(predicate.value, "字段比较值", -Number.MAX_VALUE, false);
+    } else if (predicate.kind === "message_count") {
+      finite(predicate.count, "消息数", 0, true); finite(predicate.windowHours, "消息窗口", 0, false);
+    } else if (predicate.kind === "keywords") {
+      const words = predicate.includeAny.concat(predicate.includeAll, predicate.exclude);
+      if (!words.length) throw new Error("关键词条件至少填写一个词");
+      if (words.length > 100 || words.some(function (word) { return !word || word.length > 256; })) throw new Error("关键词总数或长度超出限制");
+      if (predicate.windowHours !== undefined) finite(predicate.windowHours, "关键词窗口", 0, false);
+    } else if (predicate.kind === "sender" && predicate.senders.length === 0) throw new Error("至少选择一个发送者");
+    else if (predicate.kind === "actor" && predicate.actorIds.length === 0) throw new Error("至少选择一个角色");
+    else if (predicate.kind === "group" && predicate.groupIds.length === 0) throw new Error("至少选择一个群组");
+    else if (predicate.kind === "concrete_date") {
+      if (!predicate.dates.length || predicate.dates.some(function (date) { return !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date + "T00:00:00Z")); })) throw new Error("请输入有效的具体日期");
+    } else if (predicate.kind === "repeating_date") {
+      finite(predicate.month, "月份", 1, true); finite(predicate.day, "日期", 1, true);
+      if (predicate.month > 12 || predicate.day > 31) throw new Error("重复日期无效");
+    } else if (predicate.kind === "ai_semantic") {
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(predicate.id) || predicate.id.length > 256 || aiIds.has(predicate.id)) throw new Error("AI 判断 ID 无效或重复");
+      aiIds.add(predicate.id);
+      if (!predicate.triggerType.trim() || predicate.triggerType.length > 256) throw new Error("请输入有效的 AI 触发类型");
+      if (!predicate.requirement.trim() || predicate.requirement.length > 4096) throw new Error("请输入有效的 AI 触发要求");
+      finite(predicate.minimumConfidence, "最低置信度", 0, false);
+      if (predicate.minimumConfidence > 1) throw new Error("最低置信度必须在 0–1 之间");
+    }
+  }
+
+  function validateConditionMutationResponse(response, withEntity) {
+    if (!response || !Number.isSafeInteger(response.revision) || response.revision < 0) throw new Error("MVU_CONDITION_MUTATION_RESPONSE_INVALID");
+    if (withEntity && (!response.entity || typeof response.entity.id !== "string" || !response.entity.expression)) {
+      throw new Error("MVU_CONDITION_MUTATION_RESPONSE_INVALID");
+    }
+    return response;
+  }
+
+  async function mutateConditionFromList(method, payload) {
+    if (ui.state.conditionMutationBusy) return;
+    ui.state.conditionMutationBusy = true;
+    setBusy(true);
+    let response = null;
+    try {
+      const request = { ...payload, expectedRevision: ui.state.snapshot.revision };
+      response = validateConditionMutationResponse(await ui.native.call(method, request), true);
+      ui.state.conditionListRecovery = null;
+      ui.state.entities.delete("condition:" + response.entity.id);
+      await ui.getEntity("condition", response.entity.id);
+      await ui.loadSnapshot();
+      await ui.loadRouteData("condition-library");
+      render();
+    } catch (error) {
+      if (response) {
+        ui.state.conditionListRecovery = {
+          revision: response.revision,
+          loading: false,
+          error: "变更已经提交，但列表刷新失败。请只重新载入，不要重复操作。",
+        };
+        render();
+      } else {
+        showToast("条件操作失败：" + conditionErrorMessage(error));
+      }
+    } finally {
+      ui.state.conditionMutationBusy = false;
+      setBusy(false);
+    }
+  }
+
+  async function confirmConditionDelete(id) {
+    const dialog = ui.state.conditionDeleteDialog;
+    if (!dialog || dialog.id !== id || dialog.loading || dialog.error || dialog.references.length) return;
+    if (ui.state.conditionMutationBusy) return;
+    ui.state.conditionMutationBusy = true;
+    dialog.deleting = true;
+    render();
+    let response = null;
+    try {
+      response = validateConditionMutationResponse(await ui.native.call("deleteCondition", {
+        id, expectedRevision: ui.state.snapshot.revision,
+      }), false);
+      dialog.committedRevision = response.revision;
+      ui.state.entities.delete("condition:" + id);
+      ui.state.conditionDeleteDialog = null;
+      await ui.loadSnapshot();
+      await ui.loadRouteData("condition-library");
+      render();
+    } catch (error) {
+      if (response) {
+        ui.state.conditionDeleteDialog = null;
+        ui.state.conditionListRecovery = {
+          revision: response.revision,
+          loading: false,
+          error: "删除已经提交，但列表刷新失败。请只重新载入，不要重复删除。",
+        };
+      } else {
+        dialog.deleting = false;
+        dialog.error = conditionErrorMessage(error);
+      }
+      render();
+    } finally {
+      ui.state.conditionMutationBusy = false;
+    }
+  }
+
+  async function reloadConditionAfterCommittedSave() {
+    const draft = ui.state.conditionEditorDraft;
+    if (!draft || !draft.mutationCommitted) return;
+    try {
+      await ui.loadSnapshot();
+      ui.state.conditionEditorDraft = null;
+      ui.state.selectedEntityId = "";
+      await ui.navigate("condition-library");
+    } catch (error) {
+      draft.error = "重新载入失败：" + conditionErrorMessage(error);
+      render();
+    }
+  }
+
+  async function reloadConditionLibrary() {
+    const recovery = ui.state.conditionListRecovery;
+    if (!recovery || recovery.loading) return;
+    recovery.loading = true;
+    render();
+    try {
+      await ui.loadSnapshot();
+      await ui.loadRouteData("condition-library");
+      ui.state.conditionListRecovery = null;
+    } catch (error) {
+      recovery.loading = false;
+      recovery.error = "重新载入失败：" + conditionErrorMessage(error);
+    }
+    render();
+  }
+
+  function conditionErrorMessage(error) {
+    const message = error instanceof Error ? error.message : String(error || "未知错误");
+    if (message.includes("MVU_STALE_REVISION")) return "数据已被其他操作更新，请重新载入最新修订后再保存。";
+    if (message.includes("MVU_CONDITION_REFERENCED")) return "条件仍被规则引用，请先替换条件或停用相关规则。";
+    return message.length > 180 ? message.slice(0, 180) + "…" : message;
+  }
+
+  async function hydrateConditionRows(conditions) {
+    await Promise.all(conditions.map(async function (condition) {
+      const meta = { expression: condition.expression || null, referenceCount: null, error: "" };
+      try {
+        if (!meta.expression) meta.expression = (await ui.getEntity("condition", condition.id)).expression;
+        const response = await ui.native.call("getConditionReferences", { id: condition.id, page: 1 });
+        validateConditionReferenceResponse(response);
+        meta.referenceCount = response.totalCount;
+      } catch (error) {
+        meta.error = error instanceof Error ? error.message : String(error);
+      }
+      ui.state.conditionMeta.set(condition.id, meta);
+    }));
+  }
+
+  async function openConditionDelete(id) {
+    const condition = await ui.getEntity("condition", id);
+    const dialog = { id, name: condition.name, loading: true, error: "", references: [], page: 1, search: "", totalCount: 0, hasMore: false };
+    ui.state.conditionDeleteDialog = dialog;
+    render();
+    try {
+      const response = await ui.native.call("getConditionReferences", { id, page: 1 });
+      validateConditionReferenceResponse(response);
+      if (ui.state.conditionDeleteDialog !== dialog) return;
+      dialog.loading = false;
+      dialog.references = response.items;
+      dialog.totalCount = response.totalCount;
+      dialog.hasMore = response.hasMore;
+    } catch (error) {
+      if (ui.state.conditionDeleteDialog !== dialog) return;
+      dialog.loading = false;
+      dialog.error = "引用检查失败：" + (error instanceof Error ? error.message : String(error));
+    }
+    render();
+  }
+
+  async function pageConditionReferences(page) {
+    const dialog = ui.state.conditionDeleteDialog;
+    if (!dialog || dialog.loading || !Number.isSafeInteger(page) || page < 1) return;
+    const maxPage = Math.max(1, Math.ceil(dialog.totalCount / 10));
+    if (page > maxPage) return;
+    dialog.loading = true;
+    dialog.error = "";
+    render();
+    try {
+      const response = await ui.native.call("getConditionReferences", { id: dialog.id, page });
+      validateConditionReferenceResponse(response);
+      if (ui.state.conditionDeleteDialog !== dialog) return;
+      dialog.page = page;
+      dialog.references = response.items;
+      dialog.totalCount = response.totalCount;
+      dialog.hasMore = response.hasMore;
+      dialog.search = "";
+    } catch (error) {
+      if (ui.state.conditionDeleteDialog !== dialog) return;
+      dialog.error = "引用读取失败：" + (error instanceof Error ? error.message : String(error));
+    } finally {
+      if (ui.state.conditionDeleteDialog === dialog) dialog.loading = false;
+    }
+    render();
+  }
+
+  function validateConditionReferenceResponse(response) {
+    if (!response || !Array.isArray(response.items) || !Number.isSafeInteger(response.loadedCount) ||
+        response.loadedCount !== response.items.length || response.loadedCount > 10 ||
+        !Number.isSafeInteger(response.totalCount) || response.totalCount < response.loadedCount ||
+        typeof response.hasMore !== "boolean" || response.nextCursor !== null) {
+      throw new Error("MVU_CONDITION_REFERENCES_INVALID");
+    }
+    response.items.forEach(function (reference) {
+      if (!reference || reference.entityType !== "rule" || typeof reference.id !== "string" ||
+          typeof reference.name !== "string" || reference.relation !== "referenced_by") {
+        throw new Error("MVU_CONDITION_REFERENCES_INVALID");
+      }
+    });
+    return response;
+  }
+
+  function serializeConditionExpression(expression) {
+    if (!expression || typeof expression !== "object") throw new Error("条件结构不能为空");
+    if (expression.kind === "and" || expression.kind === "or") {
+      if (!Array.isArray(expression.children)) throw new Error("条件组合缺少子节点");
+      return { kind: expression.kind, children: expression.children.map(serializeConditionExpression) };
+    }
+    if (expression.kind === "not") return { kind: "not", child: serializeConditionExpression(expression.child) };
+    if (expression.kind !== "predicate" || !expression.predicate) throw new Error("条件节点无效");
+    return { kind: "predicate", predicate: serializeConditionPredicate(expression.predicate) };
+  }
+
+  function serializeConditionPredicate(predicate) {
+    const kind = predicate.kind;
+    if (kind === "user_care" || kind === "special_day") return { kind };
+    if (kind === "recent_positive") return { kind, count: Number(predicate.count) };
+    if (kind === "long_inactive") return { kind, hours: Number(predicate.hours) };
+    if (kind === "high_frequency") {
+      const result = { kind, messages: Number(predicate.messages) };
+      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = Number(predicate.windowHours);
+      if (predicate.bucketHours !== undefined && predicate.bucketHours !== "") result.bucketHours = Number(predicate.bucketHours);
+      return result;
+    }
+    if (kind === "field_comparison") return { kind, fieldId: predicate.fieldId, operator: predicate.operator, value: Number(predicate.value) };
+    if (kind === "message_count") {
+      const result = { kind, count: Number(predicate.count), windowHours: Number(predicate.windowHours) };
+      if (predicate.sender !== undefined && predicate.sender !== "") result.sender = predicate.sender;
+      return result;
+    }
+    if (kind === "keywords") {
+      const result = { kind, includeAny: predicate.includeAny.slice(), includeAll: predicate.includeAll.slice(), exclude: predicate.exclude.slice() };
+      if (predicate.windowHours !== undefined && predicate.windowHours !== "") result.windowHours = Number(predicate.windowHours);
+      if (predicate.caseSensitive !== undefined) result.caseSensitive = Boolean(predicate.caseSensitive);
+      return result;
+    }
+    if (kind === "sender") return { kind, senders: predicate.senders.slice() };
+    if (kind === "actor") return { kind, actorIds: predicate.actorIds.slice() };
+    if (kind === "group") return { kind, groupIds: predicate.groupIds.slice() };
+    if (kind === "concrete_date") return { kind, dates: predicate.dates.slice() };
+    if (kind === "repeating_date") return { kind, month: Number(predicate.month), day: Number(predicate.day) };
+    if (kind === "ai_semantic") return {
+      kind, id: predicate.id, triggerType: predicate.triggerType, requirement: predicate.requirement,
+      minimumConfidence: Number(predicate.minimumConfidence),
+    };
+    throw new Error("不支持的条件类型：" + String(kind || ""));
   }
 
   async function openStatusPicker(action, element) {
@@ -426,6 +1034,9 @@
       opener: element,
       onCommit(ids, items) {
         ui.state.editorSelections[key] = { ids, items };
+        if (element.dataset.conditionPath !== undefined) {
+          commitConditionPicker(element.dataset.conditionPath, element.dataset.conditionPicker, ids, items);
+        }
         if (key === "field-scope-character" || key === "field-scope-group") {
           const draft = ui.state.fieldEditorDraft;
           if (draft) {
@@ -532,6 +1143,15 @@
     handleRangeInput(event);
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest("[data-condition-reference-search]") && ui.state.conditionDeleteDialog) {
+      ui.state.conditionDeleteDialog.search = target.value;
+      render();
+      return;
+    }
+    if (target.closest('[data-form="condition-editor"]')) {
+      captureConditionEditorControl(target);
+      return;
+    }
     if (target.closest('[data-form="field-editor"]')) {
       captureFieldEditorControl(target);
       if (target.name === "chatBindingSearch") {
@@ -568,6 +1188,12 @@
   function handleAppChange(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest('[data-form="condition-editor"]')) {
+      captureConditionEditorControl(target);
+      if (target.matches("[data-condition-predicate-kind]")) renderConditionDraftChange(target.dataset.conditionPath);
+      else render();
+      return;
+    }
     if (target.closest('[data-form="field-editor"]')) {
       captureFieldEditorControl(target);
       if (target.name === "bindCurrentChat") {
@@ -1712,6 +2338,12 @@
   appRoot.addEventListener("input", handleAppInput);
   appRoot.addEventListener("change", handleAppChange);
   appRoot.addEventListener("submit", function (event) {
+    const conditionForm = event.target instanceof Element ? event.target.closest('[data-form="condition-editor"]') : null;
+    if (conditionForm) {
+      event.preventDefault();
+      void saveConditionEditor();
+      return;
+    }
     const form = event.target instanceof Element ? event.target.closest('[data-form="field-editor"]') : null;
     if (!form) return;
     event.preventDefault();
