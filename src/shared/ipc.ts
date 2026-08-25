@@ -1,5 +1,15 @@
 /** Strict typed IPC contract shared by the ToolPkg main runtime and WebView container. */
 import type { MvuRuntime } from "../mvu/app/index";
+import {
+  FULL_BACKUP_MAX_BYTES,
+  FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  fullBackupUtf8ByteLength,
+  parseDatasetImport,
+  type DatasetImportPreview,
+  type DatasetImportRestoreRequest,
+  type DatasetImportRestoreResult,
+  type FullBackupSummary,
+} from "../mvu/app/full-backup";
 import type {
   AutoRuleCondition,
   DataActor,
@@ -70,7 +80,6 @@ import type {
   BackgroundModelProbeResult,
   SystemModelApi,
 } from "../mvu/app/system-model";
-import { normalizeMvuDataset } from "../mvu/app/validation";
 
 export const MVU_TOOLPKG_ID = "com.lcilling.operit_mvu";
 export const MVU_IPC_TARGET_CONTEXT_KEY = `toolpkg_main:${MVU_TOOLPKG_ID}`;
@@ -97,6 +106,7 @@ export const MVU_IPC = {
   probeModel: "operit_mvu:probe_model",
   judgeState: "operit_mvu:judge_state",
   exportDataset: "operit_mvu:export_dataset",
+  previewDatasetImport: "operit_mvu:preview_dataset_import",
   importDataset: "operit_mvu:import_dataset",
   exportFieldTemplate: "operit_mvu:export_field_template",
   previewFieldTemplateImport: "operit_mvu:preview_field_template_import",
@@ -178,6 +188,7 @@ export interface JudgeStateResponse {
 export interface ExportDatasetResponse {
   fileName: string;
   savedPath: string;
+  summary: FullBackupSummary;
 }
 
 export interface ExportFieldTemplateResponse {
@@ -186,7 +197,8 @@ export interface ExportFieldTemplateResponse {
   summary: FieldTemplateExportSummary;
 }
 
-export interface ImportDatasetRequest { json: string; }
+export interface PreviewDatasetImportRequest { json: string; }
+export type ImportDatasetRequest = DatasetImportRestoreRequest;
 export interface AddTemporaryEffectRequest { effect: TemporaryEffectInput; }
 export interface UpdateTemporaryEffectRequest { id: string; patch: TemporaryEffectPatch; }
 export interface CreateConditionRequest { expectedRevision: number; condition: ConditionInput; }
@@ -219,11 +231,6 @@ function requireSuccessfulFileOperation(
   if (!result.successful) {
     throw new Error(`MVU_EXPORT_${operation}_FAILED:${result.details}`);
   }
-}
-
-function buildExportFileName(now: Date): string {
-  const timestamp = now.toISOString().replace(/[-:]/g, "").replace("T", "-").replace(/\.\d{3}Z$/, "Z");
-  return `operit_mvu-dataset-v2-${timestamp}.json`;
 }
 
 function fail(code: string): never {
@@ -792,8 +799,25 @@ function parseJudgeStateRequest(value: unknown): JudgeStateRequest {
 
 function parseImportDatasetRequest(value: unknown): ImportDatasetRequest {
   const record = requireRecord(value, "MVU_IMPORT_DATASET_REQUEST_INVALID");
-  assertKeys(record, ["json"], [], "MVU_IMPORT_DATASET_REQUEST_INVALID");
-  return { json: requireString(record, "json", "MVU_IMPORT_JSON_REQUIRED") };
+  assertKeys(record, ["json", "expectedRevision", "confirmation"], [], "MVU_IMPORT_DATASET_REQUEST_INVALID");
+  const confirmation = requireString(record, "confirmation", "MVU_IMPORT_DATASET_CONFIRMATION_INVALID");
+  if (confirmation !== FULL_BACKUP_REPLACEMENT_CONFIRMATION) fail("MVU_IMPORT_DATASET_CONFIRMATION_INVALID");
+  const json = requireString(record, "json", "MVU_IMPORT_JSON_REQUIRED");
+  if (fullBackupUtf8ByteLength(json) > FULL_BACKUP_MAX_BYTES) fail("MVU_FULL_BACKUP_TOO_LARGE");
+  return {
+    json,
+    expectedRevision: requireExpectedRevision(record, "MVU_IMPORT_DATASET_REVISION_INVALID"),
+    confirmation: FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  };
+}
+
+function parsePreviewDatasetImportRequest(value: unknown): PreviewDatasetImportRequest {
+  const code = "MVU_PREVIEW_DATASET_IMPORT_REQUEST_INVALID";
+  const record = requireRecord(value, code);
+  assertKeys(record, ["json"], [], code);
+  const json = requireString(record, "json", code);
+  if (fullBackupUtf8ByteLength(json) > FULL_BACKUP_MAX_BYTES) fail("MVU_FULL_BACKUP_TOO_LARGE");
+  return { json };
 }
 
 function parseTemplateJsonRequest(value: unknown): PreviewFieldTemplateImportRequest {
@@ -1440,6 +1464,7 @@ export const MVU_REQUEST_PARSERS = {
   probeModel: parseEmptyRequest,
   judgeState: parseJudgeStateRequest,
   exportDataset: parseEmptyRequest,
+  previewDatasetImport: parsePreviewDatasetImportRequest,
   importDataset: parseImportDatasetRequest,
   exportFieldTemplate: parseExportFieldTemplateRequest,
   previewFieldTemplateImport: parseTemplateJsonRequest,
@@ -1599,22 +1624,28 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
     ToolPkg.ipc.on<unknown, ExportDatasetResponse>(
       MVU_IPC.exportDataset,
       guarded("exportDataset", MVU_REQUEST_PARSERS.exportDataset, async () => {
-        const fileName = buildExportFileName(new Date());
-        const savedPath = `${MVU_EXPORT_DIRECTORY}/${fileName}`;
-        const json = JSON.stringify(await runtime.exportDataset(), null, 2);
+        const exported = await runtime.exportDataset();
+        parseDatasetImport(exported.json, Date.now());
+        if (!/^operit-mvu-full-backup-v3-schema1-\d{8}-\d{6}Z\.json$/.test(exported.fileName)) {
+          throw new Error("MVU_FULL_BACKUP_EXPORT_FILENAME_INVALID");
+        }
+        const savedPath = `${MVU_EXPORT_DIRECTORY}/${exported.fileName}`;
         const directoryResult = await Tools.Files.mkdir(MVU_EXPORT_DIRECTORY, true, "android");
         requireSuccessfulFileOperation("DIRECTORY_CREATE", directoryResult);
-        const writeResult = await Tools.Files.write(savedPath, json, false, "android");
+        const writeResult = await Tools.Files.write(savedPath, exported.json, false, "android");
         requireSuccessfulFileOperation("WRITE", writeResult);
-        return { fileName, savedPath };
+        return { fileName: exported.fileName, savedPath, summary: { ...exported.summary } };
       })
     ),
-    ToolPkg.ipc.on<unknown, void>(
+    ToolPkg.ipc.on<unknown, DatasetImportPreview>(
+      MVU_IPC.previewDatasetImport,
+      guarded("previewDatasetImport", MVU_REQUEST_PARSERS.previewDatasetImport,
+        (request) => runtime.previewDatasetImport(request.json))
+    ),
+    ToolPkg.ipc.on<unknown, DatasetImportRestoreResult>(
       MVU_IPC.importDataset,
-      guarded("importDataset", MVU_REQUEST_PARSERS.importDataset, async (request) => {
-        const parsed = normalizeMvuDataset(JSON.parse(request.json));
-        await runtime.service.replaceDataset(parsed);
-      })
+      guarded("importDataset", MVU_REQUEST_PARSERS.importDataset,
+        (request) => runtime.importDataset(request))
     ),
     ToolPkg.ipc.on<unknown, ExportFieldTemplateResponse>(
       MVU_IPC.exportFieldTemplate,
@@ -1817,8 +1848,11 @@ export const mvuIpcClient = {
   exportDataset(request: EmptyRequest): Promise<ExportDatasetResponse> {
     return call<EmptyRequest, ExportDatasetResponse>(MVU_IPC.exportDataset, request);
   },
-  importDataset(request: ImportDatasetRequest): Promise<void> {
-    return call<ImportDatasetRequest, void>(MVU_IPC.importDataset, request);
+  previewDatasetImport(request: PreviewDatasetImportRequest): Promise<DatasetImportPreview> {
+    return call<PreviewDatasetImportRequest, DatasetImportPreview>(MVU_IPC.previewDatasetImport, request);
+  },
+  importDataset(request: ImportDatasetRequest): Promise<DatasetImportRestoreResult> {
+    return call<ImportDatasetRequest, DatasetImportRestoreResult>(MVU_IPC.importDataset, request);
   },
   exportFieldTemplate(request: ExportFieldTemplateRequest): Promise<ExportFieldTemplateResponse> {
     return call<ExportFieldTemplateRequest, ExportFieldTemplateResponse>(MVU_IPC.exportFieldTemplate, request);

@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { automationScopeKey } from "../dist/mvu/app/scope.js";
+import {
+  FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  parseDatasetImport,
+} from "../dist/mvu/app/full-backup.js";
 import { createRuntime } from "../dist/mvu/app/index.js";
 import {
   createEmptyRecordManifest,
@@ -1619,12 +1623,19 @@ test("production IPC export pages every committed record while ordinary snapshot
 
   assert.equal((await runtime.dataset()).records.length, 500);
   const response = await registrations.ipc["operit_mvu:export_dataset"]({});
-  const exported = JSON.parse(files.snapshot()[response.savedPath]);
+  const exportedJson = files.snapshot()[response.savedPath];
+  const document = JSON.parse(exportedJson);
+  const exported = parseDatasetImport(exportedJson, NOW);
   const ids = exported.records.map((record) => record.id);
 
-  assert.equal(exported.formatVersion, 2);
-  assert.deepEqual(Object.keys(exported).sort(), Object.keys(legacy).sort());
+  assert.equal(document.format, "operit-mvu-full-backup");
+  assert.equal(document.schemaVersion, 1);
+  assert.equal(document.sourceFormatVersion, 3);
+  assert.equal(exported.kind, "full_v3");
+  assert.equal(Object.hasOwn(document.payload.config, "recordManifest"), false);
+  assert.equal(Object.hasOwn(document.payload.config, "revision"), false);
   assert.equal(exported.records.length, 1_001);
+  assert.equal(response.summary.recordCount, 1_001);
   assert.equal(ids[0], "record_0");
   assert.equal(ids.at(-1), "record_1000");
   assert.equal(new Set(ids).size, ids.length);
@@ -1877,7 +1888,13 @@ test("production IPC import resolves after publication and reports pending clean
   const before = await runtime.dataset();
   const replacement = structuredClone(before);
   replacement.records = [changeRecord(7_000)];
-  const request = { json: JSON.stringify(replacement) };
+  const json = JSON.stringify(replacement);
+  const preview = await registrations.ipc["operit_mvu:preview_dataset_import"]({ json });
+  const request = {
+    json,
+    expectedRevision: preview.expectedRevision,
+    confirmation: FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  };
   files.failNext("replaceAtomically", ({ destination }) => destination === V3_PATH);
 
   await assert.rejects(
@@ -1900,7 +1917,9 @@ test("production IPC import resolves after publication and reports pending clean
 
   const result = await registrations.ipc["operit_mvu:import_dataset"](request);
 
-  assert.equal(result, undefined);
+  assert.equal(result.revision, before.revision + 1);
+  assert.equal(result.kind, "legacy_v2");
+  assert.equal(result.recordCount, 1);
   const committed = JSON.parse(files.snapshot()[V3_PATH]);
   assert.equal(committed.revision, before.revision + 1);
   assert.equal(committed.recordManifest.recordCount, 1);

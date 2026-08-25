@@ -3,6 +3,13 @@ import type { CommandExecutorHooks } from "../core/command-executor";
 import { createEventBus, type MvuEventBus } from "../core/events";
 import { createDefaultPortContext, type MvuPortContext } from "../port/context";
 import { HostActorDirectory } from "./actor-source";
+import {
+  createFullBackupExport,
+  type DatasetImportPreview,
+  type DatasetImportRestoreRequest,
+  type DatasetImportRestoreResult,
+  type FullBackupExport,
+} from "./full-backup";
 import type {
   DataActor,
   DataAutoRule,
@@ -72,7 +79,9 @@ export interface MvuRuntime {
   initialize(): Promise<MigrationStatus>;
   migrationStatus(): Promise<MigrationStatus>;
   dataset(): Promise<MvuDataset>;
-  exportDataset(): Promise<MvuDataset>;
+  exportDataset(): Promise<FullBackupExport>;
+  previewDatasetImport(json: string): Promise<DatasetImportPreview>;
+  importDataset(request: DatasetImportRestoreRequest): Promise<DatasetImportRestoreResult>;
   snapshot(context: StateScopeContext): Promise<MvuSnapshotView>;
   buildMvuData(context: StateScopeContext): Promise<ReturnType<typeof buildMvuData>>;
   applyCommand(
@@ -118,8 +127,16 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
       return service.getDataset();
     },
     async exportDataset() {
-      if (isV3MvuStore(store)) return (await store.readForExport()).dataset;
-      return service.getDataset();
+      if (!isV3MvuStore(store)) throw new Error("MVU_FULL_BACKUP_REQUIRES_V3_STORE");
+      return createFullBackupExport(await store.readFullBackup(), Date.now());
+    },
+    previewDatasetImport(json) {
+      if (!isV3MvuStore(store)) return Promise.reject(new Error("MVU_FULL_BACKUP_REQUIRES_V3_STORE"));
+      return store.previewDatasetImport(json);
+    },
+    importDataset(request) {
+      if (!isV3MvuStore(store)) return Promise.reject(new Error("MVU_FULL_BACKUP_REQUIRES_V3_STORE"));
+      return store.restoreDatasetImport(request);
     },
     async snapshot(activeContext) {
       const [dataset, actorList, fields, migrationStatus] = await Promise.all([
