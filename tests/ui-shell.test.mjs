@@ -286,6 +286,100 @@ test("initial group chat character mode scopes the actor directory to the active
   assert.deepEqual({ ...actorRequest[1].filters }, { groupId: "group_b" });
 });
 
+test("initial character mode projects a group chat onto its first current member", async () => {
+  const { context, ui } = createHarness("?route=status");
+  const requests = [];
+  const groupSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: null, groupId: "group_b", actorName: "群组乙", truncated: false },
+    selected: { actor: null, group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false } },
+    contextLabels: { groupName: "群组乙", chatName: "群组乙会话", truncated: false },
+    pages: { ...validSnapshot().pages, fields: page([]) },
+  });
+  const actorSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: "member_b", groupId: "group_b", actorName: "成员乙", truncated: false },
+    selected: {
+      actor: { characterId: "member_b", name: "成员乙", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
+      group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false },
+    },
+    contextLabels: { groupName: "群组乙", chatName: "成员乙会话", truncated: false },
+  });
+  ui.native.call = async (method, payload) => {
+    requests.push([method, payload]);
+    if (method === "snapshot") return payload.actorId === "member_b" ? actorSnapshot : groupSnapshot;
+    if (method === "queryActors") return page([{ characterId: "member_b", name: "成员乙", avatarUri: null, enabled: true }]);
+    if (method === "queryGroups") return page([{ characterGroupId: "group_b", name: "群组乙", avatarUri: null }]);
+    return page([]);
+  };
+
+  vm.runInContext(appSource, context, { filename: "app.js" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const finalSnapshotRequest = requests.filter(([method]) => method === "snapshot").at(-1);
+  assert.equal(finalSnapshotRequest[1].actorId, "member_b");
+  assert.equal(ui.state.snapshot.activeContext.actorId, "member_b");
+  assert.equal(ui.state.lastActorId, "member_b");
+});
+
+test("field detail and field management send the selected UI projection context", async () => {
+  const { context, ui } = createHarness("?route=field-detail&field=field_a");
+  const requests = [];
+  const groupSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: null, groupId: "group_b", actorName: "群组乙", truncated: false },
+    selected: { actor: null, group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false } },
+    contextLabels: { groupName: "群组乙", chatName: "群组乙会话", truncated: false },
+    pages: { ...validSnapshot().pages, fields: page([]) },
+  });
+  const actorSnapshot = validSnapshot({
+    activeContext: { chatId: "chat_a", actorId: "member_b", groupId: "group_b", actorName: "成员乙", truncated: false },
+    selected: {
+      actor: { characterId: "member_b", name: "成员乙", avatarUri: null, avatarUriUnavailable: false, enabled: true, truncated: false },
+      group: { characterGroupId: "group_b", name: "群组乙", avatarUri: null, avatarUriUnavailable: false, truncated: false },
+    },
+    contextLabels: { groupName: "群组乙", chatName: "成员乙会话", truncated: false },
+  });
+  ui.native.call = async (method, payload) => {
+    requests.push([method, payload]);
+    if (method === "snapshot") return payload.actorId === "member_b" ? actorSnapshot : groupSnapshot;
+    if (method === "queryActors") return page([{ characterId: "member_b", name: "成员乙", avatarUri: null, enabled: true }]);
+    if (method === "queryGroups") return page([{ characterGroupId: "group_b", name: "群组乙", avatarUri: null }]);
+    if (method === "getEntityById") {
+      if (payload.scopeContext?.actorId !== "member_b") {
+        return validFieldEntity({
+          bindingIds: ["member_b"], currentValue: null, currentStage: null,
+          bindingDisplay: "成员乙", scopeKey: null,
+        });
+      }
+      return validFieldEntity({
+        bindingIds: ["member_b"], currentValue: 42,
+        currentStage: { id: "low", name: "陌生", description: "尚不熟悉", threshold: 0 },
+        bindingDisplay: "成员乙", scopeKey: "character:member_b",
+      });
+    }
+    if (method === "queryRecords") return page([]);
+    if (method === "queryFields") return page([validFieldEntity({
+      bindingIds: ["member_b"], currentValue: 42, scopeKey: "character:member_b",
+    })]);
+    return page([]);
+  };
+
+  vm.runInContext(appSource, context, { filename: "app.js" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(ui.state.routeError, null);
+  const fieldDetailRequest = requests.filter(([method]) => method === "getEntityById").at(-1);
+  assert.deepEqual({ ...fieldDetailRequest[1].scopeContext }, {
+    chatId: "chat_a", actorId: "member_b", groupId: "group_b", actorName: "成员乙",
+  });
+
+  await ui.navigate("config-fields", { force: true });
+  const fieldListRequest = requests.filter(([method]) => method === "queryFields").at(-1);
+  assert.deepEqual({ ...fieldListRequest[1].scopeContext }, {
+    chatId: "chat_a", actorId: "member_b", groupId: "group_b", actorName: "成员乙",
+  });
+});
+
 test("group to character with no valid history selects the first current-group member before rendering", async () => {
   const { context, ui } = createHarness();
   context.window.location.href = "https://mvu.local/app.html?route=status";

@@ -4,6 +4,7 @@ import { publishOwnedTemporaryFile, type MvuFileApi } from "./store";
 import { assertDataChangeRecord } from "./validation";
 
 export const RECORDS_PER_SEGMENT = 500;
+const RECORD_PARTIAL_READ_INITIAL_LINES = 32;
 const MAX_SEGMENT_SCAN_COUNT = 1_024;
 const MAX_LATEST_CHANGE_TARGETS = 100_000;
 
@@ -356,14 +357,47 @@ export class SegmentedRecordStore {
   }
 
   private async readSegmentRecords(segment: RecordSegmentMetadata): Promise<DataChangeRecord[]> {
-    const content = await this.files.readTextPart(
-      this.segmentPath(segment.fileName),
+    const lines = await this.readStoredLineRange(
+      segment.fileName,
       1,
       segment.committedLineCount,
     );
-    const lines = parsePartialLines(content, segment.fileName, 1, segment.committedLineCount);
     return lines.map((line, index) =>
       parseStoredLine(line, segment.fileName, index + 1, segment.lastRevision).record);
+  }
+
+  private async readStoredLineRange(
+    fileName: string,
+    firstLine: number,
+    lastLine: number,
+  ): Promise<string[]> {
+    const lines: string[] = [];
+    for (let chunkStart = firstLine; chunkStart <= lastLine;
+      chunkStart += RECORD_PARTIAL_READ_INITIAL_LINES) {
+      const chunkEnd = Math.min(lastLine, chunkStart + RECORD_PARTIAL_READ_INITIAL_LINES - 1);
+      const content = await this.files.readTextPart(
+        this.segmentPath(fileName),
+        chunkStart,
+        chunkEnd,
+      );
+      if (hasPartialReadTruncationMarker(content)) {
+        return this.readStoredLineRangeFromFullFile(fileName, firstLine, lastLine);
+      }
+      lines.push(...parsePartialLines(content, fileName, chunkStart, chunkEnd));
+    }
+    return lines;
+  }
+
+  private async readStoredLineRangeFromFullFile(
+    fileName: string,
+    firstLine: number,
+    lastLine: number,
+  ): Promise<string[]> {
+    const lines = splitLines(await this.files.readText(this.segmentPath(fileName)));
+    if (lines.length < lastLine) {
+      throw new Error(`MVU_V3_RECORD_SEGMENT_SHORT:${fileName}`);
+    }
+    return lines.slice(firstLine - 1, lastLine);
   }
 
   async deleteSegments(manifest: RecordManifest): Promise<void> {
@@ -392,12 +426,11 @@ export class SegmentedRecordStore {
       if (overlapStart < overlapEnd) {
         const firstLine = overlapStart - segmentStart + 1;
         const lastLine = overlapEnd - segmentStart;
-        const content = await this.files.readTextPart(
-          this.segmentPath(segment.fileName),
+        const lines = await this.readStoredLineRange(
+          segment.fileName,
           firstLine,
           lastLine,
         );
-        const lines = parsePartialLines(content, segment.fileName, firstLine, lastLine);
         records.push(...lines.map((line, index) =>
           parseStoredLine(line, segment.fileName, firstLine + index, segment.lastRevision).record));
       }
@@ -609,7 +642,7 @@ function parsePartialLines(
   lastLine: number,
 ): string[] {
   const lines = splitLines(content);
-  if (lines.some((line) => line === "... (file content truncated) ...")) {
+  if (hasPartialReadTruncationMarker(content)) {
     throw new Error(`MVU_V3_RECORD_PARTIAL_READ_TRUNCATED:${fileName}`);
   }
   const expectedCount = lastLine - firstLine + 1;
@@ -624,6 +657,10 @@ function parsePartialLines(
     }
     return decorated[2];
   });
+}
+
+function hasPartialReadTruncationMarker(content: string): boolean {
+  return splitLines(content).some((line) => line === "... (file content truncated) ...");
 }
 
 function requireRevision(value: number): void {

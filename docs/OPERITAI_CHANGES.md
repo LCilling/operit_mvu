@@ -123,4 +123,25 @@ namespace Tools.Files {
 - `examples/types/files.d.ts`
 - `docs/doc-src/package-dev/files.md`
 
+## 附录 A：`readPart` 的结构化截断契约
+
+现有官方 `Tools.Files.readPart(path, startLine?, endLine?, environment?)` 在 Android、SAF 和 Linux 实现中，单次正文最多返回 32,000 个字符。若请求行范围的原始正文超过上限，宿主先截取前 32,000 个字符、再添加行号，并在独立末行追加固定标记：
+
+```text
+... (file content truncated) ...
+```
+
+该标记是机器可判定的兼容契约，不得翻译、改变空白或混入普通正文行。`FilePartContentData.startLine`、`endLine` 和 `totalLines` 继续描述请求及文件行范围，不能代替截断标记；当前返回结构尚无独立的 `truncated` 布尔字段。
+
+`operit_mvu` 的正常记录查询以最多 32 行调用 `readPart`。发现上述标记时，插件会放弃该次不完整结果，并仅针对当前记录段回退到官方 `Tools.Files.read` 完整读取一次，以兼容超长历史单行，避免产生部分 JSON 或递归数百次读取。未来若宿主为 `FilePartContentData` 增加结构化 `truncated: boolean`，应保留本标记至少一个兼容周期。
+
+主要文件：
+
+- `core/tools/ToolExecutionLimits.kt`
+- `core/tools/defaultTool/standard/StandardFileSystemTools.kt`
+- `core/tools/defaultTool/standard/SafFileSystemTools.kt`
+- `core/tools/defaultTool/standard/LinuxFileSystemTools.kt`
+- `core/tools/defaultTool/debugger/DebuggerFileSystemTools.kt`
+- `examples/types/results.d.ts`
+
 完整接口形状和边界见 [HOST_INTERFACE_REQUIREMENTS.md](HOST_INTERFACE_REQUIREMENTS.md)。

@@ -33,6 +33,7 @@
   const PICKER_WINDOW_OVERSCAN = 4;
   const PICKER_WINDOW_MAX_ROWS = 24;
   const PICKER_RETAINED_PAGE_LIMIT = 128;
+  const AUXILIARY_NATIVE_CONCURRENCY = 2;
   const MODEL_BUDGET_DIAGNOSTIC_LIMIT = 32;
   const MODEL_BUDGET_DIAGNOSTIC_MAX_CODE_POINTS = 256;
   const QUERY_RESPONSE_POLICIES = {
@@ -175,6 +176,8 @@
 
   function createNativeBridge() {
     const pending = new Map();
+    const auxiliaryQueue = [];
+    let auxiliaryActive = 0;
     let sequence = 0;
     window.__mvuResolve = function (callbackId, value) {
       const request = pending.get(callbackId);
@@ -190,7 +193,7 @@
       pending.delete(callbackId);
       request.reject(new Error(String(message || "MVU_NATIVE_CALL_REJECTED")));
     };
-    return {
+    const bridge = {
       call(method, params) {
         try {
           validateNativeMutationRequest(method, params || {});
@@ -218,7 +221,25 @@
           }
         });
       },
+      callAuxiliary(method, params) {
+        return new Promise(function (resolve, reject) {
+          auxiliaryQueue.push({ method, params, resolve, reject });
+          pumpAuxiliaryQueue();
+        });
+      },
     };
+    return bridge;
+
+    function pumpAuxiliaryQueue() {
+      while (auxiliaryActive < AUXILIARY_NATIVE_CONCURRENCY && auxiliaryQueue.length > 0) {
+        const request = auxiliaryQueue.shift();
+        auxiliaryActive += 1;
+        bridge.call(request.method, request.params).then(request.resolve, request.reject).finally(function () {
+          auxiliaryActive -= 1;
+          pumpAuxiliaryQueue();
+        });
+      }
+    }
   }
 
   function isRecord(value) {
@@ -980,6 +1001,39 @@
     return [context?.chatId || "", context?.actorId || "", context?.groupId || ""].join("\u0000");
   }
 
+  function withActiveScopeContext(request) {
+    const context = state.snapshot && state.snapshot.activeContext;
+    if (!context) return { ...(request || {}) };
+    return {
+      ...(request || {}),
+      scopeContext: {
+        chatId: context.chatId,
+        actorId: context.actorId,
+        groupId: context.groupId,
+        actorName: context.actorName,
+      },
+    };
+  }
+
+  async function projectCharacterContext(bindingIds) {
+    const context = state.snapshot && state.snapshot.activeContext;
+    if (!context || context.actorId || !context.groupId) return false;
+    await loadDirectory(context.groupId);
+    const bindings = Array.isArray(bindingIds) ? new Set(bindingIds) : null;
+    const eligible = state.directory.actors.filter(function (actor) {
+      return bindings === null || bindings.has(actor.characterId);
+    });
+    const eligibleIds = eligible.map(function (actor) { return actor.characterId; });
+    const actorId = eligibleIds.includes(state.lastActorId) ? state.lastActorId : eligibleIds[0];
+    if (!actorId) return false;
+    const projected = await loadSnapshot({ groupId: context.groupId, actorId });
+    if (projected.activeContext.actorId !== actorId || projected.activeContext.groupId !== context.groupId) {
+      throw new Error("MVU_ACTOR_PROJECTION_MISMATCH");
+    }
+    state.statusMode = "character";
+    return true;
+  }
+
   function resetFieldEditorDraft() {
     state.fieldEditorDraft = null;
     delete state.editorSelections["field-scope-character"];
@@ -1042,7 +1096,8 @@
 
   async function query(method, request, label, validationState) {
     try {
-      return validateQueryResponse(await native.call(method, request || {}), method, request || {}, validationState);
+      const payload = method === "queryFields" ? withActiveScopeContext(request) : (request || {});
+      return validateQueryResponse(await native.call(method, payload), method, payload, validationState);
     } catch (error) {
       const wrapped = new Error("页面数据有误，请重试");
       wrapped.cause = error;
@@ -1469,7 +1524,9 @@
     if (typeof id !== "string" || id.length === 0) throw new Error("MVU_ENTITY_ID_MISSING");
     const key = entityType + ":" + id;
     if (state.entities.has(key)) return state.entities.get(key);
-    const entity = await native.call("getEntityById", { entityType, id });
+    const entity = await native.callAuxiliary("getEntityById", entityType === "field"
+      ? withActiveScopeContext({ entityType, id })
+      : { entityType, id });
     const validators = {
       field: validateFieldEntity,
       actor: validateActor,
@@ -1504,13 +1561,21 @@
     state.routeError = null;
     try {
       if (LIST_POLICIES[routeId]) await loadManagementPage(routeId);
-      if (routeId === "status" &&
-          state.directory.actors.length === 0 && state.directory.groups.length === 0) {
-        await loadDirectory(state.snapshot && state.snapshot.activeContext.groupId);
+      if (routeId === "status") {
+        if (state.directory.actors.length === 0 && state.directory.groups.length === 0) {
+          await loadDirectory(state.snapshot && state.snapshot.activeContext.groupId);
+        }
+        if (!(options && options.skipStatusProjection) && state.statusMode === "character") {
+          await projectCharacterContext();
+        }
       }
       if (routeId === "field-detail") {
         if (!state.selectedFieldId) throw new Error("MVU_FIELD_SELECTION_MISSING");
-        const field = await getEntity("field", state.selectedFieldId);
+        let field = await getEntity("field", state.selectedFieldId);
+        if ((field.currentValue === null || field.scopeKey === null) && field.scope === "character") {
+          await projectCharacterContext(field.bindingIds);
+          field = await getEntity("field", state.selectedFieldId);
+        }
         if (field.currentValue === null || field.scopeKey === null) throw new Error("MVU_FIELD_CONTEXT_MISSING");
         state.detailRecords = await query("queryRecords", {
           page: 1,
@@ -1606,6 +1671,7 @@
   function readableError(error) {
     const message = error instanceof Error ? error.message : String(error || "未知错误");
     if (message === "MVU_NATIVE_BRIDGE_UNAVAILABLE") return "未连接到 OperitAI。请返回宿主后重新打开插件。";
+    if (message === "MVU_FIELD_CONTEXT_MISSING") return "当前上下文没有启用该字段，请先选择已绑定的角色或群组。";
     if (/TIMEOUT/.test(message)) return "读取超时，请检查宿主状态后重试。";
     if (/INVALID|MISSING|SHAPE/.test(message)) return "收到的数据格式不完整，请重新载入。";
     return message.length > 120 ? message.slice(0, 120) + "…" : message;

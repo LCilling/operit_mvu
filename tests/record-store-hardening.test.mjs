@@ -199,6 +199,59 @@ test("record queries decode decorated partial reads without loading whole segmen
   assert.equal(files.operations().some(({ operation }) => operation === "readText"), false);
 });
 
+test("record scans fall back once when a real 32,000-character partial read is truncated", async () => {
+  const files = createFakeMvuFileApi({}, { partialReadCharacterLimit: 32_000 });
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+  const expected = Array.from({ length: 55 }, (_, index) => ({ ...changeRecord(index + 1),
+    actorName: `角色${"长".repeat(800)}`,
+  }));
+  const staged = await records.stageAppend(createEmptyRecordManifest(), expected, 7);
+  const segmentPath = `${RECORD_DIRECTORY}/segment-000001.jsonl`;
+  assert.ok(files.snapshot()[segmentPath].length > 32_000);
+  files.clearOperations();
+
+  const result = await records.queryRecords(staged.manifest, {
+    offset: 0,
+    limit: expected.length,
+    direction: "asc",
+    fieldId: "field_affinity",
+    scopeKey: "character:T",
+  });
+
+  assert.deepEqual(result.items.map(({ id }) => id), expected.map(({ id }) => id));
+  const reads = files.operations().filter(({ operation }) => operation === "readTextPart");
+  assert.equal(reads.length, 1);
+  assert.deepEqual(reads[0], {
+    operation: "readTextPart", path: segmentPath, startLine: 1, endLine: 32,
+  });
+  assert.equal(files.operations().filter(({ operation, path }) =>
+    operation === "readText" && path === segmentPath).length, 1);
+});
+
+test("record reads preserve the exact 32,000 boundary and recover an existing 32,001-character line", async () => {
+  function recordWithStoredLength(length, index) {
+    const candidate = { ...changeRecord(index), actorName: "" };
+    const baseLength = JSON.stringify({ commitRevision: 9, record: candidate }).length;
+    candidate.actorName = "长".repeat(length - baseLength);
+    assert.equal(JSON.stringify({ commitRevision: 9, record: candidate }).length, length);
+    return candidate;
+  }
+  for (const length of [32_000, 32_001]) {
+    const files = createFakeMvuFileApi({}, { partialReadCharacterLimit: 32_000 });
+    const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+    const record = recordWithStoredLength(length, length);
+    const staged = await records.stageAppend(createEmptyRecordManifest(), [record], 9);
+    files.clearOperations();
+
+    const result = await records.queryRecords(staged.manifest, { offset: 0, limit: 1, direction: "asc" });
+
+    assert.equal(result.items[0].actorName.length, record.actorName.length);
+    assert.equal(files.operations().filter(({ operation }) => operation === "readTextPart").length, 1);
+    assert.equal(files.operations().filter(({ operation }) => operation === "readText").length,
+      length === 32_001 ? 1 : 0);
+  }
+});
+
 test("two store instances serialize one path and the stale writer cannot publish", async () => {
   const initial = legacyDatasetFixture();
   const files = fixtureFiles(initial);
@@ -322,7 +375,8 @@ test("normal compatibility reads are bounded independently of 100k-record histor
   assert.equal(snapshot.dataset.records.length <= 500, true);
   const segmentPartReads = files.operations().filter((operation) =>
     operation.operation === "readTextPart" && operation.path.startsWith(`${RECORD_DIRECTORY}/segment-`));
-  assert.equal(segmentPartReads.length <= 1, true);
+  assert.equal(segmentPartReads.length <= Math.ceil(500 / 32), true);
+  assert.equal(segmentPartReads.every(({ startLine, endLine }) => endLine - startLine + 1 <= 32), true);
   assert.equal(files.operations().some((operation) =>
     operation.operation === "readText" && operation.path.startsWith(`${RECORD_DIRECTORY}/segment-`)), false);
 });

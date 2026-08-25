@@ -7,6 +7,7 @@
   const toast = document.getElementById("toast");
   const BACKGROUND_KEY = "operit_mvu.customBackground";
   const BACKGROUND_MAX_EDGE = 1600;
+  const CONDITION_REFERENCE_WORKER_LIMIT = 2;
   let toastTimer = 0;
   let pendingSegmentFocusId = "";
   let pendingConditionFocus = null;
@@ -1129,18 +1130,25 @@
   }
 
   async function hydrateConditionRows(conditions) {
-    await Promise.all(conditions.map(async function (condition) {
-      const meta = { expression: condition.expression || null, referenceCount: null, error: "" };
-      try {
-        if (!meta.expression) meta.expression = (await ui.getEntity("condition", condition.id)).expression;
-        const response = await ui.native.call("getConditionReferences", { id: condition.id, page: 1 });
-        validateConditionReferenceResponse(response);
-        meta.referenceCount = response.totalCount;
-      } catch (error) {
-        meta.error = error instanceof Error ? error.message : String(error);
+    const queue = conditions.slice();
+    async function hydrateNextCondition() {
+      while (queue.length > 0) {
+        const condition = queue.shift();
+        if (!condition) return;
+        const meta = { expression: condition.expression || null, referenceCount: null, error: "" };
+        try {
+          if (!meta.expression) meta.expression = (await ui.getEntity("condition", condition.id)).expression;
+          const response = await ui.native.callAuxiliary("getConditionReferences", { id: condition.id, page: 1 });
+          validateConditionReferenceResponse(response);
+          meta.referenceCount = response.totalCount;
+        } catch (error) {
+          meta.error = error instanceof Error ? error.message : String(error);
+        }
+        ui.state.conditionMeta.set(condition.id, meta);
       }
-      ui.state.conditionMeta.set(condition.id, meta);
-    }));
+    }
+    const workerCount = Math.min(CONDITION_REFERENCE_WORKER_LIMIT, queue.length);
+    await Promise.all(Array.from({ length: workerCount }, hydrateNextCondition));
   }
 
   async function openConditionDelete(id, opener) {
@@ -2443,7 +2451,7 @@
         throw new Error("MVU_GROUP_PROJECTION_MISMATCH");
       }
       if (!directoryLoaded) await ui.loadDirectory(directoryGroupId || null);
-      await ui.loadRouteData(ui.state.route);
+      await ui.loadRouteData(ui.state.route, { skipStatusProjection: nextMode === "group" });
       if (nextMode) ui.state.statusMode = nextMode;
       await ui.transition(function () { render({ resetScroll: false }); });
     } catch (error) {

@@ -1025,10 +1025,17 @@ function parseQueryRequest(
   value: unknown,
   sortKeys: readonly string[],
   filterKeys: readonly string[],
+  allowScopeContext = false,
 ): QueryRequest {
   const record = requireRecord(value, "MVU_QUERY_REQUEST_INVALID");
-  assertKeys(record, [], ["search", "filters", "sort", "page", "cursor"], "MVU_QUERY_REQUEST_INVALID");
+  assertKeys(
+    record,
+    [],
+    ["search", "filters", "sort", "page", "cursor", ...(allowScopeContext ? ["scopeContext"] : [])],
+    "MVU_QUERY_REQUEST_INVALID",
+  );
   const request: QueryRequest = {};
+  if (hasOwn(record, "scopeContext")) request.scopeContext = parseScopeContext(record.scopeContext);
   if (hasOwn(record, "search")) {
     const search = requireString(record, "search", "MVU_QUERY_SEARCH_INVALID");
     if (search.length > QUERY_SEARCH_MAX_LENGTH) fail("MVU_QUERY_SEARCH_TOO_LONG");
@@ -1077,6 +1084,7 @@ function parseFieldsQuery(value: unknown): QueryRequest {
     value,
     ["id", "name", "order", "enabled", "scope", "minimum", "maximum"],
     ["mode", "enabled", "scope", "type", "bindingId"],
+    true,
   );
   assertFilterValue(request, "mode", (entry) => entry === "picker");
   assertFilterValue(request, "enabled", (entry) => typeof entry === "boolean");
@@ -1147,15 +1155,18 @@ function isBoundedFilterString(value: string | boolean | number): boolean {
 
 function parseGetEntityByIdRequest(value: unknown): GetEntityByIdRequest {
   const record = requireRecord(value, "MVU_GET_ENTITY_REQUEST_INVALID");
-  assertKeys(record, ["entityType", "id"], [], "MVU_GET_ENTITY_REQUEST_INVALID");
+  assertKeys(record, ["entityType", "id"], ["scopeContext"], "MVU_GET_ENTITY_REQUEST_INVALID");
+  const entityType = requireEnum(
+    record,
+    "entityType",
+    ["field", "actor", "group", "rule", "condition", "effectGroup"] as const,
+    "MVU_ENTITY_TYPE_INVALID",
+  );
+  if (hasOwn(record, "scopeContext") && entityType !== "field") fail("MVU_GET_ENTITY_REQUEST_INVALID");
   return {
-    entityType: requireEnum(
-      record,
-      "entityType",
-      ["field", "actor", "group", "rule", "condition", "effectGroup"] as const,
-      "MVU_ENTITY_TYPE_INVALID",
-    ),
+    entityType,
     id: requireBoundedNonEmptyString(record, "id", 256, "MVU_ENTITY_ID_INVALID"),
+    ...(hasOwn(record, "scopeContext") ? { scopeContext: parseScopeContext(record.scopeContext) } : {}),
   };
 }
 

@@ -134,9 +134,12 @@ test("indexed field-scope record pages keep exact totals with bounded segment re
     "record_994", "record_993", "record_992", "record_991", "record_990",
   ]);
   const reads = files.operations().slice(beforeQuery).filter((operation) => operation.operation.startsWith("readText"));
-  assert.equal(reads.length, 1);
+  assert.equal(reads.length, Math.ceil(500 / 32));
   assert.equal(reads[0].startLine, 1);
-  assert.equal(reads[0].endLine, 500);
+  assert.equal(reads[0].endLine, 32);
+  assert.equal(reads.at(-1).startLine, 481);
+  assert.equal(reads.at(-1).endLine, 500);
+  assert.equal(reads.every(({ startLine, endLine }) => endLine - startLine + 1 <= 32), true);
 });
 
 test("startup backfills a legacy v3 record index once and filtered queries read only the needed segment", async () => {
@@ -171,9 +174,9 @@ test("startup backfills a legacy v3 record index once and filtered queries read 
   ]);
   const recordReads = files.operations().filter(({ operation, path }) =>
     operation.startsWith("readText") && path.startsWith(RECORD_DIRECTORY));
-  assert.equal(recordReads.length, 1);
-  assert.equal(recordReads[0].operation, "readTextPart");
-  assert.equal(recordReads[0].path, `${RECORD_DIRECTORY}/segment-000006.jsonl`);
+  assert.equal(recordReads.length, Math.ceil(500 / 32));
+  assert.equal(recordReads.every(({ operation }) => operation === "readTextPart"), true);
+  assert.equal(recordReads.every(({ path }) => path === `${RECORD_DIRECTORY}/segment-000006.jsonl`), true);
 
   files.clearOperations();
   const restarted = v3Store(files);

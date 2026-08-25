@@ -183,6 +183,37 @@ test("condition library renders exact 10-row paging with row-level view toggle a
   assert.ok(document.querySelector("[data-new-entity='condition']"), "new condition action must stay visible");
 });
 
+test("condition reference hydration stays below the host per-origin async quota", async (t) => {
+  const window = await createApp("rules");
+  t.after(() => window.close());
+  const originalCall = window.MvuUi.native.call.bind(window.MvuUi.native);
+  let activeReferences = 0;
+  let maximumActiveReferences = 0;
+  window.MvuUi.native.call = async function (method, params) {
+    if (method !== "getConditionReferences") return originalCall(method, params);
+    activeReferences += 1;
+    maximumActiveReferences = Math.max(maximumActiveReferences, activeReferences);
+    try {
+      if (activeReferences > 4) throw new Error("ToolPkg async per-origin quota exceeded");
+      await new Promise((resolve) => setTimeout(resolve, 8));
+      return await originalCall(method, params);
+    } finally {
+      activeReferences -= 1;
+    }
+  };
+
+  await window.MvuUi.navigate("condition-library");
+
+  assert.ok(maximumActiveReferences <= 2, `reference hydration reached ${maximumActiveReferences} concurrent calls`);
+  const visibleConditions = window.MvuUi.state.pages.conditions.items;
+  assert.equal(visibleConditions.length, 10);
+  for (const condition of visibleConditions) {
+    const meta = window.MvuUi.state.conditionMeta.get(condition.id);
+    assert.equal(meta?.error, "", `${condition.id} failed reference hydration`);
+    assert.equal(typeof meta?.referenceCount, "number");
+  }
+});
+
 test("condition serializer preserves every production predicate token and exact payload keys", async (t) => {
   const window = await createApp("condition-editor");
   t.after(() => window.close());

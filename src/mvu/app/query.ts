@@ -57,6 +57,7 @@ export interface QueryRequest {
   sort?: { key: string; direction: "asc" | "desc" };
   page?: number;
   cursor?: string;
+  scopeContext?: StateScopeContext;
 }
 
 export interface QueryResponse<T> {
@@ -87,6 +88,7 @@ export type QueryEntityType =
 export interface GetEntityByIdRequest {
   entityType: QueryEntityType;
   id: string;
+  scopeContext?: StateScopeContext;
 }
 
 export interface EntityReferenceSummary {
@@ -387,9 +389,12 @@ export class MvuQueryService {
   }
 
   async queryFields(request: QueryRequest): Promise<QueryResponse<FieldQueryItem>> {
+    validateProjectionContext(request.scopeContext);
     const [snapshot, context, actors, groups] = await Promise.all([
       this.source.readV3(),
-      this.source.activeContext(),
+      request.scopeContext === undefined
+        ? this.source.activeContext()
+        : Promise.resolve(request.scopeContext),
       this.source.listActors(),
       this.source.listGroups(),
     ]);
@@ -629,6 +634,10 @@ export class MvuQueryService {
     if (typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("MVU_ENTITY_ID_INVALID");
     }
+    if (request.scopeContext !== undefined && request.entityType !== "field") {
+      throw new Error("MVU_GET_ENTITY_REQUEST_INVALID");
+    }
+    validateProjectionContext(request.scopeContext);
     let entity: FieldQueryItem | DataActor | QueryGroup | RuleDefinitionV3 | ConditionDefinition | EffectGroupDefinition | undefined;
     if (request.entityType === "actor") {
       entity = (await this.source.listActors()).find((item) => item.characterId === request.id);
@@ -641,7 +650,9 @@ export class MvuQueryService {
         const field = dataset.fields.find((item) => item.id === request.id);
         if (field !== undefined) {
           const [context, actors, groups] = await Promise.all([
-            this.source.activeContext(),
+            request.scopeContext === undefined
+              ? this.source.activeContext()
+              : Promise.resolve(request.scopeContext),
             this.source.listActors(),
             this.source.listGroups(),
           ]);
@@ -1260,6 +1271,18 @@ function validateQueryRequest(
   }
 }
 
+function validateProjectionContext(value: StateScopeContext | undefined): void {
+  if (value === undefined) return;
+  if (typeof value !== "object" || value === null ||
+    Object.keys(value).length !== 4 ||
+    typeof value.chatId !== "string" || value.chatId.length === 0 ||
+    (value.actorId !== null && (typeof value.actorId !== "string" || value.actorId.length === 0)) ||
+    (value.groupId !== null && (typeof value.groupId !== "string" || value.groupId.length === 0)) ||
+    typeof value.actorName !== "string") {
+    throw new Error("MVU_QUERY_SCOPE_CONTEXT_INVALID");
+  }
+}
+
 function validateRecordRequest(request: QueryRequest): void {
   validateQueryRequest(request, { cursor: false, sortKeys: ["occurredAt"], filterKeys: ["fieldId", "scopeKey"] });
   if ((request.search ?? "").length > 0) {
@@ -1297,6 +1320,7 @@ function queryFingerprint(request: QueryRequest): string {
     sort: request.sort === undefined
       ? null
       : { key: request.sort.key, direction: request.sort.direction },
+    scopeContext: request.scopeContext ?? null,
   });
 }
 
