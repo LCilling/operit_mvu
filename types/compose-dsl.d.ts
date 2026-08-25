@@ -441,7 +441,7 @@ export type ComposeWebViewResourceDecision =
     };
 
 export type ComposeWebViewJavascriptInterfaceMethod = (
-  argumentsList: readonly unknown[]
+  ...args: unknown[]
 ) => unknown | Promise<unknown>;
 
 export type ComposeWebViewJavascriptInterface = Record<

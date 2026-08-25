@@ -11,31 +11,12 @@ import {
 } from "../dist/shared/ipc.js";
 
 const ROOT = new URL("../", import.meta.url);
-const EXPECTED_CAPABILITIES = [
-  "chat.actor_identity",
-  "chat.history.immutable",
-  "chat.invalidation.durable",
-  "files.atomic_replace",
-  "ipc.owner_isolation",
-  "model.system.structured",
-  "runtime.bounded_async",
-];
-
-test("root manifest requires the complete Operit ToolPkg API-v3 host contract", () => {
+test("root manifest avoids private host capability keys", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
-  assert.deepEqual(manifest.host_requirements, {
-    api: "operit-toolpkg-host",
-    api_version: 3,
-    capabilities: EXPECTED_CAPABILITIES,
-  });
-  assert.deepEqual(
-    manifest.host_requirements.capabilities,
-    [...new Set(manifest.host_requirements.capabilities)].sort(),
-    "host capabilities must be unique and lexically sorted",
-  );
+  assert.equal(Object.hasOwn(manifest, "host_requirements"), false);
 });
 
-test("the package audit enforces the manifest host contract", () => {
+test("the package audit enforces the standard Operit manifest contract", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.match(packageJson.scripts.audit, /audit-manifest\.mjs/);
   const result = spawnSync(process.execPath, ["scripts/audit-manifest.mjs"], {
@@ -43,7 +24,7 @@ test("the package audit enforces the manifest host contract", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-  assert.match(result.stdout, /manifest host contract: PASS/);
+  assert.match(result.stdout, /standard Operit manifest contract: PASS/);
 });
 
 test("every UI IPC operation targets the package's exact persistent main runtime", async (t) => {

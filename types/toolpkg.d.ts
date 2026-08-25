@@ -894,33 +894,6 @@ export namespace ToolPkg {
         snapshot(request?: ChatContextSnapshotRequest): Promise<ChatContextSnapshot>;
     }
 
-    /** A model configured for on-device inference by Operit. */
-    export interface LocalModelOption extends JsonObject {
-        configId: string;
-        modelIndex: number;
-        configName: string;
-        modelName: string;
-        providerType: "MNN" | "LLAMA_CPP" | "LMSTUDIO" | "OLLAMA" | "OPENAI_LOCAL";
-    }
-
-    /** A single, non-streaming prompt to an Operit on-device model. */
-    export interface LocalModelCompletionRequest extends JsonObject {
-        configId: string;
-        modelIndex: number;
-        systemPrompt: string;
-        userPrompt: string;
-    }
-
-    export interface LocalModelCompletionResult extends JsonObject {
-        text: string;
-        providerModel: string;
-    }
-
-    export interface LocalModelApi {
-        list(): Promise<LocalModelOption[]>;
-        complete(request: LocalModelCompletionRequest): Promise<LocalModelCompletionResult>;
-    }
-
     /** Availability of Operit's current default chat model for background completion. */
     export interface SystemModelProbeResult extends JsonObject {
         available: boolean;
@@ -1053,7 +1026,6 @@ export namespace ToolPkg {
         registerSummaryGenerateHook(definition: SummaryGenerateHookRegistration): void;
         registerAiProvider(definition: AiProviderRegistration): void;
         chatContext: ChatContextApi;
-        localModels: LocalModelApi;
         systemModel: SystemModelApi;
         readResource(key: string, outputFileName?: string, internal?: boolean): Promise<string>;
         getConfigDir(pluginId?: string): string;

@@ -3,19 +3,6 @@
   "toolpkg_id": "com.lcilling.operit_mvu",
   "version": "2.0.1",
   "main": "dist/main.js",
-  "host_requirements": {
-    "api": "operit-toolpkg-host",
-    "api_version": 3,
-    "capabilities": [
-      "chat.actor_identity",
-      "chat.history.immutable",
-      "chat.invalidation.durable",
-      "files.atomic_replace",
-      "ipc.owner_isolation",
-      "model.system.structured",
-      "runtime.bounded_async"
-    ]
-  },
   "display_name": {
     "zh": "动态状态",
     "en": "Operit MVU",
