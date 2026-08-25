@@ -207,6 +207,10 @@ function createToolsFileApi(): MvuFileApi {
       const result = await Tools.Files.move(source, destination);
       requireSuccessfulFileOperation("move", result);
     },
+    async replaceAtomically(source, destination) {
+      const result = await Tools.Files.replaceAtomically(source, destination);
+      requireSuccessfulFileOperation("atomic_replace", result);
+    },
     async deleteFile(path) {
       const result = await Tools.Files.deleteFile(path, true);
       requireSuccessfulFileOperation("delete", result);

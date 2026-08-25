@@ -100,6 +100,12 @@ export namespace Files {
     function move(source: string, destination: string, environment?: FileEnvironment): Promise<FileOperationData>;
 
     /**
+     * Atomically replace a destination with a same-directory source file.
+     * The operation fails instead of degrading to copy/delete when atomic replacement is unavailable.
+     */
+    function replaceAtomically(source: string, destination: string): Promise<FileOperationData>;
+
+    /**
      * Copy file from source to destination. Supports cross-environment copying between Android and Linux.
      * @param source - Source path
      * @param destination - Destination path

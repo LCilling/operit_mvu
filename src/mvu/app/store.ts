@@ -27,6 +27,7 @@ export interface MvuFileApi {
   writeText(path: string, content: string): Promise<void>;
   appendText(path: string, content: string): Promise<void>;
   move(source: string, destination: string): Promise<void>;
+  replaceAtomically(source: string, destination: string): Promise<void>;
   deleteFile(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
 }
@@ -96,6 +97,9 @@ export class InMemoryMvuStore implements MvuStore {
     if (expectedRevision !== this.snapshot.revision) {
       throw new StaleRevisionError(expectedRevision, this.snapshot.revision);
     }
+    if (!Number.isSafeInteger(this.snapshot.revision + 1)) {
+      throw new Error("MVU_REVISION_OVERFLOW");
+    }
     const committed = klona(next);
     committed.revision = this.snapshot.revision + 1;
     this.snapshot = snapshotOf(committed);
@@ -149,9 +153,9 @@ export class FileMvuStore implements MvuStore {
   }
 
   private async persist(filePath: string, dataset: MvuDataset): Promise<void> {
-    const temporaryPath = `${filePath}.tmp`;
+    const temporaryPath = `${filePath}.tmp.${nextPersistenceId()}`;
     await this.files.writeText(temporaryPath, JSON.stringify(dataset, null, 2));
-    await this.files.move(temporaryPath, filePath);
+    await this.files.replaceAtomically(temporaryPath, filePath);
   }
 
   private async loadFromDisk(configDir: string, filePath: string): Promise<MvuStoreSnapshot> {
@@ -194,6 +198,9 @@ export class FileMvuStore implements MvuStore {
           throw new StaleRevisionError(expectedRevision, current.revision);
         }
 
+        if (!Number.isSafeInteger(current.revision + 1)) {
+          throw new Error("MVU_REVISION_OVERFLOW");
+        }
         const committed = klona(next);
         committed.revision = current.revision + 1;
         assertMvuDataset(committed);
@@ -208,4 +215,12 @@ export class FileMvuStore implements MvuStore {
       }
     });
   }
+}
+
+let persistenceSequence = 0;
+
+function nextPersistenceId(): string {
+  persistenceSequence += 1;
+  if (!Number.isSafeInteger(persistenceSequence)) persistenceSequence = 1;
+  return `${Date.now().toString(36)}_${persistenceSequence.toString(36)}`;
 }

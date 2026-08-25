@@ -36,7 +36,7 @@ interface StoredRecordLine {
 }
 
 export function createEmptyRecordManifest(nextSegmentIndex = 1): RecordManifest {
-  if (!Number.isInteger(nextSegmentIndex) || nextSegmentIndex < 1) {
+  if (!Number.isSafeInteger(nextSegmentIndex) || nextSegmentIndex < 1) {
     throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_INVALID");
   }
   return { segments: [], recordCount: 0, nextSegmentIndex };
@@ -66,9 +66,6 @@ export class SegmentedRecordStore {
     }
 
     await this.ensureDirectory();
-    if (currentManifest.segments.length > 0) {
-      await this.validateAndRepair(currentManifest, commitRevision - 1);
-    }
     const manifest = cloneManifest(currentManifest);
     const touchedSegmentPaths: string[] = [];
     let recordIndex = 0;
@@ -84,6 +81,9 @@ export class SegmentedRecordStore {
         commitRevision,
         record,
       } satisfies StoredRecordLine)).join("\n") + "\n";
+      if (!Number.isSafeInteger(manifest.recordCount + chunk.length)) {
+        throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
+      }
       await this.files.appendText(path, content);
       if (!touchedSegmentPaths.includes(path)) touchedSegmentPaths.push(path);
       updateSegmentMetadata(segment, chunk, commitRevision);
@@ -100,8 +100,18 @@ export class SegmentedRecordStore {
     commitRevision: number,
   ): Promise<StagedRecordWrite> {
     assertRecordManifest(currentManifest);
+    for (const record of records) assertDataChangeRecord(record);
+    requireRevision(commitRevision);
+    const requiredSegments = Math.ceil(records.length / RECORDS_PER_SEGMENT);
+    let nextSegmentIndex = currentManifest.nextSegmentIndex;
+    while (requiredSegments > 0 && await this.segmentRunExists(nextSegmentIndex, requiredSegments)) {
+      if (!Number.isSafeInteger(nextSegmentIndex + 1)) {
+        throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
+      }
+      nextSegmentIndex += 1;
+    }
     return this.stageAppend(
-      createEmptyRecordManifest(currentManifest.nextSegmentIndex),
+      createEmptyRecordManifest(nextSegmentIndex),
       records,
       commitRevision,
     );
@@ -125,12 +135,12 @@ export class SegmentedRecordStore {
         parseStoredLine(line, segment.fileName, index + 1, committedRevision));
       validateSegmentMetadata(segment, parsed);
       if (lines.length > segment.committedLineCount) {
-        const temporaryPath = `${path}.repair.tmp`;
+        const temporaryPath = `${path}.repair.tmp.${nextRecordOperationId()}`;
         await this.files.writeText(
           temporaryPath,
           committedLines.length === 0 ? "" : `${committedLines.join("\n")}\n`,
         );
-        await this.files.move(temporaryPath, path);
+        await this.files.replaceAtomically(temporaryPath, path);
       }
     }
     // New segments are allocated contiguously from nextSegmentIndex. If a
@@ -142,6 +152,9 @@ export class SegmentedRecordStore {
       const orphanPath = this.segmentPath(orphanName);
       if (!(await this.files.exists(orphanPath))) break;
       await this.files.deleteFile(orphanPath);
+      if (!Number.isSafeInteger(orphanIndex + 1)) {
+        throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
+      }
       orphanIndex += 1;
     }
   }
@@ -149,7 +162,8 @@ export class SegmentedRecordStore {
   async queryRecords(manifest: RecordManifest, request: RecordQueryRequest): Promise<RecordQueryResult> {
     assertRecordManifest(manifest);
     const offset = request.offset ?? 0;
-    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(request.limit) || request.limit <= 0) {
+    if (!Number.isSafeInteger(offset) || offset < 0 ||
+      !Number.isSafeInteger(request.limit) || request.limit <= 0) {
       throw new Error("MVU_V3_RECORD_QUERY_INVALID");
     }
     const direction = request.direction ?? "desc";
@@ -210,15 +224,12 @@ export class SegmentedRecordStore {
       if (overlapStart < overlapEnd) {
         const firstLine = overlapStart - segmentStart + 1;
         const lastLine = overlapEnd - segmentStart;
-        const content = await this.files.readTextPart(
-          this.segmentPath(segment.fileName),
-          firstLine,
-          lastLine,
-        );
-        const lines = splitLines(content);
-        if (lines.length !== lastLine - firstLine + 1) {
+        const content = await this.files.readText(this.segmentPath(segment.fileName));
+        const physicalLines = splitLines(content);
+        if (physicalLines.length < segment.committedLineCount) {
           throw new Error(`MVU_V3_RECORD_SEGMENT_SHORT:${segment.fileName}`);
         }
+        const lines = physicalLines.slice(firstLine - 1, lastLine);
         records.push(...lines.map((line, index) =>
           parseStoredLine(line, segment.fileName, firstLine + index, segment.lastRevision).record));
       }
@@ -237,8 +248,12 @@ export class SegmentedRecordStore {
     const index = manifest.nextSegmentIndex;
     const fileName = `segment-${String(index).padStart(6, "0")}.jsonl`;
     const path = this.segmentPath(fileName);
-    // An interrupted config commit may leave an unlisted segment at this exact index.
-    if (await this.files.exists(path)) await this.files.deleteFile(path);
+    if (await this.files.exists(path)) {
+      throw new Error(`MVU_V3_RECORD_SEGMENT_COLLISION:${fileName}`);
+    }
+    if (!Number.isSafeInteger(manifest.nextSegmentIndex + 1)) {
+      throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
+    }
     const segment: RecordSegmentMetadata = {
       index,
       fileName,
@@ -269,22 +284,32 @@ export class SegmentedRecordStore {
   private segmentPath(fileName: string): string {
     return `${this.directoryPath()}/${fileName}`;
   }
+
+  private async segmentRunExists(startIndex: number, count: number): Promise<boolean> {
+    for (let offset = 0; offset < count; offset += 1) {
+      const index = startIndex + offset;
+      if (!Number.isSafeInteger(index)) throw new Error("MVU_V3_RECORD_NEXT_SEGMENT_OVERFLOW");
+      const fileName = `segment-${String(index).padStart(6, "0")}.jsonl`;
+      if (await this.files.exists(this.segmentPath(fileName))) return true;
+    }
+    return false;
+  }
 }
 
 export function assertRecordManifest(value: unknown): asserts value is RecordManifest {
   if (typeof value !== "object" || value === null) failManifest();
   const manifest = value as Partial<RecordManifest>;
-  if (!Array.isArray(manifest.segments) || !Number.isInteger(manifest.recordCount) ||
-    (manifest.recordCount ?? -1) < 0 || !Number.isInteger(manifest.nextSegmentIndex) ||
+  if (!Array.isArray(manifest.segments) || !Number.isSafeInteger(manifest.recordCount) ||
+    (manifest.recordCount ?? -1) < 0 || !Number.isSafeInteger(manifest.nextSegmentIndex) ||
     (manifest.nextSegmentIndex ?? 0) < 1) failManifest();
   let total = 0;
   let previousIndex = 0;
   for (let position = 0; position < manifest.segments.length; position += 1) {
     const segment = manifest.segments[position] as Partial<RecordSegmentMetadata>;
-    if (typeof segment !== "object" || segment === null || !Number.isInteger(segment.index) ||
+    if (typeof segment !== "object" || segment === null || !Number.isSafeInteger(segment.index) ||
       (segment.index ?? 0) <= previousIndex ||
       segment.fileName !== `segment-${String(segment.index).padStart(6, "0")}.jsonl` ||
-      !Number.isInteger(segment.committedLineCount) || (segment.committedLineCount ?? 0) < 1 ||
+      !Number.isSafeInteger(segment.committedLineCount) || (segment.committedLineCount ?? 0) < 1 ||
       (segment.committedLineCount ?? 0) > RECORDS_PER_SEGMENT ||
       (position < manifest.segments.length - 1 && segment.committedLineCount !== RECORDS_PER_SEGMENT) ||
       !isFiniteNumber(segment.firstOccurredAt) || !isFiniteNumber(segment.lastOccurredAt) ||
@@ -295,6 +320,7 @@ export function assertRecordManifest(value: unknown): asserts value is RecordMan
     }
     const validatedSegment = segment as RecordSegmentMetadata;
     previousIndex = validatedSegment.index;
+    if (!Number.isSafeInteger(total + validatedSegment.committedLineCount)) failManifest();
     total += validatedSegment.committedLineCount;
   }
   const validatedManifest = manifest as RecordManifest;
@@ -318,6 +344,9 @@ function updateSegmentMetadata(
   for (const record of records) {
     segment.firstOccurredAt = Math.min(segment.firstOccurredAt, record.occurredAt);
     segment.lastOccurredAt = Math.max(segment.lastOccurredAt, record.occurredAt);
+  }
+  if (!Number.isSafeInteger(segment.committedLineCount + records.length)) {
+    throw new Error("MVU_V3_RECORD_COUNT_OVERFLOW");
   }
   segment.committedLineCount += records.length;
   segment.lastRevision = revision;
@@ -381,7 +410,7 @@ function requireRevision(value: number): void {
 }
 
 function isRevision(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -390,4 +419,12 @@ function isFiniteNumber(value: unknown): value is number {
 
 function failManifest(): never {
   throw new Error("MVU_V3_RECORD_MANIFEST_INVALID");
+}
+
+let recordOperationSequence = 0;
+
+function nextRecordOperationId(): string {
+  recordOperationSequence += 1;
+  if (!Number.isSafeInteger(recordOperationSequence)) recordOperationSequence = 1;
+  return `${Date.now().toString(36)}_${recordOperationSequence.toString(36)}`;
 }
