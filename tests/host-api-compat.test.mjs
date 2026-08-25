@@ -195,6 +195,12 @@ test("AST host audit allows extension 8 and rejects undocumented APIs", async (t
       "ToolPkg.localModels.list();",
       "ToolPkg.systemModel.prepareDispatch({});",
       "ToolPkg.chatContext.history();",
+      "const { localModels } = ToolPkg;",
+      "localModels.list();",
+      "const model = ToolPkg.systemModel;",
+      "model.prepareDispatch({});",
+      "const { Files } = Tools;",
+      "Files.unregisteredMethod();",
     ].join("\n"),
   );
   await writeFile(
@@ -211,6 +217,7 @@ test("AST host audit allows extension 8 and rejects undocumented APIs", async (t
   assert.ok(result.violations.some((item) => item.symbol === "ToolPkg.localModels"));
   assert.ok(result.violations.some((item) => item.symbol === "ToolPkg.systemModel.prepareDispatch"));
   assert.ok(result.violations.some((item) => item.symbol === "ToolPkg.chatContext.history"));
+  assert.ok(result.violations.some((item) => item.symbol === "Tools.Files.unregisteredMethod"));
   assert.ok(result.violations.some((item) => item.symbol === "manifest.host_requirements"));
 });
 

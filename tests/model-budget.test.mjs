@@ -67,6 +67,7 @@ function installPersistedMessageHost(t, files, hostSnapshot, modelCalls) {
   } };
   globalThis.ToolPkg = {
     getConfigDir() { return PRODUCTION_CONFIG_DIR; },
+    readResource() { return ""; },
     chatContext: {
       async snapshot() { return structuredClone(hostSnapshot); },
     },
