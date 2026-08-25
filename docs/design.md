@@ -47,7 +47,7 @@
 
 | 层级 | 字号 `fontSize` | 字重 `fontWeight` | 行高 `lineHeight` | 用例 |
 | --- | --- | --- | --- | --- |
-| 页面标题 | 21 | semibold(600) | 26 | 顶部导航标题「动态状态」「字段设置」|
+| 页面标题 | 21 | regular(400) | 28 | 顶部导航标题「动态状态」「字段设置」|
 | 板块标题 | 16 | semibold(600) | 20 | 卡片内小标题「基础信息」「阶段列表」|
 | 卡片标题 | 15 | semibold(600) | 19 | 字段名、规则名、状态项名称 |
 | 正文 | 14 | regular(400) | 21 | 字段描述、规则说明、表单正文 |
@@ -57,7 +57,9 @@
 | 标签/胶囊 | 11–12 | medium(500) | 16 | 阶段 chip、Tab、筛选 |
 | 按钮文字 | 15 | medium(500) | 20 | 主按钮/次按钮 |
 
-- 字体族：系统默认（Material Sans / Roboto），中文用系统默认；不引入外部字体。
+- 宿主依据：`D:\ProjectFile\OperitAI\app\src\main\java\com\ai\assistance\operit\ui\theme\Type.kt` 使用 `FontFamily.Default`；其中 `bodyLarge=16sp/24sp/Normal`、`titleLarge=22sp/28sp/Normal`、`labelSmall=11sp/16sp/Medium`，并由全局 `fontScale` 缩放。
+- WebView 文本栈固定为 `Roboto, "Noto Sans SC", system-ui, sans-serif`，优先贴近 Android 默认字体；不得加入 `Segoe UI` 或加载正文/展示用自定义 WebFont。`Material Symbols Rounded` 仅可用于图标。
+- 密度取舍：插件保留现有 `14px/21px` 正文和 `21px/28px` 页面标题，不再缩小；前者比宿主 `bodyLarge` 紧凑，后者接近宿主 `titleLarge`。所有正文、标题、表单控件、按钮、筛选、分页、阶段与趋势标签继承同一文本栈，并保留文本缩放行为。
 - 数字用等宽或 tabular 对齐，保证数值纵向对齐。
 
 ---
@@ -110,7 +112,7 @@
 ### 4.3 导航栏（Top Navigation / AppBar）
 - **双层顶栏**：MVU route 使用 `topBar: "host"`，最上方保留 Operit 原生蓝色顶栏；插件 WebView 从宿主顶栏下方开始，并完整保留参考图中的背景照片、三横线、页面标题和右侧功能按钮。两层顶栏不能合并、互相替代，也不能把插件内部标题栏改成宿主蓝色样式。
 - **背景**：透明/页面 `bg`，或白底（一级页）；不贴深色。
-- **标题**：全部左对齐，左边界固定在导航图标之后；右侧动作出现或消失时不得改变标题位置。`fontSize 21`、semibold、`textPrimary`。
+- **标题**：全部左对齐，左边界固定在导航图标之后；右侧动作出现或消失时不得改变标题位置。`fontSize 21`、regular、`lineHeight 28`、`textPrimary`。
 - **一级页入口**：「动态状态」「MVU 状态/字段设置」「规则设置」「临时效果」「记录」以及抽屉中的插件级「高级选项」左侧统一使用无底框的三横线菜单按钮；字段专属的自然变化、每轮变化、AI 设置以及各详情/编辑页使用返回按钮。
 - **返回**：左侧保留 `44×44` 的 `IconButton` 触控区，只显示 `ArrowBack` 图标，不使用底色、边框、阴影或圆角按钮外观。
 - **右侧动作**：文字按钮或图标（「编辑」「十新建字段」「使用模板」），`primary`。

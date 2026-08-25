@@ -11,6 +11,8 @@
   const listSearchTimers = new Map();
 
   ui.render = render;
+  ui.patchEntityPicker = patchEntityPicker;
+  ui.patchManagementList = patchManagementList;
   ui.switchStatusMode = switchStatusMode;
   ui.importDatasetText = importDataset;
   ui.exportDataset = exportDataset;
@@ -76,6 +78,80 @@
     });
   }
 
+  function fragmentFromHtml(html, selector) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    return template.content.querySelector(selector);
+  }
+
+  function patchEntityPicker() {
+    const current = appRoot.querySelector(".entity-picker");
+    if (!ui.state.entityPicker || !current) {
+      render();
+      return;
+    }
+    const results = current.querySelector("[data-picker-results]");
+    const search = current.querySelector("[data-picker-search]");
+    const active = document.activeElement;
+    const activePickerId = active && active.dataset ? active.dataset.pickerId || "" : "";
+    const activeAction = active && active.dataset ? active.dataset.action || "" : "";
+    const searchActive = active === search;
+    const resultsActive = active === results;
+    const selection = searchActive && typeof search.selectionStart === "number"
+      ? [search.selectionStart, search.selectionEnd, search.selectionDirection]
+      : null;
+    const scrollTop = results ? results.scrollTop : 0;
+    if (results) ui.updateEntityPickerViewport(scrollTop, results.clientHeight);
+    const next = fragmentFromHtml(ui.components.renderEntityPicker(ui.state.entityPicker), ".entity-picker");
+    if (!next) {
+      render();
+      return;
+    }
+    ["[data-picker-pinned-region]", "[data-picker-results]", "[data-picker-footer]"].forEach(function (selector) {
+      const currentRegion = current.querySelector(selector);
+      const nextRegion = next.querySelector(selector);
+      if (currentRegion && nextRegion) currentRegion.innerHTML = nextRegion.innerHTML;
+    });
+    const nextResults = current.querySelector("[data-picker-results]");
+    if (nextResults) nextResults.scrollTop = scrollTop;
+    if (searchActive && search) {
+      search.focus({ preventScroll: true });
+      if (selection && typeof search.setSelectionRange === "function") {
+        search.setSelectionRange(selection[0], selection[1], selection[2] || "none");
+      }
+      return;
+    }
+    let focusTarget = null;
+    if (activePickerId) {
+      focusTarget = Array.from(current.querySelectorAll("[data-picker-id]")).find(function (candidate) {
+        return candidate.dataset.pickerId === activePickerId;
+      }) || null;
+    } else if (activeAction) {
+      focusTarget = Array.from(current.querySelectorAll("[data-action]")).find(function (candidate) {
+        return candidate.dataset.action === activeAction;
+      }) || null;
+    } else if (resultsActive) {
+      focusTarget = nextResults;
+    }
+    if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus({ preventScroll: true });
+  }
+
+  function patchManagementList(routeId) {
+    const route = ui.routes[routeId];
+    const renderer = route && ui.pages[route.page];
+    const current = appRoot.querySelector('[data-management-region="' + routeId + '"]');
+    if (!current || typeof renderer !== "function") {
+      render();
+      return;
+    }
+    const next = fragmentFromHtml(renderer(), '[data-management-region="' + routeId + '"]');
+    if (!next) {
+      render();
+      return;
+    }
+    current.innerHTML = next.innerHTML;
+  }
+
   async function handleClick(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
@@ -120,7 +196,7 @@
       setBusy(true);
       try {
         await ui.updateListView(pageButton.dataset.pageRoute, { page: Number(pageButton.dataset.page) });
-        render({ resetScroll: true });
+        patchManagementList(pageButton.dataset.pageRoute);
       } finally {
         setBusy(false);
       }
@@ -195,6 +271,8 @@
     } else if (action === "edit-current-field") {
       ui.state.selectedEntityId = ui.state.selectedFieldId;
       await ui.navigate("field-editor");
+    } else if (action === "open-status-actor-picker" || action === "open-status-group-picker") {
+      await openStatusPicker(action, element);
     } else if (action === "open-field-picker" || action === "open-actor-picker" || action === "open-condition-picker" || action === "open-effect-picker" || action === "open-group-picker") {
       await openPickerForTrigger(action, element);
     } else if (action === "close-entity-picker") {
@@ -204,6 +282,29 @@
     } else if (action === "confirm-entity-picker") {
       ui.confirmEntityPicker();
     }
+  }
+
+  async function openStatusPicker(action, element) {
+    const groupMode = action === "open-status-group-picker";
+    await ui.openEntityPicker({
+      entity: groupMode ? "groups" : "actors",
+      title: groupMode ? "查找群组" : "查找角色",
+      mode: "single",
+      selectedIds: groupMode
+        ? [ui.state.snapshot.activeContext.groupId].filter(Boolean)
+        : [ui.state.snapshot.activeContext.actorId].filter(Boolean),
+      opener: element,
+      async onCommit(ids) {
+        const id = ids[0];
+        if (!id) return;
+        if (groupMode) {
+          await reloadContext({ groupId: id }, id, "group");
+        } else {
+          const groupId = ui.state.snapshot.activeContext.groupId;
+          await reloadContext({ groupId, actorId: id }, groupId, "character");
+        }
+      },
+    });
   }
 
   async function openPickerForTrigger(action, element) {
@@ -331,15 +432,51 @@
     listSearchTimers.set(route, window.setTimeout(function () {
       listSearchTimers.delete(route);
       void ui.updateListView(route, { search: listSearch.value }).then(function () {
-        render({ resetScroll: true });
+        patchManagementList(route);
       }).catch(function () { showToast("搜索失败，请重试"); });
     }, 180));
+  }
+
+  function handleAppChange(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    const listFilter = target.closest("[data-list-filter-route]");
+    if (listFilter) {
+      const route = listFilter.dataset.listFilterRoute;
+      const key = listFilter.dataset.listFilterKey;
+      const pageKey = {
+        "config-fields": "fields",
+        "config-rules": "rules",
+        "config-conditions": "conditions",
+        "config-effects": "effectGroups",
+        records: "records",
+      }[route];
+      const filters = { ...(ui.state.listViews[pageKey]?.filters || {}) };
+      if (listFilter.value === "") delete filters[key];
+      else filters[key] = listFilter.dataset.filterValueType === "boolean"
+        ? listFilter.value === "true"
+        : listFilter.value;
+      void ui.updateListView(route, { filters, page: 1 }).then(function () {
+        patchManagementList(route);
+      }).catch(function () { showToast("筛选失败，请重试"); });
+      return;
+    }
+    const pickerFilter = target.closest("[data-picker-filter]");
+    if (pickerFilter) {
+      void ui.updateEntityPickerFilter(
+        pickerFilter.dataset.pickerFilter,
+        pickerFilter.value,
+        pickerFilter.dataset.filterValueType || "string"
+      );
+    }
   }
 
   function handleAppScroll(event) {
     const results = event.target instanceof Element ? event.target.closest("[data-picker-results]") : null;
     if (!results) return;
-    if (results.scrollTop + results.clientHeight >= results.scrollHeight - 72) {
+    const nearBoundary = results.scrollTop + results.clientHeight >= results.scrollHeight - 72;
+    if (ui.updateEntityPickerViewport(results.scrollTop, results.clientHeight)) patchEntityPicker();
+    if (nearBoundary) {
       void ui.fetchNextEntityPickerPage();
     }
   }
@@ -347,6 +484,9 @@
   async function switchStatusMode(mode) {
     if (mode !== "character" && mode !== "group") throw new Error("MVU_STATUS_MODE_INVALID");
     if (mode === "group") {
+      if (ui.state.directory.groups.length === 0) {
+        await ui.loadDirectory(ui.state.snapshot.activeContext.groupId || null);
+      }
       const selected = ui.state.snapshot.activeContext.groupId ||
         (ui.state.snapshot.selected.group && ui.state.snapshot.selected.group.characterGroupId) ||
         (ui.state.directory.groups[0] && ui.state.directory.groups[0].characterGroupId);
@@ -411,8 +551,7 @@
       errorNode.textContent = "字段定义尚未载入，请重新进入本页。";
       return;
     }
-    const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
-    const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
+    const currentValue = field.currentValue === null ? field.initialValue : field.currentValue;
     const validation = validateFieldRangeDraft(field, { minimum: minimumInput, maximum: maximumInput }, currentValue);
     errorNode.textContent = "";
     if (validation.error || !validation.changed) {
@@ -443,8 +582,7 @@
     if (!card || !field) return;
     const minimumInput = card.querySelector('[data-range-number="minimum"]').value;
     const maximumInput = card.querySelector('[data-range-number="maximum"]').value;
-    const summary = ui.state.snapshot.pages.fields.items.find(function (item) { return item.id === field.id; });
-    const currentValue = summary && summary.current ? summary.current.value : field.initialValue;
+    const currentValue = field.currentValue === null ? field.initialValue : field.currentValue;
     const validation = validateFieldRangeDraft(field, { minimum: minimumInput, maximum: maximumInput }, currentValue);
     const error = card.querySelector("[data-range-error]");
     const save = card.querySelector('[data-action="save-field-range"]');
@@ -599,6 +737,7 @@
     });
   });
   appRoot.addEventListener("input", handleAppInput);
+  appRoot.addEventListener("change", handleAppChange);
   appRoot.addEventListener("keydown", handleAppKeydown);
   appRoot.addEventListener("scroll", handleAppScroll, true);
   window.addEventListener("resize", drawCharts);

@@ -54,9 +54,9 @@
       '<button type="button" class="text-action" data-new-entity="' + entityType + '">' + c.icon("add") + addLabel + "</button>") +
       '<label class="search-field full">' + c.icon("search") + '<input type="search" value="' + ui.escapeHtml(view.search) + '" placeholder="搜索' +
       title + '" aria-label="搜索' + title + '" data-list-search-route="' + route + '"></label>' +
-      c.listMeta(page, noun, view.page, pageSize, ui.state.snapshot.counts[pageCountKey(route)], c.listViewFiltered(view)) +
+      '<div data-management-region="' + route + '">' + c.listMeta(page, noun, view.page, pageSize, ui.state.snapshot.counts[pageCountKey(route)], c.listViewFiltered(view)) +
       (page.items.length ? '<div class="compact-list">' + page.items.map(row).join("") + "</div>" :
-        c.emptyState("inbox", "还没有" + title, "创建后会显示在这里。")) + c.pagination(page, route, view.page) + "</div>";
+        c.emptyState("inbox", "还没有" + title, "创建后会显示在这里。")) + c.pagination(page, route, view.page) + "</div></div>";
   }
 
   function pageCountKey(route) {

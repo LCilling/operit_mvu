@@ -49,6 +49,13 @@ export interface QueryResponse<T> {
   nextCursor: string | null;
 }
 
+export interface FieldQueryItem extends DataField {
+  currentValue: number | null;
+  currentStage: DataField["stages"][number] | null;
+  bindingDisplay: string;
+  scopeKey: string | null;
+}
+
 export type QueryGroup = ToolPkg.ChatContextGroupSnapshot;
 
 export type QueryEntityType =
@@ -317,10 +324,16 @@ export class MvuQueryService {
     this.cursorCapacity = positiveSafeInteger(options.cursorCapacity, DEFAULT_CURSOR_CAPACITY);
   }
 
-  async queryFields(request: QueryRequest): Promise<QueryResponse<DataField>> {
-    const dataset = (await this.source.readV3()).dataset;
+  async queryFields(request: QueryRequest): Promise<QueryResponse<FieldQueryItem>> {
+    const [snapshot, context, actors, groups] = await Promise.all([
+      this.source.readV3(),
+      this.source.activeContext(),
+      this.source.listActors(),
+      this.source.listGroups(),
+    ]);
+    const dataset = snapshot.dataset;
     const picker = request.filters?.mode === "picker" || request.cursor !== undefined;
-    return queryCollection({
+    const response = queryCollection({
       entity: "fields",
       items: dataset.fields,
       request,
@@ -340,6 +353,7 @@ export class MvuQueryService {
         mode: (_item, value) => value === "picker",
         enabled: (item, value) => item.enabled === value,
         scope: (item, value) => item.scope === value,
+        type: (item, value) => item.modelVisibility === value,
         bindingId: (item, value) => typeof value === "string" && item.bindingIds.includes(value),
       },
       validateFilters: (filters) => {
@@ -347,11 +361,14 @@ export class MvuQueryService {
         requireFilter(filters, "enabled", (value) => typeof value === "boolean");
         requireFilter(filters, "scope", (value) =>
           value === "character" || value === "group" || value === "global" || value === "chat");
+        requireFilter(filters, "type", (value) =>
+          value === "full" || value === "stage_only" || value === "hidden");
         requireFilter(filters, "bindingId", isNonEmptyFilterString);
       },
       searchText: (item) => [item.id, item.name, item.description, ...item.bindingIds],
       id: (item) => item.id,
     }, this.cursorAccess());
+    return mapQueryResponse(response, (field) => projectField(field, dataset, context, actors, groups));
   }
 
   async queryActors(request: QueryRequest): Promise<QueryResponse<DataActor>> {
@@ -387,9 +404,21 @@ export class MvuQueryService {
   }
 
   async queryGroups(request: QueryRequest): Promise<QueryResponse<QueryGroup>> {
+    const actorId = request.filters?.actorId;
+    if (actorId !== undefined &&
+        (typeof actorId !== "string" || actorId.length === 0 || this.source.listActorsForGroup === undefined)) {
+      throw new Error("MVU_QUERY_FILTER_INVALID");
+    }
+    const groups = await this.source.listGroups();
+    const memberGroupIds = typeof actorId === "string"
+      ? new Set((await Promise.all(groups.map(async (group) => ({
+          id: group.characterGroupId,
+          actors: await this.source.listActorsForGroup!(group.characterGroupId),
+        })))).filter((entry) => entry.actors.some((actor) => actor.characterId === actorId)).map((entry) => entry.id))
+      : null;
     return queryCollection({
       entity: "groups",
-      items: await this.source.listGroups(),
+      items: groups,
       request,
       pageSize: PICKER_BATCH_SIZE,
       cursor: true,
@@ -398,7 +427,10 @@ export class MvuQueryService {
         id: (item) => item.characterGroupId,
         name: (item) => item.name,
       },
-      filterKeys: {},
+      filterKeys: {
+        actorId: (item, value) => typeof value === "string" && memberGroupIds?.has(item.characterGroupId) === true,
+      },
+      validateFilters: (filters) => requireFilter(filters, "actorId", isNonEmptyFilterString),
       searchText: (item) => [item.characterGroupId, item.name],
       id: (item) => item.characterGroupId,
     }, this.cursorAccess());
@@ -518,20 +550,31 @@ export class MvuQueryService {
   }
 
   async getEntityById(request: GetEntityByIdRequest): Promise<
-    DataField | DataActor | QueryGroup | RuleDefinitionV3 | ConditionDefinition | EffectGroupDefinition
+    FieldQueryItem | DataActor | QueryGroup | RuleDefinitionV3 | ConditionDefinition | EffectGroupDefinition
   > {
     if (!isQueryEntityType(request.entityType)) throw new Error("MVU_ENTITY_TYPE_INVALID");
     if (typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("MVU_ENTITY_ID_INVALID");
     }
-    let entity: DataField | DataActor | QueryGroup | RuleDefinitionV3 | ConditionDefinition | EffectGroupDefinition | undefined;
+    let entity: FieldQueryItem | DataActor | QueryGroup | RuleDefinitionV3 | ConditionDefinition | EffectGroupDefinition | undefined;
     if (request.entityType === "actor") {
       entity = (await this.source.listActors()).find((item) => item.characterId === request.id);
     } else if (request.entityType === "group") {
       entity = (await this.source.listGroups()).find((item) => item.characterGroupId === request.id);
     } else {
-      const dataset = (await this.source.readV3()).dataset;
-      if (request.entityType === "field") entity = dataset.fields.find((item) => item.id === request.id);
+      const snapshot = await this.source.readV3();
+      const dataset = snapshot.dataset;
+      if (request.entityType === "field") {
+        const field = dataset.fields.find((item) => item.id === request.id);
+        if (field !== undefined) {
+          const [context, actors, groups] = await Promise.all([
+            this.source.activeContext(),
+            this.source.listActors(),
+            this.source.listGroups(),
+          ]);
+          entity = projectField(field, dataset, context, actors, groups);
+        }
+      }
       if (request.entityType === "rule") entity = dataset.rules.find((item) => item.id === request.id);
       if (request.entityType === "condition") entity = dataset.conditions.find((item) => item.id === request.id);
       if (request.entityType === "effectGroup") entity = dataset.effectGroups.find((item) => item.id === request.id);
@@ -888,7 +931,6 @@ export class MvuQueryService {
       throw new Error("MVU_QUERY_CURSOR_INVALID");
     }
     this.cursors.delete(token);
-    this.cursors.set(token, state);
     return state;
   }
 
@@ -1179,6 +1221,53 @@ function mapQueryResponse<TSource, TResult>(
     hasMore: response.hasMore,
     nextCursor: response.nextCursor,
   };
+}
+
+function projectField(
+  field: DataField,
+  dataset: MvuDatasetV3,
+  context: StateScopeContext,
+  actors: readonly DataActor[],
+  groups: readonly QueryGroup[],
+): FieldQueryItem {
+  const scopeKey = contextScopeKey(field, context);
+  const currentValue = scopeKey === null
+    ? null
+    : dataset.stateValues[scopeKey]?.[field.id] ?? field.initialValue;
+  const currentStage = currentValue === null ? null : stageForValue(field, currentValue);
+  return {
+    ...klona(field),
+    currentValue,
+    currentStage: currentStage === null ? null : klona(currentStage),
+    bindingDisplay: fieldBindingDisplay(field, context, actors, groups),
+    scopeKey,
+  };
+}
+
+function fieldBindingDisplay(
+  field: DataField,
+  context: StateScopeContext,
+  actors: readonly DataActor[],
+  groups: readonly QueryGroup[],
+): string {
+  if (field.scope === "global") return "所有角色、群组和会话";
+  if (field.bindingIds.length === 0) return "未绑定";
+  if (field.scope === "chat") {
+    if (context.chatId !== null && field.bindingIds.includes(context.chatId)) {
+      return context.actorName.length > 0 ? `${context.actorName} 的会话` : "当前会话";
+    }
+    return `${field.bindingIds.length} 个会话`;
+  }
+  const names = field.scope === "character"
+    ? new Map(actors.map((actor) => [actor.characterId, actor.name]))
+    : new Map(groups.map((group) => [group.characterGroupId, group.name]));
+  const firstName = names.get(field.bindingIds[0]);
+  if (firstName === undefined) {
+    return `${field.bindingIds.length}${field.scope === "character" ? " 个角色" : " 个群组"}`;
+  }
+  return field.bindingIds.length === 1
+    ? firstName
+    : `${firstName} 等 ${field.bindingIds.length}${field.scope === "character" ? " 个角色" : " 个群组"}`;
 }
 
 function summarizeField(
