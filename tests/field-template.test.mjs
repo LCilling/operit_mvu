@@ -3,6 +3,8 @@ import test from "node:test";
 
 import { migrateDatasetV2ToV3 } from "../dist/mvu/app/migration-v3.js";
 import { MvuQueryService } from "../dist/mvu/app/query.js";
+import { V3MvuStore } from "../dist/mvu/app/store-v3.js";
+import { FileMvuStore } from "../dist/mvu/app/store.js";
 import {
   MVU_IPC,
   MVU_REQUEST_PARSERS,
@@ -10,7 +12,7 @@ import {
   mvuIpcClient,
 } from "../dist/shared/ipc.js";
 import webContainerScreen from "../dist/ui/web_container/index.ui.js";
-import { legacyDatasetFixture } from "./helpers.mjs";
+import { createFakeMvuFileApi, legacyDatasetFixture } from "./helpers.mjs";
 
 const NOW = Date.parse("2033-05-18T03:33:20.000Z");
 
@@ -240,7 +242,16 @@ test("field template preview is deterministic and reports conflicts and readable
   assert.deepEqual(first.mappingNeeds, [{
     fieldId: "field_affinity",
     scope: "character",
-    sourceTargets: [{ kind: "actor", sourceId: "actor_t", name: "角色 T", hasValue: false }],
+    requiresLocalTargets: false,
+    templateValueAvailable: false,
+    sourceTargets: [{
+      kind: "actor",
+      sourceId: "actor_t",
+      name: "角色 T",
+      hasValue: false,
+      requiresSearch: false,
+      suggestedTarget: { targetId: "actor_t", name: "角色 T", reason: "stable_id" },
+    }],
   }]);
   assert.equal(fixture.transactionCount(), 0);
   assert.deepEqual(fixture.current(), before);
@@ -368,6 +379,172 @@ test("update preserves local bindings and values while replace applies the expli
   assert.equal(writes, 2);
 });
 
+test("cross-scope update is unavailable in preview and rejects without reinterpreting local bindings or values", async () => {
+  for (const importedScope of ["group", "global", "chat"]) {
+    const sourceData = createFixture().dataset;
+    sourceData.fields[0] = {
+      ...sourceData.fields[0],
+      scope: importedScope,
+      bindingIds: [],
+    };
+    sourceData.stateValues = {};
+    const source = createServiceFrom(sourceData);
+    const exported = await source.service.exportFieldTemplate({
+      fieldIds: ["field_affinity"],
+      targetSelections: [],
+    });
+
+    const localData = createFixture().dataset;
+    localData.fields[0].bindingIds = ["actor_t"];
+    localData.stateValues = { "character:actor_t": { field_affinity: 37 } };
+    const target = createServiceFrom(localData, {
+      actors: [{ characterId: "actor_t", name: "角色 T", enabled: true }],
+      groups: [{ characterGroupId: "group_main", name: "主群组", avatarUri: null }],
+    });
+    const before = target.current();
+    const preview = await target.service.previewFieldTemplateImport({ json: exported.json });
+    assert.deepEqual(preview.fields[0].updateCompatibility, {
+      available: false,
+      localScope: "character",
+      reason: "scope_mismatch",
+    });
+    await assert.rejects(target.service.importFieldTemplate({
+      json: exported.json,
+      expectedRevision: preview.revision,
+      decisions: { fields: [{ sourceFieldId: "field_affinity", strategy: "update", mappings: [] }] },
+    }), /MVU_FIELD_TEMPLATE_UPDATE_SCOPE_MISMATCH/);
+    assert.equal(target.transactionCount(), 0, importedScope);
+    assert.deepEqual(target.current(), before, importedScope);
+  }
+});
+
+test("definition-only character templates require explicit unbound targets and allow every target to be disabled", async () => {
+  const source = createFixture();
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: [],
+  });
+  const targetData = createFixture().dataset;
+  targetData.fields = [];
+  targetData.stateValues = {};
+  const target = createServiceFrom(targetData, {
+    actors: [
+      { characterId: "actor_t", name: "角色 T", enabled: true },
+      { characterId: "actor_u", name: "角色 U", enabled: true },
+    ],
+    groups: [{ characterGroupId: "group_main", name: "主群组", avatarUri: null }],
+  });
+  const preview = await target.service.previewFieldTemplateImport({ json: exported.json });
+  assert.deepEqual(preview.mappingNeeds, [{
+    fieldId: "field_affinity",
+    scope: "character",
+    requiresLocalTargets: true,
+    templateValueAvailable: false,
+    sourceTargets: [],
+  }]);
+  await assert.rejects(target.service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: preview.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [] }] },
+  }), /MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_REQUIRED/);
+  const result = await target.service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: preview.revision,
+    decisions: { fields: [{
+      sourceFieldId: "field_affinity",
+      mappings: [],
+      unboundTargets: [
+        { targetId: "actor_t", enabled: false, valuePolicy: "field_initial" },
+        { targetId: "actor_u", enabled: false, valuePolicy: "keep_existing" },
+      ],
+    }] },
+  });
+  assert.deepEqual(result.summary, {
+    created: ["field_affinity"], updated: [], replaced: [], skippedTargets: 2, valueWrites: 0,
+  });
+  assert.deepEqual(target.current().fields[0].bindingIds, []);
+  assert.deepEqual(target.current().stateValues, {});
+  assert.equal(target.transactionCount(), 1);
+});
+
+test("definition-only group targets import explicitly and reject template values, duplicates, cross-kind, or missing IDs atomically", async () => {
+  const sourceData = createFixture().dataset;
+  sourceData.fields[0] = { ...sourceData.fields[0], id: "field_group", scope: "group", bindingIds: [] };
+  const source = createServiceFrom(sourceData);
+  const exported = await source.service.exportFieldTemplate({ fieldIds: ["field_group"], targetSelections: [] });
+  const targetData = createFixture().dataset;
+  targetData.fields = [];
+  targetData.stateValues = {};
+  const target = createServiceFrom(targetData, {
+    actors: [{ characterId: "actor_t", name: "角色 T", enabled: true }],
+    groups: [
+      { characterGroupId: "group_alpha", name: "Alpha", avatarUri: null },
+      { characterGroupId: "group_beta", name: "Beta", avatarUri: null },
+    ],
+  });
+  const revision = targetData.revision;
+  const request = (unboundTargets) => ({
+    json: exported.json,
+    expectedRevision: revision,
+    decisions: { fields: [{ sourceFieldId: "field_group", mappings: [], unboundTargets }] },
+  });
+  await assert.rejects(target.service.importFieldTemplate(request([
+    { targetId: "group_alpha", enabled: true, valuePolicy: "template_value" },
+  ])), /MVU_FIELD_TEMPLATE_UNBOUND_TEMPLATE_VALUE_INVALID/);
+  await assert.rejects(target.service.importFieldTemplate(request([
+    { targetId: "group_alpha", enabled: true, valuePolicy: "field_initial" },
+    { targetId: "group_alpha", enabled: false, valuePolicy: "field_initial" },
+  ])), /MVU_FIELD_TEMPLATE_UNBOUND_TARGET_DUPLICATE/);
+  for (const targetId of ["actor_t", "group_missing"]) {
+    await assert.rejects(target.service.importFieldTemplate(request([
+      { targetId, enabled: true, valuePolicy: "field_initial" },
+    ])), /MVU_FIELD_TEMPLATE_UNBOUND_TARGET_INVALID/);
+  }
+  assert.equal(target.transactionCount(), 0);
+  assert.deepEqual(target.current(), targetData);
+
+  const committed = await target.service.importFieldTemplate(request([
+    { targetId: "group_alpha", enabled: true, valuePolicy: "field_initial" },
+    { targetId: "group_beta", enabled: false, valuePolicy: "keep_existing" },
+  ]));
+  assert.equal(committed.summary.valueWrites, 1);
+  assert.deepEqual(target.current().fields[0].bindingIds, ["group_alpha"]);
+  assert.equal(target.current().stateValues["group:group_alpha"].field_group, 0);
+});
+
+test("unbound targets are forbidden for mapped, global, chat, and update decisions", async () => {
+  const fixture = createFixture();
+  const mapped = await fixture.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: false }),
+  });
+  const unboundTargets = [{ targetId: "actor_t", enabled: true, valuePolicy: "field_initial" }];
+  await assert.rejects(fixture.service.importFieldTemplate({
+    json: mapped.json,
+    expectedRevision: fixture.dataset.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [{
+      sourceTargetId: "actor_t", targets: unboundTargets,
+    }], unboundTargets }] },
+  }), /MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE/);
+  await assert.rejects(fixture.service.importFieldTemplate({
+    json: mapped.json,
+    expectedRevision: fixture.dataset.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", strategy: "update", mappings: [], unboundTargets }] },
+  }), /MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE/);
+  for (const scope of ["global", "chat"]) {
+    const data = createFixture().dataset;
+    data.fields[0] = { ...data.fields[0], scope, bindingIds: [] };
+    const source = createServiceFrom(data);
+    const exported = await source.service.exportFieldTemplate({ fieldIds: ["field_affinity"], targetSelections: [] });
+    await assert.rejects(fixture.service.importFieldTemplate({
+      json: exported.json,
+      expectedRevision: fixture.dataset.revision,
+      decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [], unboundTargets }] },
+    }), /MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_INAPPROPRIATE/);
+  }
+  assert.equal(fixture.transactionCount(), 0);
+});
+
 test("group templates export readable group metadata and map one source group only to explicit local groups", async () => {
   const base = createFixture().dataset;
   base.fields[0] = {
@@ -400,7 +577,12 @@ test("group templates export readable group metadata and map one source group on
       { characterGroupId: "group_alpha", name: "Alpha", avatarUri: null },
       { characterGroupId: "group_beta", name: "Beta", avatarUri: null },
       { characterGroupId: "group_unselected", name: "Other", avatarUri: null },
+      { characterGroupId: "group_same_name", name: "远征队", avatarUri: null },
     ],
+  });
+  const preview = await target.service.previewFieldTemplateImport({ json: exported.json });
+  assert.deepEqual(preview.mappingNeeds[0].sourceTargets[0].suggestedTarget, {
+    targetId: "group_same_name", name: "远征队", reason: "unique_name",
   });
   await target.service.importFieldTemplate({
     json: exported.json,
@@ -482,6 +664,47 @@ test("chat templates never export saved chat UUIDs and bind only the current imp
   });
   assert.deepEqual(target.current().fields[0].bindingIds, ["current_import_session"]);
   assert.equal(JSON.stringify(target.current().fields[0]).includes("saved_chat_uuid_private"), false);
+});
+
+test("preview suggests exact stable IDs before unique names and requires search for duplicate or missing names", async () => {
+  const sourceData = createFixture().dataset;
+  sourceData.fields[0].bindingIds = ["actor_exact", "actor_unique", "actor_duplicate", "actor_missing"];
+  const source = createServiceFrom(sourceData, { actors: [
+    { characterId: "actor_exact", name: "Renamed source", enabled: true },
+    { characterId: "actor_unique", name: "Unique name", enabled: true },
+    { characterId: "actor_duplicate", name: "Duplicate name", enabled: true },
+    { characterId: "actor_missing", name: "Missing name", enabled: true },
+  ] });
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix(
+      { targetId: "actor_exact", enabled: true, includeValue: false },
+      { targetId: "actor_unique", enabled: true, includeValue: false },
+      { targetId: "actor_duplicate", enabled: true, includeValue: false },
+      { targetId: "actor_missing", enabled: true, includeValue: false },
+    ),
+  });
+  const target = createServiceFrom(createFixture().dataset, { actors: [
+    { characterId: "actor_exact", name: "Local exact ID wins", enabled: true },
+    { characterId: "local_unique", name: "Unique name", enabled: true },
+    { characterId: "local_duplicate_a", name: "Duplicate name", enabled: true },
+    { characterId: "local_duplicate_b", name: "Duplicate name", enabled: true },
+  ] });
+  const preview = await target.service.previewFieldTemplateImport({ json: exported.json });
+  const suggestions = Object.fromEntries(preview.mappingNeeds[0].sourceTargets.map((entry) => [entry.sourceId, entry]));
+  assert.deepEqual(suggestions.actor_exact.suggestedTarget, {
+    targetId: "actor_exact", name: "Local exact ID wins", reason: "stable_id",
+  });
+  assert.equal(suggestions.actor_exact.requiresSearch, false);
+  assert.deepEqual(suggestions.actor_unique.suggestedTarget, {
+    targetId: "local_unique", name: "Unique name", reason: "unique_name",
+  });
+  assert.equal(suggestions.actor_unique.requiresSearch, false);
+  assert.equal("suggestedTarget" in suggestions.actor_duplicate, false);
+  assert.equal(suggestions.actor_duplicate.requiresSearch, true);
+  assert.equal("suggestedTarget" in suggestions.actor_missing, false);
+  assert.equal(suggestions.actor_missing.requiresSearch, true);
+  assert.equal(target.transactionCount(), 0, "suggestions are preview-only");
 });
 
 test("preview reports deterministic range and step adjustments before importing selected target values", async () => {
@@ -634,10 +857,34 @@ test("copy IDs remain stable and bounded at the maximum portable source-ID lengt
   assert.deepEqual(imported.summary.created, [preview.fields[0].proposedCopyId]);
 });
 
-test("export filenames are path-safe and dependency metadata contains counts but no dependency entities or IDs", async () => {
+test("export filenames are path-safe and dependency metadata contains only bounded readable omission entries", async () => {
   const fixture = createFixture();
   const data = fixture.current();
   data.fields[0].name = "../../\\evil\u0000字段";
+  data.linkRules.push({
+    id: "link_affinity_excite",
+    sourceFieldId: "field_affinity",
+    operator: ">=",
+    sourceThreshold: 50,
+    targetFieldId: "field_excite",
+    effect: { kind: "delta", value: 1 },
+    enabled: true,
+  });
+  data.conditions.push({
+    id: "condition_direct_affinity",
+    name: "Affinity threshold",
+    description: "Nested direct reference",
+    enabled: true,
+    expression: { kind: "and", children: [
+      { kind: "predicate", predicate: { kind: "sender", senders: ["user"] } },
+      { kind: "or", children: [{
+        kind: "predicate",
+        predicate: { kind: "field_comparison", fieldId: "field_affinity", operator: ">=", value: 50 },
+      }] },
+    ] },
+    createdAt: "2033-05-18T03:33:20.000Z",
+    updatedAt: "2033-05-18T03:33:20.000Z",
+  });
   const source = createServiceFrom(data, {
     actors: [{ characterId: "actor_t", name: "角色 T", enabled: true }],
   });
@@ -649,12 +896,82 @@ test("export filenames are path-safe and dependency metadata contains counts but
   assert.equal(exported.fileName.includes(".."), false);
   assert.equal(/[\\/\u0000]/.test(exported.fileName), false);
   const document = JSON.parse(exported.json);
-  assert.deepEqual(Object.keys(document.fields[0].dependencySummary).sort(), [
-    "automationRuleCount", "effectGroupCount", "linkRuleCount",
+  assert.deepEqual(Object.keys(document.fields[0].omittedDependencies).sort(), [
+    "items", "totalCount", "truncated",
   ]);
-  assert.equal(JSON.stringify(document.fields[0].dependencySummary).includes("rule_"), false);
+  assert.equal(document.fields[0].omittedDependencies.totalCount, 5);
+  assert.equal(document.fields[0].omittedDependencies.truncated, false);
+  assert.deepEqual(document.fields[0].omittedDependencies.items.map(({ kind, sourceId, readableName }) => ({
+    kind, sourceId, readableName,
+  })), [
+    { kind: "condition", sourceId: "condition_auto_positive", readableName: "Positive interaction condition" },
+    { kind: "condition", sourceId: "condition_direct_affinity", readableName: "Affinity threshold" },
+    { kind: "effect_group", sourceId: "effect_group_effect_warm", readableName: "Migrated effect effect_warm" },
+    { kind: "link_rule", sourceId: "link_affinity_excite", readableName: "../../\\evil\u0000字段 → Excitement" },
+    { kind: "rule", sourceId: "auto_positive", readableName: "Positive interaction" },
+  ]);
   const forbidden = new Set(["records", "rules", "conditions", "effects", "effectGroups", "dependencies"]);
   for (const key of collectObjectKeys(document)) assert.equal(forbidden.has(key), false, `forbidden entity key ${key}`);
+  for (const key of ["actions", "expression", "fieldEffects", "operations", "conditionId"]) {
+    assert.equal(collectObjectKeys(document).has(key), false, `dependency payload key ${key}`);
+  }
+  const preview = await source.service.previewFieldTemplateImport({ json: exported.json });
+  assert.deepEqual(preview.omittedDependencies, [{
+    fieldId: "field_affinity",
+    totalCount: 5,
+    truncated: false,
+    items: document.fields[0].omittedDependencies.items,
+  }]);
+  assert.deepEqual(preview.invalidReferences, [
+    "OMITTED_DEPENDENCY:field_affinity:condition:condition_auto_positive",
+    "OMITTED_DEPENDENCY:field_affinity:condition:condition_direct_affinity",
+    "OMITTED_DEPENDENCY:field_affinity:effect_group:effect_group_effect_warm",
+    "OMITTED_DEPENDENCY:field_affinity:link_rule:link_affinity_excite",
+    "OMITTED_DEPENDENCY:field_affinity:rule:auto_positive",
+  ]);
+});
+
+test("omitted dependency metadata is deterministically bounded and strict about keys, counts, and text", async () => {
+  const data = createFixture().dataset;
+  data.linkRules = Array.from({ length: 205 }, (_, index) => ({
+    id: `link_limit_${String(index).padStart(3, "0")}`,
+    sourceFieldId: "field_affinity",
+    operator: ">=",
+    sourceThreshold: index % 100,
+    targetFieldId: "field_excite",
+    effect: { kind: "delta", value: 1 },
+    enabled: true,
+  }));
+  const source = createServiceFrom(data, {
+    actors: [{ characterId: "actor_t", name: "角色 T", enabled: true }],
+  });
+  const exported = await source.service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: [],
+  });
+  const dependencies = JSON.parse(exported.json).fields[0].omittedDependencies;
+  assert.equal(dependencies.totalCount, 208);
+  assert.equal(dependencies.truncated, true);
+  assert.equal(dependencies.items.length, 200);
+  assert.deepEqual(dependencies.items[0], {
+    kind: "condition", sourceId: "condition_auto_positive", readableName: "Positive interaction condition",
+  });
+  assert.deepEqual(dependencies.items.at(-1), {
+    kind: "link_rule", sourceId: "link_limit_197", readableName: "Affinity → Excitement",
+  });
+
+  const unknown = mutateAndResign(exported.json, (document) => {
+    document.fields[0].omittedDependencies.items[0].payload = {};
+  });
+  await assert.rejects(source.service.previewFieldTemplateImport({ json: unknown }), /MVU_FIELD_TEMPLATE_UNKNOWN_KEYS/);
+  const badCount = mutateAndResign(exported.json, (document) => {
+    document.fields[0].omittedDependencies.totalCount = 1;
+  });
+  await assert.rejects(source.service.previewFieldTemplateImport({ json: badCount }), /MVU_FIELD_TEMPLATE_DEPENDENCIES_INVALID/);
+  const longText = mutateAndResign(exported.json, (document) => {
+    document.fields[0].omittedDependencies.items[0].readableName = "x".repeat(513);
+  });
+  await assert.rejects(source.service.previewFieldTemplateImport({ json: longText }), /MVU_FIELD_TEMPLATE_TEXT_LIMIT/);
 });
 
 test("typed IPC parsers and client expose strict field-template requests", () => {
@@ -670,6 +987,7 @@ test("typed IPC parsers and client expose strict field-template requests", () =>
     decisions: { fields: [{
       sourceFieldId: "field_affinity",
       strategy: "create_copy",
+      unboundTargets: [{ targetId: "actor_u", enabled: false, valuePolicy: "field_initial" }],
       mappings: [{
         sourceTargetId: "actor_t",
         targets: [{ targetId: "actor_u", enabled: true, valuePolicy: "keep_existing" }],
@@ -812,4 +1130,72 @@ test("native UI bridge dispatches all field-template operations through typed ma
     targetRuntime: "main",
     targetContextKey: "toolpkg_main:com.lcilling.operit_mvu",
   })), true);
+});
+
+test("field-template import composes with the real V3 store CAS path and survives restart", async () => {
+  const configDir = "/field-template-real-store";
+  const v2Path = `${configDir}/operit_mvu.dataset.v2.json`;
+  const v3Path = `${configDir}/operit_mvu.dataset.v3.json`;
+  const legacy = legacyDatasetFixture();
+  const files = createFakeMvuFileApi({ [v2Path]: JSON.stringify(legacy, null, 2) });
+  const createLegacyStore = () => new FileMvuStore({
+    getConfigDir: () => configDir,
+    files,
+    createInitialDataset: () => structuredClone(legacy),
+  });
+  const createStore = () => new V3MvuStore({
+    getConfigDir: () => configDir,
+    files,
+    legacyStore: createLegacyStore(),
+    createInitialDataset: () => structuredClone(legacy),
+    now: () => NOW,
+  });
+  const store = createStore();
+  await store.initialize();
+  const querySource = {
+    readV3: () => store.readV3(),
+    transactV3: (expectedRevision, next, records = []) => store.transactV3(expectedRevision, next, records),
+    queryCommittedRecords: (request) => store.queryRecords(request),
+    async listActors() { return [{ characterId: "actor_t", name: "角色 T", enabled: true }]; },
+    async listGroups() { return []; },
+    async activeContext() { return { chatId: "chat_current", actorId: "actor_t", groupId: null, actorName: "角色 T" }; },
+    migrationStatus: () => store.migrationStatus(),
+  };
+  const service = new MvuQueryService(querySource, { now: () => NOW });
+  const exported = await service.exportFieldTemplate({
+    fieldIds: ["field_affinity"],
+    targetSelections: actorMatrix({ targetId: "actor_t", enabled: true, includeValue: false }),
+  });
+  const preview = await service.previewFieldTemplateImport({ json: exported.json });
+  files.clearOperations();
+  const result = await service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: preview.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [{
+      sourceTargetId: "actor_t",
+      targets: [{ targetId: "actor_t", enabled: true, valuePolicy: "field_initial" }],
+    }] }] },
+  });
+  assert.equal(result.revision, preview.revision + 1);
+  assert.deepEqual(result.summary.created, ["field_affinity_copy"]);
+  assert.equal(files.operations().filter(({ operation, destination }) =>
+    operation === "replaceAtomically" && destination === v3Path).length, 1);
+
+  files.clearOperations();
+  await assert.rejects(service.importFieldTemplate({
+    json: exported.json,
+    expectedRevision: preview.revision,
+    decisions: { fields: [{ sourceFieldId: "field_affinity", mappings: [{
+      sourceTargetId: "actor_t",
+      targets: [{ targetId: "actor_t", enabled: true, valuePolicy: "field_initial" }],
+    }] }] },
+  }), /MVU_STALE_REVISION/);
+  assert.equal(files.operations().some(({ operation }) => operation === "replaceAtomically"), false);
+
+  const restarted = createStore();
+  assert.equal((await restarted.initialize()).mode, "v3");
+  const durable = await restarted.readV3();
+  assert.equal(durable.revision, result.revision);
+  assert.deepEqual(durable.dataset.fields.find(({ id }) => id === "field_affinity_copy").bindingIds, ["actor_t"]);
+  assert.equal(durable.dataset.stateValues["character:actor_t"].field_affinity_copy, 0);
 });
