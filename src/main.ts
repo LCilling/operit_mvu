@@ -2,6 +2,8 @@
 import webContainerScreen from "./ui/web_container/index.ui.js";
 import {
   createRuntime,
+  MvuQueryService,
+  type MvuQuerySource,
   type MvuRuntime,
   type StateScopeContext,
 } from "./mvu/app/index";
@@ -15,6 +17,8 @@ import {
   persistedEventContext,
 } from "./mvu/app/host-context";
 import { HostSystemModelApi } from "./mvu/app/system-model";
+import { migrateDatasetV2ToV3 } from "./mvu/app/migration-v3";
+import { isV3MvuStore } from "./mvu/app/store-v3";
 import {
   installMvuIpc,
   type MvuPageSnapshot,
@@ -26,6 +30,7 @@ const TOOLPKG_ID = "com.lcilling.operit_mvu";
 
 let runtime: MvuRuntime | undefined;
 let systemModel: HostSystemModelApi | undefined;
+let queryService: MvuQueryService | undefined;
 let ipcInstalled = false;
 let persistedMessageTail: Promise<void> = Promise.resolve();
 
@@ -43,11 +48,18 @@ function ensureSystemModel(): HostSystemModelApi {
   return systemModel;
 }
 
+function ensureQueryService(): MvuQueryService {
+  if (queryService !== undefined) return queryService;
+  queryService = new MvuQueryService(createQuerySource());
+  return queryService;
+}
+
 function ensureIpcInstalled(): void {
   if (ipcInstalled) return;
   installMvuIpc(ensureRuntime(), {
     snapshot: buildActiveSnapshot,
     systemModel: ensureSystemModel(),
+    queries: ensureQueryService(),
   });
   ipcInstalled = true;
 }
@@ -241,19 +253,13 @@ async function buildActiveSnapshot(request: SnapshotRequest): Promise<MvuPageSna
     const synchronized = await synchronizeHostSnapshot(hostSnapshot);
     await settleContexts(synchronized.context, synchronized.members);
     const selectedContext = activeContextFromHostSnapshot(hostSnapshot, request.actorId);
-    const snapshot = await ensureRuntime().snapshot(selectedContext);
-    const selectableActorIds = synchronized.members.map((member) => {
-      if (member.actorId === null) throw new Error("MVU_HOST_MEMBER_ACTOR_ID_MISSING");
-      return member.actorId;
-    });
+    const snapshot = await new MvuQueryService(createQuerySource(hostSnapshot, selectedContext)).pageSnapshot();
     const contextOwnerName = hostSnapshot.activeGroup?.name ??
       hostSnapshot.activeCharacter?.name ??
       hostSnapshot.activePrompt?.name ??
       "";
     return {
       ...snapshot,
-      selectableActorIds,
-      groups: hostSnapshot.groups,
       contextLabels: {
         groupName: hostSnapshot.activeGroup?.name ?? null,
         chatName: contextOwnerName.length > 0 ? `${contextOwnerName} 的会话` : "当前会话",
@@ -263,6 +269,64 @@ async function buildActiveSnapshot(request: SnapshotRequest): Promise<MvuPageSna
     console.error("MVU active snapshot failed", error);
     throw error;
   }
+}
+
+function createQuerySource(
+  fixedHostSnapshot?: ToolPkg.ChatContextSnapshot,
+  fixedContext?: StateScopeContext,
+): MvuQuerySource {
+  const activeRuntime = ensureRuntime();
+  const hostSnapshot = async (): Promise<ToolPkg.ChatContextSnapshot> =>
+    fixedHostSnapshot ?? ToolPkg.chatContext.snapshot();
+  return {
+    async readV3() {
+      const status = await activeRuntime.migrationStatus();
+      if (status.mode === "v3" && isV3MvuStore(activeRuntime.store)) {
+        return activeRuntime.store.readV3();
+      }
+      const legacy = await activeRuntime.dataset();
+      const migrated = migrateDatasetV2ToV3(legacy, Date.now()).dataset;
+      migrated.revision = legacy.revision;
+      return { revision: legacy.revision, dataset: migrated };
+    },
+    async transactV3(expectedRevision, next, newRecords = []) {
+      const status = await activeRuntime.migrationStatus();
+      if (status.mode !== "v3" || !isV3MvuStore(activeRuntime.store)) {
+        throw new Error("MVU_V3_MUTATION_UNAVAILABLE_IN_COMPAT_MODE");
+      }
+      return activeRuntime.store.transactV3(expectedRevision, next, newRecords);
+    },
+    async queryCommittedRecords(request) {
+      const status = await activeRuntime.migrationStatus();
+      if (status.mode === "v3" && isV3MvuStore(activeRuntime.store)) {
+        return activeRuntime.store.queryRecords(request);
+      }
+      const records = (await activeRuntime.dataset()).records;
+      const offset = request.offset ?? 0;
+      const ordered = request.direction === "asc" ? records : [...records].reverse();
+      const items = ordered.slice(offset, offset + request.limit);
+      const hasMore = offset + items.length < ordered.length;
+      return {
+        items,
+        loadedCount: items.length,
+        totalCount: ordered.length,
+        hasMore,
+        nextOffset: hasMore ? offset + items.length : null,
+      };
+    },
+    async listActors() {
+      return actorsFromHostSnapshot(await hostSnapshot());
+    },
+    async listGroups() {
+      return (await hostSnapshot()).groups;
+    },
+    async activeContext() {
+      return fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
+    },
+    migrationStatus() {
+      return activeRuntime.migrationStatus();
+    },
+  };
 }
 
 async function synchronizeHostSnapshot(

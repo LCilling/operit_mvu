@@ -36,6 +36,17 @@ const uiNativeMethods = captures(appSource, /callNative\("([A-Za-z][A-Za-z0-9]+)
 const bridgeMethods = captures(bridgeSource, /case "([A-Za-z][A-Za-z0-9]+)"/g);
 const missingBridgeMethods = [...uiNativeMethods].filter((method) => !bridgeMethods.has(method));
 assert.deepEqual(missingBridgeMethods, [], `Native methods without bridge cases: ${missingBridgeMethods.join(", ")}`);
+const requiredV3BridgeMethods = [
+  "queryFields", "queryActors", "queryGroups", "queryRules", "queryConditions",
+  "queryEffectGroups", "queryRecords", "getEntityById",
+  "createCondition", "updateCondition", "copyCondition", "toggleCondition",
+  "deleteCondition", "getConditionReferences",
+  "createEffectGroup", "updateEffectGroup", "copyEffectGroup", "toggleEffectGroup",
+  "deleteEffectGroup", "getEffectGroupReferences",
+  "createRule", "updateRule", "copyRule", "toggleRule", "deleteRule", "getRuleReferences",
+];
+const missingV3BridgeMethods = requiredV3BridgeMethods.filter((method) => !bridgeMethods.has(method));
+assert.deepEqual(missingV3BridgeMethods, [], `NativeMvu v3 bridge is missing: ${missingV3BridgeMethods.join(", ")}`);
 
 const screenMetaBody = objectBody(appSource, "const SCREEN_META = {", "const SCREEN_IDS");
 const rendererBody = objectBody(appSource, "const renderers = {", "function render(");

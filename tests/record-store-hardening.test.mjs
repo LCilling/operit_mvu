@@ -172,8 +172,8 @@ test("the real Tools adapter rejects an unsuccessful atomic-replace result", asy
   assert.equal(files.snapshot()[V3_PATH], undefined);
 });
 
-test("record queries ignore decorated partial reads and slice bounded raw segments locally", async () => {
-  const files = createFakeMvuFileApi({}, { partialReadLineLimit: 1 });
+test("record queries decode decorated partial reads without loading whole segments", async () => {
+  const files = createFakeMvuFileApi({});
   const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
   const staged = await records.stageAppend(
     createEmptyRecordManifest(),
@@ -181,7 +181,7 @@ test("record queries ignore decorated partial reads and slice bounded raw segmen
     1,
   );
   files.clearOperations();
-  files.failNext("readTextPart", () => true, new Error("HOST_DECORATED_PARTIAL_READ_FORBIDDEN"));
+  files.failNext("readText", () => true, new Error("WHOLE_SEGMENT_READ_FORBIDDEN"));
 
   const result = await records.queryRecords(staged.manifest, {
     offset: 1,
@@ -190,8 +190,13 @@ test("record queries ignore decorated partial reads and slice bounded raw segmen
   });
 
   assert.deepEqual(result.items.map(({ id }) => id), ["hardening_record_2", "hardening_record_3"]);
-  assert.equal(files.operations().some(({ operation }) => operation === "readTextPart"), false);
-  assert.equal(files.operations().filter(({ operation }) => operation === "readText").length, 1);
+  assert.deepEqual(files.operations().filter(({ operation }) => operation === "readTextPart"), [{
+    operation: "readTextPart",
+    path: `${RECORD_DIRECTORY}/segment-000001.jsonl`,
+    startLine: 2,
+    endLine: 3,
+  }]);
+  assert.equal(files.operations().some(({ operation }) => operation === "readText"), false);
 });
 
 test("two store instances serialize one path and the stale writer cannot publish", async () => {
@@ -315,10 +320,11 @@ test("normal compatibility reads are bounded independently of 100k-record histor
   const snapshot = await store.read();
 
   assert.equal(snapshot.dataset.records.length <= 500, true);
-  const segmentReads = files.operations().filter((operation) =>
-    operation.operation === "readText" && operation.path.startsWith(`${RECORD_DIRECTORY}/segment-`));
-  assert.equal(segmentReads.length <= 1, true);
-  assert.equal(files.operations().some(({ operation }) => operation === "readTextPart"), false);
+  const segmentPartReads = files.operations().filter((operation) =>
+    operation.operation === "readTextPart" && operation.path.startsWith(`${RECORD_DIRECTORY}/segment-`));
+  assert.equal(segmentPartReads.length <= 1, true);
+  assert.equal(files.operations().some((operation) =>
+    operation.operation === "readText" && operation.path.startsWith(`${RECORD_DIRECTORY}/segment-`)), false);
 });
 
 test("legacy rule edits preserve hidden selectors, targets, references, and shared conditions", async () => {

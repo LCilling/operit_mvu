@@ -1150,11 +1150,13 @@ test("registered production chat hook commits legacy changes, v3 effects, AI rul
 
   const productionReader = createRuntime({ getConfigDir: () => CONFIG_DIR });
   assert.equal((await productionReader.initialize()).mode, "v3");
+  const queryCallStart = fileCalls.length;
   const queried = await productionReader.store.queryRecords({ offset: 0, limit: 10, direction: "asc" });
+  const queryCalls = fileCalls.slice(queryCallStart);
   assert.equal(queried.items.length, 7);
-  assert.equal(fileCalls.some((call) => call.operation === "readPart"), false);
-  assert.equal(fileCalls.some((call) =>
-    call.operation === "read" && call.path.startsWith(`${RECORD_DIRECTORY}/segment-`)), true);
+  assert.equal(queryCalls.some((call) => call.operation === "readPart"), true);
+  assert.equal(queryCalls.some((call) =>
+    call.operation === "read" && call.path.startsWith(`${RECORD_DIRECTORY}/segment-`)), false);
   const compatibility = await productionReader.snapshot({
     chatId: "chat_main", actorId: "T", groupId: null, actorName: "T",
   });
