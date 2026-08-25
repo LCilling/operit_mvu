@@ -50,3 +50,27 @@
 - `git diff --check`: PASS。
 
 本任务不声称进行了真机或 MuMu 测试。
+
+## 3203a9e 复审后的窄范围修复
+
+### 生产修复
+
+- 群组 compact snapshot/IPC 的 `modelBudget` 现在接收与系统 prompt 相同的 `memberContexts`，并直接复用 `MvuService.buildModelStateSection(...).budget`。该链继续使用权威 `readV3()`、精确 scope recency 和同一字段引用图，不再维护单独的单-context UI 预算。
+- v2 AI 规则判断先过滤有效候选，再按 `order`、稳定规则 ID 排序，单次选取前 20 条。超过上限时返回唯一有界诊断 `MVU_AI_RULES_OVERFLOW:<total>:<selected>`；生产消息链记录该诊断，继续状态判断和持久化，不增加模型调用。
+
+### 本轮 RED
+
+- 新增生产组合测试通过真实 `registerToolPkg → prompt hook → snapshot IPC` 运行。旧实现中真实 prompt 已输出 40 行，但 compact budget 为 `used=0,total=0,overflow=false`，预期为 `40/800/true`。
+- 21 条合法 AI 规则直接调用与真实 v2 compatibility 消息事件均以 `MVU_AI_RULE_LIMIT_EXCEEDED` 失败，事件在 `judgeState` 和持久化前中断。
+- 修正测试夹具自身的真实 v2 文件名和合法规则效果后，三个测试均只因上述两个生产缺陷保持 RED。
+
+### 本轮 GREEN 与回归
+
+- 新增目标测试：3/3 PASS。群组 prompt 与 compact/IPC 均为 `used=40,total=800,limit=40,overflow=true`。
+- 21 条规则只产生 1 次 rule completion，候选为稳定前 20 条并返回 `MVU_AI_RULES_OVERFLOW:21:20`；随后产生 1 次 state completion，消息成功持久化。
+- focused model-budget + query：65/65 PASS。
+- related model-budget/condition/query/record-store/rule/host：138/138 PASS。
+- 完整 `pnpm run test:v3`：294/294 PASS。
+- condition DOM：31/31 PASS；field-template DOM：20/20 PASS。
+- `pnpm run typecheck`：PASS；本任务文件 `git diff --check`：PASS。
+- `pnpm run build` 已执行，但当前被共享工作树中授权范围外的规则 UI 审计失败阻断；失败项为 `compact rule rows must show actor, condition and action summaries with view/edit actions`。本修复未修改 static UI、审计脚本、manifest、types 或 artifacts。

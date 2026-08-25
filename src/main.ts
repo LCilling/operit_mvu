@@ -177,14 +177,17 @@ async function processPersistedMessage(
     if (migrationStatus.mode === "v2_compat") {
       const aiRules = await activeRuntime.service.getApplicableAiRules(context, payload.timestamp);
       if (aiRules.length > 0) {
-      const judgement = await ensureSystemModel().judgeRules({
-        context,
-        rules: aiRules,
-        fields,
-        recentFacts,
-        message: trustedMessage,
-      });
-      if (judgement.available) aiRuleJudgements = judgement.judgements;
+        const judgement = await ensureSystemModel().judgeRules({
+          context,
+          rules: aiRules,
+          fields,
+          recentFacts,
+          message: trustedMessage,
+        });
+        if (judgement.diagnostics.length > 0) {
+          console.warn("MVU AI rule judgement diagnostics", ...judgement.diagnostics);
+        }
+        if (judgement.available) aiRuleJudgements = judgement.judgements;
       }
     }
     let aiChanges: Awaited<ReturnType<HostSystemModelApi["judgeState"]>>["changes"] = [];
@@ -347,8 +350,9 @@ function createQuerySource(
       return fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
     },
     async modelBudget() {
-      const context = fixedContext ?? activeContextFromHostSnapshot(await hostSnapshot());
-      return activeRuntime.modelBudget(context);
+      const snapshot = await hostSnapshot();
+      const context = fixedContext ?? activeContextFromHostSnapshot(snapshot);
+      return activeRuntime.modelBudget(context, memberContextsFromHostSnapshot(snapshot));
     },
     migrationStatus() {
       return activeRuntime.migrationStatus();

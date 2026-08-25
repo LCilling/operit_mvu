@@ -18,6 +18,80 @@ import { migrateDatasetV2ToV3 } from "../dist/mvu/app/migration-v3.js";
 const NOW = Date.parse("2033-05-18T03:33:20.000Z");
 const CONFIG_DIR = "/config";
 const RECORD_DIRECTORY = `${CONFIG_DIR}/operit_mvu.records.v3`;
+const V2_PATH = `${CONFIG_DIR}/operit_mvu.dataset.v2.json`;
+
+function installProductionMainHost(t, files, hostSnapshot, registrations, systemModel = {
+  async probe() { return { available: false, reason: "test" }; },
+  async complete() { throw new Error("UNEXPECTED_MODEL_COMPLETION"); },
+}) {
+  const previous = {
+    hasIcons: Object.prototype.hasOwnProperty.call(globalThis, "Icons"),
+    icons: globalThis.Icons,
+    hasToolPkg: Object.prototype.hasOwnProperty.call(globalThis, "ToolPkg"),
+    toolPkg: globalThis.ToolPkg,
+    hasTools: Object.prototype.hasOwnProperty.call(globalThis, "Tools"),
+    tools: globalThis.Tools,
+  };
+  t.after(() => {
+    if (previous.hasIcons) globalThis.Icons = previous.icons;
+    else delete globalThis.Icons;
+    if (previous.hasToolPkg) globalThis.ToolPkg = previous.toolPkg;
+    else delete globalThis.ToolPkg;
+    if (previous.hasTools) globalThis.Tools = previous.tools;
+    else delete globalThis.Tools;
+  });
+
+  const successful = () => ({ successful: true, details: "" });
+  globalThis.Icons = { Favorite: "favorite" };
+  globalThis.Tools = { Files: {
+    async exists(path) { return { exists: await files.exists(path) }; },
+    async read(path) { return { content: await files.readText(path) }; },
+    async readPart(path, startLine, endLine) {
+      return { content: await files.readTextPart(path, startLine, endLine) };
+    },
+    async write(path, content, append = false) {
+      if (append) await files.appendText(path, content);
+      else await files.writeText(path, content);
+      return successful();
+    },
+    async move(source, destination) {
+      await files.move(source, destination);
+      return successful();
+    },
+    async replaceAtomically(source, destination) {
+      await files.replaceAtomically(source, destination);
+      return successful();
+    },
+    async deleteFile(path) {
+      await files.deleteFile(path);
+      return successful();
+    },
+    async mkdir(path) {
+      await files.mkdir(path);
+      return successful();
+    },
+  } };
+  globalThis.ToolPkg = {
+    getConfigDir() { return CONFIG_DIR; },
+    chatContext: {
+      async snapshot() { return structuredClone(hostSnapshot); },
+    },
+    systemModel,
+    ipc: {
+      on(channel, handler) {
+        registrations.ipc ??= {};
+        registrations.ipc[channel] = handler;
+        return () => { delete registrations.ipc[channel]; };
+      },
+      async call() { throw new Error("UNEXPECTED_IPC_CALL"); },
+    },
+    registerUiRoute(definition) { registrations.ui = definition; },
+    registerNavigationEntry(definition) { registrations.navigation = definition; },
+    registerAppLifecycleHook(definition) { registrations.lifecycle = definition; },
+    registerChatMessageHook(definition) { registrations.chat = definition; },
+    registerSystemPromptComposeHook(definition) { registrations.prompt = definition; },
+  };
+}
 
 function field(index, name = `Field ${String(index).padStart(4, "0")}`) {
   const base = legacyDatasetFixture().fields[0];
@@ -803,6 +877,63 @@ test("compact snapshot contains summaries counts and first pages without option 
   assert.equal("actors" in snapshot, false);
   assert.equal("groups" in snapshot, false);
   assert.equal("records" in snapshot, false);
+});
+
+test("production group prompt and snapshot IPC share the same 40-of-800 model budget", async (t) => {
+  const members = Array.from({ length: 20 }, (_, index) => ({
+    characterCardId: `actor_${String(index).padStart(2, "0")}`,
+    name: `Actor ${index}`,
+    avatarUri: null,
+  }));
+  const bindings = members.map((member) => member.characterCardId);
+  const legacy = legacyDatasetFixture();
+  legacy.fields = Array.from({ length: 40 }, (_, index) => ({
+    ...field(index),
+    bindingIds: bindings,
+  }));
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  legacy.stateValues = {};
+  const files = createFakeMvuFileApi({ [V2_PATH]: JSON.stringify(legacy, null, 2) });
+  const hostSnapshot = {
+    chatId: "chat_main",
+    activePrompt: { type: "character_group", id: "group_main", name: "Group" },
+    activeCharacter: null,
+    activeGroup: { characterGroupId: "group_main", name: "Group", avatarUri: null },
+    characters: members,
+    groups: [{ characterGroupId: "group_main", name: "Group", avatarUri: null }],
+    members,
+    currentCharacter: null,
+  };
+  const registrations = {};
+  installProductionMainHost(t, files, hostSnapshot, registrations);
+  const main = await import(`../dist/main.js?group-budget=${Date.now()}`);
+  assert.equal(main.registerToolPkg(), true);
+  assert.deepEqual(await registrations.lifecycle.function(), { ok: true });
+
+  const composed = await registrations.prompt.function({
+    eventName: "system_prompt_compose",
+    eventPayload: {
+      stage: "compose_system_prompt_sections",
+      functionType: "CHAT",
+      promptFunctionType: "CHAT",
+      systemPrompt: "base prompt",
+      chatId: "chat_main",
+    },
+  });
+  const compact = await registrations.ipc[MVU_IPC.snapshot]({ groupId: "group_main" });
+  const promptRows = composed.systemPrompt.split("\n").filter((line) => line.startsWith("- ")).length;
+
+  assert.equal(promptRows, 40);
+  assert.deepEqual(compact.modelBudget, {
+    used: 40,
+    total: 800,
+    limit: 40,
+    referencedIncluded: 0,
+    referencedTotal: 0,
+    overflow: true,
+    diagnostics: [],
+  });
 });
 
 test("status snapshot filters disabled and context-inapplicable fields before taking five", async () => {

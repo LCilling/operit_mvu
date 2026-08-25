@@ -87,7 +87,10 @@ export interface MvuRuntime {
   importDataset(request: DatasetImportRestoreRequest): Promise<DatasetImportRestoreResult>;
   snapshot(context: StateScopeContext): Promise<MvuSnapshotView>;
   buildMvuData(context: StateScopeContext): Promise<ReturnType<typeof buildMvuData>>;
-  modelBudget(context: StateScopeContext): Promise<ModelFieldBudgetStats>;
+  modelBudget(
+    context: StateScopeContext,
+    memberContexts?: readonly StateScopeContext[],
+  ): Promise<ModelFieldBudgetStats>;
   applyCommand(
     context: StateScopeContext,
     commandText: string,
@@ -182,8 +185,8 @@ export function createRuntime(options: RuntimeOptions = {}): MvuRuntime {
       }
       return data;
     },
-    async modelBudget(activeContext) {
-      return (await service.projectModelFields(activeContext)).budget;
+    async modelBudget(activeContext, memberContexts = []) {
+      return (await service.buildModelStateSection(activeContext, memberContexts)).budget;
     },
     async applyCommand(activeContext, commandText, audit) {
       return service.applyCommand(activeContext, commandText, audit);
