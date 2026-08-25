@@ -96,7 +96,7 @@
     },
     demoCursorSequence: 0,
     demoCursors: new Map(),
-    demoStore: { revision: 7, fields: null, fieldSequence: 0 },
+    demoStore: { revision: 7, fields: null, fieldSequence: 0, stateValues: {} },
     demoLastRequests: {},
     demoLastFieldTemplateJson: "",
     demoNextFailureMethod: "",
@@ -158,6 +158,11 @@
     };
     return {
       call(method, params) {
+        try {
+          validateNativeMutationRequest(method, params || {});
+        } catch (error) {
+          return Promise.reject(error);
+        }
         if (state.demo) return Promise.resolve().then(function () { return demoCall(method, params || {}); });
         if (!window.NativeMvu || typeof window.NativeMvu.call !== "function") {
           return Promise.reject(new Error("MVU_NATIVE_BRIDGE_UNAVAILABLE"));
@@ -208,6 +213,15 @@
 
   function requireFinite(value, code) {
     if (!finiteNumber(value)) throw new Error(code);
+  }
+
+  function validateNativeMutationRequest(method, params) {
+    if (method === "createEffectGroup" && isRecord(params.effectGroup)) {
+      validateEffectReasonConfig(params.effectGroup.defaultReason, 512);
+    }
+    if (method === "updateEffectGroup" && isRecord(params.patch) && params.patch.defaultReason !== undefined) {
+      validateEffectReasonConfig(params.patch.defaultReason, 512);
+    }
   }
 
   function validateQueryResponse(value, methodOrLabel, request, cursorState) {
@@ -509,19 +523,20 @@
     if (!Array.isArray(effect.fieldEffects) || effect.fieldEffects.length === 0) throw new Error("MVU_EFFECT_GROUP_INVALID");
     requireString(effect.createdAt, "MVU_EFFECT_GROUP_INVALID");
     requireString(effect.updatedAt, "MVU_EFFECT_GROUP_INVALID");
-    validateEffectReasonConfig(effect.defaultReason);
+    validateEffectReasonConfig(effect.defaultReason, 16384);
     if (effect.defaultDuration !== undefined) validateEffectDuration(effect.defaultDuration);
     effect.fieldEffects.forEach(validateFieldEffect);
   }
 
-  function validateEffectReasonConfig(reason) {
+  function validateEffectReasonConfig(reason, maximumLength) {
     const code = "MVU_EFFECT_REASON_CONFIG_INVALID";
+    const textLimit = Number.isSafeInteger(maximumLength) ? maximumLength : 16384;
     if (!isRecord(reason)) throw new Error(code);
     const keys = Object.keys(reason).sort();
     if (keys.length !== 3 || keys[0] !== "mode" || keys[1] !== "template" || keys[2] !== "text") throw new Error(code);
     if (!["template", "custom"].includes(reason.mode) ||
         !["general", "positive", "negative", "environment", "relationship"].includes(reason.template) ||
-        typeof reason.text !== "string" || reason.text.length > 512 ||
+        typeof reason.text !== "string" || reason.text.length > textLimit ||
         (reason.mode === "custom" && reason.text.trim().length === 0)) {
       throw new Error(code);
     }
@@ -747,6 +762,10 @@
       ? draft.stages.map(function (stage, index) { return { ...stage, id: stage.id || "stage-" + (index + 1) }; })
       : [{ id: "stage-1", name: "初始", description: "", threshold: Number(draft.minimum) || 0 }];
     draft.chatAutoBind = draft.scope === "chat" && Boolean(currentChatId && draft.bindingIds.includes(currentChatId));
+    draft.chatBindingSearch = "";
+    draft.chatBindingPage = 1;
+    draft.chatBindingsOpen = false;
+    draft.manualChatBindingId = "";
     state.fieldEditorDraft = draft;
     return draft;
   }
@@ -1562,49 +1581,138 @@
     };
   }
 
-  function demoImportFieldTemplate(_demo, request) {
+  function demoImportFieldTemplate(demo, request) {
     if (request.expectedRevision !== state.demoStore.revision) throw new Error("MVU_STALE_REVISION");
     const document = JSON.parse(request.json);
+    if (!document || document.format !== "operit-mvu-field-template" || document.schemaVersion !== 1 || !Array.isArray(document.fields)) {
+      throw new Error("MVU_FIELD_TEMPLATE_FORMAT_INVALID");
+    }
+    if (!request.decisions || !Array.isArray(request.decisions.fields) || request.decisions.fields.length !== document.fields.length) {
+      throw new Error("MVU_FIELD_TEMPLATE_DECISIONS_INVALID");
+    }
+    const decisionById = new Map(request.decisions.fields.map(function (decision) { return [decision.sourceFieldId, decision]; }));
+    if (decisionById.size !== document.fields.length || document.fields.some(function (entry) { return !decisionById.has(entry.sourceFieldId); })) {
+      throw new Error("MVU_FIELD_TEMPLATE_DECISIONS_INVALID");
+    }
     const summary = { created: [], updated: [], replaced: [], skippedTargets: 0, valueWrites: 0 };
-    const occupied = new Set(state.demoStore.fields.map(function (field) { return field.id; }));
+    const draftFields = JSON.parse(JSON.stringify(state.demoStore.fields));
+    const draftValues = JSON.parse(JSON.stringify(state.demoStore.stateValues || {}));
+    const virtualFields = demo.pickerFields || [];
+    const occupied = new Set(draftFields.concat(virtualFields).map(function (field) { return field.id; }));
+    const actorIds = new Set(demo.actors.concat(demo.pickerActors).map(function (actor) { return actor.characterId; }));
+    const groupIds = new Set(demo.groups.concat(demo.pickerGroups).map(function (group) { return group.characterGroupId; }));
     document.fields.forEach(function (entry) {
-      const decision = request.decisions.fields.find(function (item) { return item.sourceFieldId === entry.sourceFieldId; }) || { mappings: [] };
+      const decision = decisionById.get(entry.sourceFieldId);
       const strategy = decision.strategy || "create_copy";
-      const existingIndex = state.demoStore.fields.findIndex(function (field) { return field.id === entry.sourceFieldId; });
+      if (!["create_copy", "update", "replace"].includes(strategy)) throw new Error("MVU_FIELD_TEMPLATE_STRATEGY_INVALID");
+      const existingIndex = draftFields.findIndex(function (field) { return field.id === entry.sourceFieldId; });
+      const virtualExisting = virtualFields.find(function (field) { return field.id === entry.sourceFieldId; });
+      const local = existingIndex >= 0 ? draftFields[existingIndex] : virtualExisting || null;
+      if ((strategy === "update" || strategy === "replace") && !local) throw new Error("MVU_FIELD_TEMPLATE_CONFLICT_REQUIRED");
+      if (strategy === "update") {
+        if (decision.unboundTargets !== undefined || (decision.mappings || []).length > 0) {
+          throw new Error("MVU_FIELD_TEMPLATE_MAPPING_SCOPE_INVALID");
+        }
+        if (local.scope !== entry.definition.scope) throw new Error("MVU_FIELD_TEMPLATE_UPDATE_SCOPE_MISMATCH");
+        const updated = { ...JSON.parse(JSON.stringify(entry.definition)), id: local.id, bindingIds: local.bindingIds.slice(), order: local.order };
+        if (existingIndex >= 0) draftFields[existingIndex] = updated;
+        else draftFields.push(updated);
+        summary.updated.push(updated.id);
+        return;
+      }
       const id = strategy === "create_copy" ? demoCopyId(entry.sourceFieldId, occupied) : entry.sourceFieldId;
-      const targets = [];
-      (decision.unboundTargets || []).forEach(function (target) { targets.push(target); });
-      (decision.mappings || []).forEach(function (mapping) {
-        mapping.targets.forEach(function (target) { targets.push(target); });
-      });
-      const enabledTargets = targets.filter(function (target) { return target.enabled; });
-      summary.skippedTargets += targets.length - enabledTargets.length;
-      summary.valueWrites += enabledTargets.filter(function (target) { return target.valuePolicy === "template_value"; }).length;
-      const local = existingIndex >= 0 ? state.demoStore.fields[existingIndex] : null;
-      const bindingIds = strategy === "update" && local
-        ? local.bindingIds.slice()
-        : Array.from(new Set(enabledTargets.map(function (target) { return target.targetId; })));
+      const resolved = demoResolveTemplateTargets(entry, decision, actorIds, groupIds, summary);
+      const bindingIds = entry.definition.scope === "chat"
+        ? [demo.snapshot.activeContext.chatId].filter(Boolean)
+        : entry.definition.scope === "global" ? [] : resolved.bindingIds;
       const next = {
         ...JSON.parse(JSON.stringify(entry.definition)),
         id,
         bindingIds,
-        order: local ? local.order : state.demoStore.fields.length,
+        order: local ? local.order : draftFields.length,
       };
-      if (strategy === "update" && local) {
-        state.demoStore.fields[existingIndex] = { ...next, bindingIds: local.bindingIds.slice(), order: local.order };
-        summary.updated.push(id);
-      } else if (strategy === "replace") {
-        if (existingIndex >= 0) state.demoStore.fields[existingIndex] = next;
-        else state.demoStore.fields.push(next);
+      if (strategy === "replace") {
+        if (existingIndex >= 0) draftFields[existingIndex] = next;
+        else draftFields.push(next);
+        Object.keys(draftValues).forEach(function (scopeKey) { delete draftValues[scopeKey][id]; });
         summary.replaced.push(id);
       } else {
-        state.demoStore.fields.push(next);
+        draftFields.push(next);
         summary.created.push(id);
       }
+      resolved.writes.forEach(function (write) {
+        const scopeKey = entry.definition.scope + ":" + write.targetId;
+        const existingValue = ((state.demoStore.stateValues || {})[scopeKey] || {})[entry.sourceFieldId];
+        const value = write.valuePolicy === "template_value"
+          ? demoNormalizeTemplateValue(next, write.templateValue)
+          : write.valuePolicy === "keep_existing" && existingValue !== undefined ? existingValue : next.initialValue;
+        draftValues[scopeKey] = draftValues[scopeKey] || {};
+        draftValues[scopeKey][id] = value;
+        summary.valueWrites += 1;
+      });
       occupied.add(id);
     });
+    state.demoStore.fields = draftFields;
+    state.demoStore.stateValues = draftValues;
     state.demoStore.revision += 1;
     return { revision: state.demoStore.revision, summary };
+  }
+
+  function demoResolveTemplateTargets(entry, decision, actorIds, groupIds, summary) {
+    const scope = entry.definition.scope;
+    if (scope !== "character" && scope !== "group") {
+      if (decision.unboundTargets !== undefined || (decision.mappings || []).length > 0) {
+        throw new Error("MVU_FIELD_TEMPLATE_MAPPING_SCOPE_INVALID");
+      }
+      return { bindingIds: [], writes: [] };
+    }
+    const validIds = scope === "group" ? groupIds : actorIds;
+    const sourceTargets = entry.sourceTargets || [];
+    let targetGroups;
+    if (sourceTargets.length === 0) {
+      if ((decision.mappings || []).length > 0 || !Array.isArray(decision.unboundTargets) || decision.unboundTargets.length === 0) {
+        throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TARGETS_REQUIRED");
+      }
+      targetGroups = [{ source: null, targets: decision.unboundTargets }];
+    } else {
+      if (decision.unboundTargets !== undefined || !Array.isArray(decision.mappings) || decision.mappings.length !== sourceTargets.length) {
+        throw new Error("MVU_FIELD_TEMPLATE_MAPPING_MISSING");
+      }
+      const mappingBySource = new Map(decision.mappings.map(function (mapping) { return [mapping.sourceTargetId, mapping]; }));
+      if (mappingBySource.size !== sourceTargets.length || sourceTargets.some(function (source) { return !mappingBySource.has(source.sourceId); })) {
+        throw new Error("MVU_FIELD_TEMPLATE_MAPPING_MISSING");
+      }
+      targetGroups = sourceTargets.map(function (source) {
+        return { source, targets: mappingBySource.get(source.sourceId).targets };
+      });
+    }
+    const seen = new Set();
+    const bindingIds = [];
+    const writes = [];
+    targetGroups.forEach(function (group) {
+      if (!Array.isArray(group.targets)) throw new Error("MVU_FIELD_TEMPLATE_MAPPING_INVALID");
+      group.targets.forEach(function (target) {
+        if (!target || typeof target.targetId !== "string" || seen.has(target.targetId)) {
+          throw new Error("MVU_FIELD_TEMPLATE_MAPPING_DUPLICATE");
+        }
+        seen.add(target.targetId);
+        if (!validIds.has(target.targetId)) throw new Error("MVU_FIELD_TEMPLATE_MAPPING_TARGET_INVALID:" + target.targetId);
+        if (!["template_value", "keep_existing", "field_initial"].includes(target.valuePolicy)) {
+          throw new Error("MVU_FIELD_TEMPLATE_VALUE_POLICY_INVALID");
+        }
+        if (!group.source && target.valuePolicy === "template_value") throw new Error("MVU_FIELD_TEMPLATE_UNBOUND_TEMPLATE_VALUE_INVALID");
+        if (group.source && target.valuePolicy === "template_value" && group.source.value === undefined) {
+          throw new Error("MVU_FIELD_TEMPLATE_VALUE_MISSING");
+        }
+        if (!target.enabled) {
+          summary.skippedTargets += 1;
+          return;
+        }
+        bindingIds.push(target.targetId);
+        writes.push({ ...target, templateValue: group.source ? group.source.value : undefined });
+      });
+    });
+    return { bindingIds, writes };
   }
 
   function demoCopyId(sourceId, occupied) {

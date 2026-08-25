@@ -187,6 +187,8 @@ requireMatch(files["pages-config.js"], /scopeButton\("chat"[\s\S]*?bindCurrentCh
   "conversation scope must default to readable current-chat binding with collapsed advanced controls");
 requireMatch(files["app.js"], /saveFieldEditor[\s\S]*?addField[\s\S]*?updateField[\s\S]*?loadSnapshot[\s\S]*?config-fields/,
   "field create/update must save through native IPC and reload the authoritative five-row list");
+requireMatch(files["app.js"], /saveFieldEditor[\s\S]*?draft\.submitting[\s\S]*?draft\.mutationCommitted[\s\S]*?finishCommittedFieldSave[\s\S]*?reloadFieldListAfterSave/,
+  "field save must lock duplicate submissions and separate committed mutations from refresh recovery");
 requireMatch(files["app.js"], /previewFieldTemplateImport[\s\S]*?previewRevision[\s\S]*?importFieldTemplate/,
   "field-template import must retain preview revision through preview and atomic commit");
 requireMatch(files["pages-config.js"], /all_on[\s\S]*?全部启用[\s\S]*?all_off[\s\S]*?全部停用[\s\S]*?file_suggestion[\s\S]*?采用文件建议/,
@@ -195,6 +197,16 @@ requireMatch(files["pages-config.js"], /不会按源 ID 静默覆盖/,
   "field-template export must explain that source IDs are only mapping suggestions");
 requireMatch(files["app.js"], /refreshFieldTemplatePreview[\s\S]*?loadFieldTemplatePreview\(flow,\s*true\)[\s\S]*?STALE_REVISION/,
   "stale field-template imports must visibly re-preview the same file before retry");
+requireMatch(files["app.js"], /retainedImportMappings[\s\S]*?ui\.getEntity[\s\S]*?droppedMappingCount[\s\S]*?mapping_removed/,
+  "stale field-template refresh must revalidate local mapping existence and report removals");
+requireMatch(files["app.js"], /assignedElsewhere[\s\S]*?validateUniqueImportMappings[\s\S]*?被重复映射/,
+  "field-template mappings must prevent and centrally reject duplicate local targets per field");
+requireMatch(files["pages-config.js"], /TEMPLATE_PAGE_SIZE\s*=\s*5[\s\S]*?data-template-search[\s\S]*?data-template-count[\s\S]*?显示 [\s\S]*?共 /,
+  "every high-cardinality template view must use searchable five-row windows with explicit counts");
+requireMatch(files["pages-config.js"], /高级绑定设置[\s\S]*?chatBindingSearch[\s\S]*?data-chat-binding-count[\s\S]*?manualChatBindingId/,
+  "conversation advanced binding management must remain bounded searchable and manually addressable");
+requireMatch(files["app.js"], /bindCurrentChat[\s\S]*?bindingIds\.push\(chatId\)[\s\S]*?bindingIds\.filter[\s\S]*?id !== chatId/,
+  "current-conversation toggle must add or remove only the active chat binding");
 requireMatch(files["pages-config.js"], /data-repair-categories/,
   "field-template preview and result must render categorized repair work");
 requireMatch(files["app.js"], /规则[\s\S]*?条件[\s\S]*?状态联动[\s\S]*?临时效果[\s\S]*?其他无效引用/,
@@ -203,6 +215,8 @@ requireMatch(files["runtime.js"], /if\s*\(method === "addField"\)[\s\S]*?if\s*\(
   "demo native must implement real field create/update responses");
 requireMatch(files["runtime.js"], /if\s*\(method === "exportFieldTemplate"\)[\s\S]*?if\s*\(method === "previewFieldTemplateImport"\)[\s\S]*?if\s*\(method === "importFieldTemplate"\)/,
   "demo native must implement field CRUD and real field-template preview/export/import responses");
+requireMatch(files["runtime.js"], /demoImportFieldTemplate[\s\S]*?draftValues[\s\S]*?state\.demoStore\.stateValues[\s\S]*?demoResolveTemplateTargets[\s\S]*?template_value[\s\S]*?keep_existing[\s\S]*?field_initial/,
+  "demo field-template import must atomically persist all exact value policies");
 requireMatch(index, /id="fieldTemplateImportPicker"[^>]*type="file"[^>]*application\/json/,
   "field-template import needs its own JSON file input");
 requireMatch(files["app.js"], /fieldTemplateImportPicker\.value\s*=\s*""/,
@@ -217,8 +231,12 @@ requireMatch(files["app.js"], /field-template-layer[\s\S]*?restoreFocusDescripto
   "field-template overlay clicks must stay inside and closing must restore its logical opener");
 requireMatch(styles, /\.template-step[\s\S]*?transition:[\s\S]*?(?:180|200|220)ms/,
   "field-template step changes need a short purposeful transition");
-requireMatch(files["runtime.js"], /validateEffectReasonConfig\(effect\.defaultReason\)[\s\S]*?keys\.length !== 3[\s\S]*?reason\.text\.length > 512/,
-  "complete effect-group DTOs must fail closed without an exact bounded defaultReason");
+requireMatch(files["runtime.js"], /validateEffectReasonConfig\(effect\.defaultReason,\s*16384\)[\s\S]*?keys\.length !== 3[\s\S]*?reason\.text\.length > textLimit/,
+  "complete effect-group response DTOs must fail closed while accepting the legacy persisted reason boundary");
+requireMatch(files["runtime.js"], /validateNativeMutationRequest[\s\S]*?createEffectGroup[\s\S]*?updateEffectGroup[\s\S]*?validateEffectReasonConfig\([^\n]*512\)/,
+  "effect-group create and update requests must retain the 512-character editor boundary");
+requireMatch(files["app.js"] + files["pages-config.js"], /loading:\s*true[\s\S]*?flow\.loading\s*=\s*false[\s\S]*?flow\.loading\s*\?\s*"progress_activity"\s*:\s*"error"/,
+  "field-template loading state must stay separate from inline error state");
 requireMatch(files["pages-rules.js"], /rule-summary[\s\S]*?触发角色[\s\S]*?触发条件[\s\S]*?触发结果[\s\S]*?>查看<[\s\S]*?>修改</,
   "compact rule rows must show actor, condition and action summaries with view/edit actions");
 requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,
