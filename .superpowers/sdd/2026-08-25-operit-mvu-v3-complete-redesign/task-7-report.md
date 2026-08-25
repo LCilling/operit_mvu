@@ -8,6 +8,9 @@ Task 7 is implemented on `codex/mvu-v3-complete-redesign`.
 - Review fix A: `4129d58` — runtime contracts, validated DTO recovery, group projection and app-owned navigation.
 - Review fix B: `139d4d2` — range/stage restoration, context-first paging and bounded field-detail records.
 - Review fix C: `d37e64e` — mobile accessibility, focus/transition behavior, avatar/background hardening and responsive audits.
+- Final fix A: `d9240f9` — transactional group/actor projection, recursive DTO validation, context-aware demo data and real UTF-8 build-byte reporting.
+- Final fix B: `604163b` — one-time crash-safe legacy record-index backfill with CAS publication and fail-closed filtered queries.
+- Final fix C: `ef61492` — whitespace range validation, targeted reduced-motion behavior, stage-label collision handling and malformed-host browser coverage.
 - Subject: `feat: rebuild MVU four-section UI shell`
 - Base: `ab6d927`
 - Release metadata/version: unchanged by this task.
@@ -16,7 +19,7 @@ The old 4,479-line monolithic UI was replaced by a shared runtime, component lay
 
 ## Independent-review remediation
 
-The Task 7 review fixes were delivered as three focused code commits.
+The first Task 7 review remediation was delivered as three focused code commits.
 
 1. Runtime contracts/navigation (`4129d58`): import sends `{json}`, export consumes `{fileName,savedPath}`, group selection reloads an authoritative group snapshot and member directory, direct child back stays inside the app-owned route tree, and every compact/query DTO kind has structural validation plus recovery UI.
 2. Range/stage/context (`139d4d2`): restored dirty/disabled range editing, finite/min-max/precision/stage-spacing checks and proportional preview; status filtering now precedes five-item paging; field detail requests records by exact `fieldId + scopeKey`, page size 10, while indexed 100,000-record storage reads remain bounded.
@@ -77,7 +80,7 @@ git diff --check
 - Self-contained build: PASS, `dist/app.html` contains the modules in dependency order and no external script/style/asset reference.
 - TypeScript: PASS.
 - Temporary-effect regression audit: PASS.
-- Full Node suite after review remediation: `149` passed / `0` failed.
+- Full Node suite after final review remediation: `162` passed / `0` failed.
 - `git diff --check`: PASS.
 
 The persistence suite continues to print its intentional failure-injection diagnostics while all assertions pass.
@@ -107,7 +110,21 @@ The review-remediation pass then exercised the production build at `320`, `360`,
 - Drawer: first control receives focus; forward/reverse Tab wrap; Escape closes and restores focus to `打开菜单`.
 - Segmented controls: ArrowLeft/ArrowRight changes selection and restores focus after asynchronous group reload; reason mode switches its owned panel.
 - One Impeccable detector pass over all production UI targets returned `[]`.
-- Self-contained bundle: `9,150,635` bytes.
+- Self-contained bundle: `9,176,851` UTF-8 bytes.
+
+## Final review closure
+
+The last seven review findings were closed with TDD in three additional focused code commits (`d9240f9`, `604163b`, `ef61492`).
+
+- Initial group-chat character mode requests the actor directory with the active `groupId`. A group-to-character transition without valid actor history now resolves the selected group's members first, selects the first valid member, and publishes only the matching actor snapshot. Browser proof used distinct projections: Operit `48`, group A `72`, group B `86`, and Bob `31`; no stale group card remained after switching back.
+- Snapshot, query and entity validation now descends through every stage, rule action, field effect, operation and recursive condition node (bounded to depth 12). Malformed `actions: [null]`, `stages: [null]`, `expression: {}`, record, actor, group and wrong-kind entity payloads all fail closed into recovery.
+- Startup validation backfills missing legacy-v3 `filterCounts` once, publishes through exact revision/manifest CAS, and is retry-safe. The six-segment regression fixture produced an exact filtered total of `500`; after backfill, the page query read only the required sixth segment. A failed publication reports indexing pending and performs zero filtered segment scans.
+- Empty and whitespace-only range inputs remain invalid before number coercion. The save action stays disabled, preview renders `换算后 —`, and the inline error is `请输入有效的上下限数值。`.
+- Reduced motion now disables only spatial route, drawer, control and view-transition motion. It retains immediate selected-state and focus feedback and contains no blanket selector or `0.01ms` override.
+- The final browser matrix covered five routes at `320`, `360`, `393`, and `430` CSS pixels at real `100%` and `130%` text scaling (`40` cases). Measured body fonts were `14px` and `18.2px`; maximum document/app overflow, clipped actions, off-screen controls and unexpected recovery states were all `0`.
+- Nonuniform stages `0 / 7 / 42 / 91` retained exact normalized horizontal anchors, with zero label collisions at `320px / 130%`. Field-detail card gaps measured `12px`, including stage to trend.
+- A malformed NativeMvu record rendered `数据无法载入`, exposed the retry action, and rendered zero status cards.
+- Final gates: `pnpm run check` PASS (`162/162`), `pnpm run build` PASS (`9,176,851` bytes), `git diff --check` PASS, and the single final Impeccable detector run returned `[]`.
 
 ## Architecture and behavior
 
