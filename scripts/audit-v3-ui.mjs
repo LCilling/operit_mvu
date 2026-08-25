@@ -132,6 +132,61 @@ requireMatch(allUi, /数据无法载入[\s\S]*?重新加载|页面数据有误[\
   "malformed snapshots and queries need readable recovery actions");
 requireMatch(files["runtime.js"], /validateQueryResponse/,
   "bounded query responses must be validated before rendering");
+requireMatch(files["runtime.js"], /openEntityPicker[\s\S]*?searchEntityPicker[\s\S]*?fetchNextEntityPickerPage/,
+  "runtime must export one searchable cursor picker contract");
+requireMatch(files["runtime.js"], /PICKER_SEARCH_DEBOUNCE_MS\s*=\s*180/,
+  "picker search must use the exact 180ms debounce");
+requireMatch(files["runtime.js"], /requestToken[\s\S]*?token\s*!==[\s\S]*?requestToken/,
+  "picker must discard stale async responses by request token");
+requireMatch(files["runtime.js"], /PICKER_RESULT_LIMIT\s*=\s*60[\s\S]*?slice\(-PICKER_RESULT_LIMIT\)/,
+  "picker result DOM must remain bounded while cursor batches append");
+requireMatch(files["components.js"], /role="dialog"[\s\S]*?data-picker-search[\s\S]*?data-picker-results/,
+  "picker must render as a searchable dialog with a bounded result region");
+requireMatch(files["components.js"], /picker-pinned[\s\S]*?已选择/,
+  "picker must keep selected entities visibly pinned");
+requireMatch(files["components.js"], /selectedIdList\.slice\(0,\s*pinnedLimit\)[\s\S]*?aria-label="另 [\s\S]*?项已选择/,
+  "picker must bound pinned DOM and expose an accessible hidden-selection summary");
+requireMatch(files["app.js"], /openEntityPicker\([\s\S]*?opener:\s*element/,
+  "picker must retain its logical opener instead of relying on transient document focus");
+requireMatch(files["runtime.js"], /restoreFocusDescriptor[\s\S]*?querySelectorAll\("\[data-action\]"\)[\s\S]*?candidate\.dataset\.pickerKey/,
+  "picker close must resolve the stable logical opener after shell rerender");
+requireMatch(files["app.js"], /open-field-picker[\s\S]*?ui\.openEntityPicker/,
+  "field selector actions must call the shared entity picker");
+requireMatch(files["app.js"], /open-actor-picker[\s\S]*?ui\.openEntityPicker/,
+  "actor selector actions must call the shared entity picker");
+requireMatch(files["app.js"], /open-condition-picker[\s\S]*?ui\.openEntityPicker/,
+  "condition selector actions must call the shared entity picker");
+requireMatch(files["app.js"], /open-effect-picker[\s\S]*?ui\.openEntityPicker/,
+  "effect selector actions must call the shared entity picker");
+requireMatch(files["app.js"], /data-picker-results[\s\S]*?fetchNextEntityPickerPage/,
+  "picker must auto-fetch its cursor near the scroll boundary");
+requireMatch(files["app.js"], /entityPicker[\s\S]*?Escape[\s\S]*?Tab/,
+  "picker must support Escape and trapped keyboard focus");
+rejectMatch(allUi, /加载更多/,
+  "large lists and pickers must not expose load-more copy or actions");
+rejectMatch(allUi, /<select[^>]*>[\s\S]{0,800}(?:fields|字段列表|allFields)/i,
+  "field selectors must not populate a select with an unbounded field collection");
+requireMatch(files["components.js"], /const counts\s*=\s*filtered[\s\S]*?匹配[\s\S]*?\/ 共 [\s\S]*?allCount[\s\S]*?本页/,
+  "list counts must distinguish the matched total from the authoritative all total");
+requireMatch(files["pages-config.js"] + files["pages-rules.js"] + files["pages-status.js"],
+  /snapshot\.counts\.fields[\s\S]*?snapshot\.counts\[pageCountKey\(route\)\][\s\S]*?snapshot\.counts\.records/,
+  "field, rule, condition, effect and record counts must source all totals from the compact snapshot");
+requireMatch(files["runtime.js"], /demoPickerSlowSearch[\s\S]*?demoPickerFailSearch[\s\S]*?length:\s*96[\s\S]*?pickerFields/,
+  "browser demo must expose deterministic high-cardinality picker delay and failure controls");
+requireMatch(files["runtime.js"], /"config-fields":\s*\{[\s\S]*?method:\s*"queryFields"[\s\S]*?pageSize:\s*5/,
+  "field management must use the server-owned five-row policy");
+requireMatch(files["runtime.js"], /"rule-library":\s*\{[\s\S]*?method:\s*"queryRules"[\s\S]*?pageSize:\s*5/,
+  "rule management must use the server-owned five-row policy");
+requireMatch(files["runtime.js"], /"condition-library":\s*\{[\s\S]*?method:\s*"queryConditions"[\s\S]*?pageSize:\s*10/,
+  "condition management must use the server-owned ten-row policy");
+requireMatch(files["runtime.js"], /"effect-library":\s*\{[\s\S]*?method:\s*"queryEffectGroups"[\s\S]*?pageSize:\s*10/,
+  "effect management must use the server-owned ten-row policy");
+requireMatch(files["runtime.js"], /records:\s*\{[\s\S]*?method:\s*"queryRecords"[\s\S]*?pageSize:\s*10/,
+  "records must use the server-owned ten-row policy");
+requireMatch(files["pages-config.js"], /management-summary[\s\S]*?当前值[\s\S]*?数值范围[\s\S]*?>查看<[\s\S]*?>修改</,
+  "compact field rows must show scope, binding, value/range, status, view and edit actions");
+requireMatch(files["pages-rules.js"], /rule-summary[\s\S]*?触发角色[\s\S]*?触发条件[\s\S]*?触发结果[\s\S]*?>查看<[\s\S]*?>修改</,
+  "compact rule rows must show actor, condition and action summaries with view/edit actions");
 requireMatch(files["runtime.js"], /validateConditionExpression[\s\S]*?depth\s*>\s*12/,
   "condition DTO validation must recurse with a hard depth bound");
 requireMatch(files["runtime.js"], /loadDirectory\(state\.snapshot\s*&&\s*state\.snapshot\.activeContext\.groupId\)/,

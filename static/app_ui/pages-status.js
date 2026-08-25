@@ -68,11 +68,12 @@
 
   function recordsPage() {
     const page = ui.state.pages.records;
+    const view = ui.state.listViews.records;
     return '<div class="records-page">' + c.sectionHeading("变化记录", "每页 10 条，按最新变化排列") +
-      c.listMeta(page, "条") + (page.items.length
+      c.listMeta(page, "条记录", view.page, 10, ui.state.snapshot.counts.records, c.listViewFiltered(view)) + (page.items.length
         ? '<div class="record-list">' + page.items.map(c.recordRow).join("") + "</div>"
         : c.emptyState("history", "还没有变化记录", "字段发生变化后，会在这里显示原因和时间。")) +
-      c.pagination(page, "records", 1) + "</div>";
+      c.pagination(page, "records", view.page) + "</div>";
   }
 
   function currentStageFor(field, value) {
