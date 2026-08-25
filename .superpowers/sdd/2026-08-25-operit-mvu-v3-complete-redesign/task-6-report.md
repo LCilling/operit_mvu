@@ -240,3 +240,51 @@ The failure-injection diagnostics printed by record-store tests remain expected 
 - Compact summaries cap abnormal legacy identifiers as well as labels. Normal host UUIDs and generated v3 identifiers fit the bound; an imported identifier that itself requires truncation is surfaced with `truncated: true` and remains a legacy-repair case rather than silently expanding the snapshot.
 - Cursor state remains runtime-local, capped and expiring; restart invalidates outstanding cursors, and host directory totals may change because the host exposes no directory revision.
 - Arbitrary record-body search remains fail-closed to preserve the 100,000-record bounded-I/O guarantee.
+
+## Final Task 6 identity-preservation fix
+
+The prior residual statement that compact summaries could truncate abnormal identifiers is superseded by this final fix. Identity, reference and protocol fields are now never truncated. The production and regression-test change is committed as:
+
+- `d2b957f` — preserve exact snapshot identities/protocol values, make URI omission atomic, and reduce summary cardinality under byte pressure.
+
+### TDD RED evidence
+
+```text
+node --test --test-name-pattern="compact snapshot preserves|snapshot avatar URIs|snapshot byte pressure|multi-megabyte legacy labels" tests/query.test.mjs
+```
+
+- `0` passed / `4` failed.
+- Two field IDs sharing the first 40 characters collapsed to the same summary ID.
+- A valid URI below the intended byte cap was returned as a broken prefix.
+- Budget-pressure metadata was absent and structured fields were truncated instead of reducing summaries.
+- The retained 2,000,000-character fixture returned a giant URI prefix rather than an atomic unavailable value.
+
+### Final behavior
+
+1. Entity/stage/record IDs, condition/effect/field references, actor/group/chat/binding identities, scope keys, revisions, cursor tokens, ISO timestamps, icons, migration error codes and theme colors preserve their exact values. A 41st-character collision test proves summary uniqueness and uses the returned summary ID for a successful `getEntityById` round trip.
+2. Actor and group avatar URIs have an explicit `MVU_SNAPSHOT_URI_MAX_BYTES = 2,048` UTF-8 boundary. Values within the boundary are returned whole; oversized values return `null` with `avatarUriUnavailable: true`. No URI prefix is synthesized.
+3. Code-point-safe truncation is restricted to human-readable names, descriptions, reasons, labels, warning text and error messages. Per-summary `truncated` flags no longer conflate identity or URI handling.
+4. Compact snapshots expose top-level `snapshotTruncated` and exact per-page `returnedCount`. If exact structured values make the full first pages exceed 64 KiB, trailing summaries are removed in a deterministic priority order. `counts` and page `totalCount` remain exact; `loadedCount`, `returnedCount` and `hasMore` describe the reduced payload consistently.
+5. The byte-pressure fixture uses five entries per entity category, 256-character IDs, giant Unicode labels/URIs and large syntactically valid CSS colors. Returned IDs/colors remain exact while the serialized snapshot stays at or below 65,536 UTF-8 bytes.
+6. The `Actor_A` cursor-fingerprint regression, 2,000,000-character legacy fixture, 15-operation CAS matrix and all 100,000-record bounded-I/O invariants remain active.
+
+### Verification
+
+```text
+node --test tests/query.test.mjs
+pnpm run check
+git diff --check
+```
+
+- Focused final regressions: `4` passed / `0` failed.
+- Query suite: `38` passed / `0` failed.
+- Full suite: `134` passed / `0` failed.
+- Manifest/WebView audits, TypeScript and temporary-effect audit: PASS.
+- Task 5 atomic publication/recovery/migration/cleanup and bounded record access: PASS.
+- `git diff --check`: PASS.
+
+### Residual boundaries
+
+- Task 7 must consume the new `snapshotTruncated`, `returnedCount` and `avatarUriUnavailable` contract; the old `static/app_ui/app.js` monolith remains intentionally untouched.
+- Runtime-local picker cursors still expire and are invalidated by restart; the UI restarts the search in that case.
+- Arbitrary record-body search remains fail-closed to preserve bounded 100,000-record I/O.
