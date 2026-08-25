@@ -4,15 +4,22 @@ const path = require("node:path");
 const test = require("node:test");
 
 const root = path.resolve(__dirname, "..");
-const appScripts = [
-  "static/app_ui/runtime.js",
-  "static/app_ui/components.js",
-  "static/app_ui/pages-status.js",
-  "static/app_ui/pages-config.js",
-  "static/app_ui/pages-rules.js",
-  "static/app_ui/pages-advanced.js",
-  "static/app_ui/app.js",
+const builtScriptOrder = [
+  "runtime.js",
+  "components.js",
+  "pages-status.js",
+  "pages-config.js",
+  "pages-rules.js",
+  "pages-advanced.js",
+  "app.js",
 ];
+
+function builtScriptBlock(html, sourceName) {
+  const escaped = sourceName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = html.match(new RegExp(`<script\\s+data-source="${escaped}"[^>]*>[\\s\\S]*?<\\/script>`, "i"));
+  assert.ok(match, `missing built script fixture ${sourceName}`);
+  return match[0];
+}
 
 async function waitFor(predicate, message, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -23,21 +30,36 @@ async function waitFor(predicate, message, timeoutMs = 2_000) {
   assert.fail(message);
 }
 
-async function createApp(route) {
+function parseBuiltArtifact(html) {
+  const scriptPattern = /<script\b(?<attributes>[^>]*)>(?<source>[\s\S]*?)<\/script>/gi;
+  const scripts = Array.from(html.matchAll(scriptPattern), (match) => {
+    const sourceMatch = match.groups.attributes.match(/\bdata-source=(['"])(?<name>[^'"]+)\1/i);
+    return { name: sourceMatch?.groups.name || "", source: match.groups.source };
+  });
+  const actualOrder = scripts.map((script) => script.name);
+  if (actualOrder.length !== builtScriptOrder.length ||
+      actualOrder.some((name, index) => name !== builtScriptOrder[index])) {
+    throw new Error(`MVU_BUILT_SCRIPT_ORDER_INVALID:${actualOrder.join(",")}`);
+  }
+  return {
+    markup: html.replace(scriptPattern, ""),
+    scripts,
+  };
+}
+
+async function createApp(route, options = {}) {
+  const html = options.builtHtml || await readFile(path.join(root, "dist", "app.html"), "utf8");
+  const artifact = parseBuiltArtifact(html);
   const { Window } = await import("happy-dom");
   const window = new Window({ url: `https://mvu.local/app.html?demo=1&route=${route}` });
-  window.document.body.innerHTML = [
-    '<main id="appRoot"></main>',
-    '<input id="backgroundPicker" type="file">',
-    '<input id="datasetImportPicker" type="file">',
-    '<div id="toast"></div>',
-  ].join("");
+  window.document.open();
+  window.document.write(artifact.markup);
+  window.document.close();
   if (typeof window.matchMedia !== "function") {
     window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   }
-  for (const relativePath of appScripts) {
-    const source = await readFile(path.join(root, relativePath), "utf8");
-    window.eval(`${source}\n//# sourceURL=${relativePath.replaceAll("\\", "/")}`);
+  for (const script of artifact.scripts) {
+    window.eval(`${script.source}\n//# sourceURL=dist/app.html?data-source=${script.name}`);
   }
   await waitFor(
     () => window.document.querySelector(".app-screen") && !window.document.querySelector(".boot-state"),
@@ -45,6 +67,26 @@ async function createApp(route) {
   );
   return window;
 }
+
+test("DOM gate rejects built artifact script omission and order mutations", async () => {
+  const html = await readFile(path.join(root, "dist", "app.html"), "utf8");
+  const runtime = builtScriptBlock(html, "runtime.js");
+  const components = builtScriptBlock(html, "components.js");
+  const omitted = html.replace(components, "");
+  const reordered = html
+    .replace(runtime, "<!-- task8-runtime-slot -->")
+    .replace(components, runtime)
+    .replace("<!-- task8-runtime-slot -->", components);
+
+  await assert.rejects(
+    createApp("status", { builtHtml: omitted }).then((window) => { window.close(); }),
+    /MVU_BUILT_SCRIPT_ORDER_INVALID/,
+  );
+  await assert.rejects(
+    createApp("status", { builtHtml: reordered }).then((window) => { window.close(); }),
+    /MVU_BUILT_SCRIPT_ORDER_INVALID/,
+  );
+});
 
 test("next-page DOM patch preserves the live scroll container and logical pagination focus", async (t) => {
   const window = await createApp("config-fields");
