@@ -113,23 +113,96 @@ export function largeDatasetFixture() {
   return dataset;
 }
 
-export function createFakeFiles(initialFiles = {}) {
+/** Map-backed implementation of the complete MvuFileApi contract. */
+export function createFakeMvuFileApi(initialFiles = {}) {
   const files = new Map(Object.entries(initialFiles));
-  return {
-    async read(path) {
-      return files.get(path) ?? null;
+  const directories = new Set();
+  const failures = [];
+  const operations = [];
+
+  function failIfRequested(operation, details) {
+    const index = failures.findIndex((failure) =>
+      failure.operation === operation && failure.matches(details));
+    if (index < 0) return;
+    const [failure] = failures.splice(index, 1);
+    throw failure.error;
+  }
+
+  function requireFile(path) {
+    const content = files.get(path);
+    if (content === undefined) throw new Error(`FAKE_FILE_NOT_FOUND:${path}`);
+    return content;
+  }
+
+  const api = {
+    async exists(path) {
+      failIfRequested("exists", { path });
+      return files.has(path) || directories.has(path) ||
+        [...files.keys()].some((candidate) => candidate.startsWith(`${path}/`));
     },
-    async write(path, value) {
-      files.set(path, value);
+    async readText(path) {
+      failIfRequested("readText", { path });
+      operations.push({ operation: "readText", path });
+      return requireFile(path);
     },
-    async remove(path) {
-      files.delete(path);
+    async readTextPart(path, startLine, endLine) {
+      failIfRequested("readTextPart", { path, startLine, endLine });
+      operations.push({ operation: "readTextPart", path, startLine, endLine });
+      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) ||
+        startLine < 1 || endLine < startLine) {
+        throw new Error("FAKE_READ_PART_RANGE_INVALID");
+      }
+      const lines = requireFile(path).replace(/\r\n/g, "\n").split("\n");
+      if (lines.at(-1) === "") lines.pop();
+      return lines.slice(startLine - 1, endLine).join("\n");
+    },
+    async writeText(path, content) {
+      failIfRequested("writeText", { path, content });
+      operations.push({ operation: "writeText", path, content });
+      files.set(path, content);
+    },
+    async appendText(path, content) {
+      failIfRequested("appendText", { path, content });
+      operations.push({ operation: "appendText", path, content });
+      files.set(path, (files.get(path) ?? "") + content);
+    },
+    async move(source, destination) {
+      failIfRequested("move", { source, destination });
+      operations.push({ operation: "move", source, destination });
+      const content = requireFile(source);
+      files.set(destination, content);
+      files.delete(source);
+    },
+    async deleteFile(path) {
+      failIfRequested("deleteFile", { path });
+      operations.push({ operation: "deleteFile", path });
+      for (const candidate of [...files.keys()]) {
+        if (candidate === path || candidate.startsWith(`${path}/`)) files.delete(candidate);
+      }
+      for (const candidate of [...directories]) {
+        if (candidate === path || candidate.startsWith(`${path}/`)) directories.delete(candidate);
+      }
+    },
+    async mkdir(path) {
+      failIfRequested("mkdir", { path });
+      operations.push({ operation: "mkdir", path });
+      directories.add(path);
+    },
+    failNext(operation, matches = () => true, error = new Error(`FAKE_${operation.toUpperCase()}_FAILED`)) {
+      failures.push({ operation, matches, error });
+    },
+    operations() {
+      return structuredClone(operations);
     },
     snapshot() {
       return Object.fromEntries(files);
     },
   };
+  return api;
 }
+
+/** Retained for older test callers that only need the in-memory snapshot helpers. */
+export const createFakeFiles = createFakeMvuFileApi;
 
 function fieldFixture(id, name, order) {
   return {

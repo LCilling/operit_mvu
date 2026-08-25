@@ -148,6 +148,24 @@ export interface HourlyMessageBucket {
   messageCount: number;
 }
 
+/** Metadata is the visibility boundary for one append-only JSONL segment. */
+export interface RecordSegmentMetadata {
+  index: number;
+  fileName: string;
+  committedLineCount: number;
+  firstOccurredAt: number;
+  lastOccurredAt: number;
+  firstRevision: number;
+  lastRevision: number;
+}
+
+/** Only lines named by this committed manifest are visible to readers. */
+export interface RecordManifest {
+  segments: RecordSegmentMetadata[];
+  recordCount: number;
+  nextSegmentIndex: number;
+}
+
 /**
  * The pure migration representation. Runtime/storage integration is intentionally
  * deferred; copied v2 runtime facts stay available until the v3 store owns them.
@@ -165,7 +183,7 @@ export interface MvuDatasetV3 {
   effectGroups: EffectGroupDefinition[];
   activeEffects: ActiveEffectInstance[];
   stateValues: Record<string, Record<string, number>>;
-  records: DataChangeRecord[];
+  recordManifest: RecordManifest;
   lastSettled: Record<string, Record<string, number>>;
   turnCounters: Record<string, Record<string, TurnCounter>>;
   processedMessageIds: string[];
@@ -176,6 +194,8 @@ export interface MvuDatasetV3 {
 
 export interface MigrationResult {
   dataset: MvuDatasetV3;
+  /** Record bodies are staged separately and become visible with the config commit. */
+  records: DataChangeRecord[];
   report: {
     migratedFields: number;
     migratedRules: number;

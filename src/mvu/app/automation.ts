@@ -11,7 +11,11 @@ import type {
   DataAutoRule,
   DataLinkRule,
 } from "./model";
-import type { HourlyMessageBucket } from "./model-v3";
+import type {
+  ConditionDefinition,
+  ConditionExpression,
+  HourlyMessageBucket,
+} from "./model-v3";
 
 export const MAX_LINK_CHAIN_DEPTH = 8;
 export const MAX_PROCESSED_MESSAGE_IDS_V3 = 2_048;
@@ -43,6 +47,44 @@ export function hourlyMessageBucketsFromFacts(
   let buckets: HourlyMessageBucket[] = [];
   for (const fact of facts) buckets = appendHourlyMessageBucket(buckets, fact.occurredAt);
   return buckets;
+}
+
+/**
+ * Retain every UTC hour that can still overlap an enabled frequency window.
+ * The 24-hour floor preserves the default high-frequency semantics; larger
+ * user windows extend the horizon without any independent item-count cap.
+ */
+export function retainHourlyMessageBuckets(
+  buckets: readonly HourlyMessageBucket[],
+  conditions: readonly ConditionDefinition[],
+  now: number,
+): HourlyMessageBucket[] {
+  requireFinite(now, "MVU_V3_HOURLY_RETENTION_TIME_INVALID");
+  const retentionHours = conditions
+    .filter((condition) => condition.enabled)
+    .reduce((maximum, condition) => Math.max(
+      maximum,
+      maximumFrequencyWindow(condition.expression),
+    ), 24);
+  const cutoff = now - retentionHours * HOUR_IN_MILLISECONDS;
+  return buckets
+    .filter((bucket) => bucket.startedAt + HOUR_IN_MILLISECONDS > cutoff)
+    .map((bucket) => ({ ...bucket }));
+}
+
+function maximumFrequencyWindow(expression: ConditionExpression): number {
+  switch (expression.kind) {
+    case "predicate":
+      return expression.predicate.kind === "high_frequency"
+        ? expression.predicate.windowHours ?? 24
+        : 0;
+    case "not":
+      return maximumFrequencyWindow(expression.child);
+    case "and":
+    case "or":
+      return expression.children.reduce((maximum, child) =>
+        Math.max(maximum, maximumFrequencyWindow(child)), 0);
+  }
 }
 
 /** Facts derived by the host from one persisted-message evaluation window. */

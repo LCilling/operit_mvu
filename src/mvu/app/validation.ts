@@ -456,6 +456,11 @@ function assertRecordShape(value: unknown): asserts value is DataChangeRecord {
   }
 }
 
+/** Public storage-boundary validator for one persisted JSONL record. */
+export function assertDataChangeRecord(value: unknown): asserts value is DataChangeRecord {
+  assertRecordShape(value);
+}
+
 function assertTurnCounterShape(value: unknown): asserts value is TurnCounter {
   if (!isRecord(value) || !isFiniteNumber(value.userMessages) ||
     !isFiniteNumber(value.characterMessages) || !Number.isInteger(value.userMessages) ||
@@ -528,7 +533,9 @@ function runtimeKeyAppliesToField(key: string, field: DataField): boolean {
   return key.startsWith(prefix) && field.bindingIds.includes(key.slice(prefix.length));
 }
 
-function assertRuntimeFieldMaps(dataset: MvuDataset): void {
+function assertRuntimeFieldMaps(
+  dataset: Pick<MvuDataset, "fields" | "stateValues" | "lastSettled" | "turnCounters">,
+): void {
   const fields = new Map(dataset.fields.map((field) => [field.id, field]));
   for (const [key, state] of Object.entries(dataset.stateValues)) {
     for (const [fieldId, value] of Object.entries(state)) {
@@ -555,7 +562,9 @@ function assertRuntimeFieldMaps(dataset: MvuDataset): void {
   }
 }
 
-function validatePendingBootstrapFields(dataset: MvuDataset): void {
+function validatePendingBootstrapFields(
+  dataset: Pick<MvuDataset, "fields" | "pendingBootstrapFieldIds">,
+): void {
   requireUnique(
     dataset.pendingBootstrapFieldIds,
     "MVU_PENDING_BOOTSTRAP_FIELD_DUPLICATE"
@@ -645,15 +654,24 @@ export function assertMvuDataset(value: unknown): asserts value is MvuDataset {
  * remains deferred, but reusable effects and active snapshots are strict here.
  */
 export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV3 {
-  if (!isRecord(value) || value.formatVersion !== 3 || !Array.isArray(value.fields) ||
+  if (!isRecord(value) || value.formatVersion !== 3 || !isIsoTimestamp(value.createdAt) ||
+    !isFiniteNumber(value.revision) || !Number.isInteger(value.revision) || value.revision < 0 ||
+    !Array.isArray(value.fields) ||
     !Array.isArray(value.linkRules) || !Array.isArray(value.conditions) ||
     !Array.isArray(value.rules) || !Array.isArray(value.effectGroups) ||
+    !Array.isArray(value.pendingBootstrapFieldIds) ||
+    !value.pendingBootstrapFieldIds.every((entry) => typeof entry === "string") ||
     !Array.isArray(value.activeEffects) || !Array.isArray(value.processedMessageIds) ||
     value.processedMessageIds.length > MAX_PROCESSED_MESSAGE_IDS_V3 ||
     !value.processedMessageIds.every((id) => typeof id === "string") ||
     new Set(value.processedMessageIds).size !== value.processedMessageIds.length) {
     fail("INVALID_MVU_V3_DATASET");
   }
+  assertSettingsShape(value.settings);
+  assertNestedNumberMap(value.stateValues);
+  assertNestedNumberMap(value.lastSettled);
+  assertNestedCounterMap(value.turnCounters);
+  assertRecordManifestShape(value.recordManifest);
   assertMessageFactsMap(value.messageFacts, MAX_MESSAGE_FACTS_PER_SCOPE_V3);
   assertHourlyMessageBucketsMap(value.hourlyMessageBuckets);
   assertNestedNumberMap(value.ruleLastTriggered);
@@ -674,6 +692,20 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
   const fields = value.fields.map((field) => {
     assertDataFieldShape(field);
     return field;
+  });
+  for (const linkRule of value.linkRules) {
+    assertLinkRuleShape(linkRule);
+    validateLinkRule(linkRule, fields);
+  }
+  validatePendingBootstrapFields({
+    fields,
+    pendingBootstrapFieldIds: value.pendingBootstrapFieldIds,
+  });
+  assertRuntimeFieldMaps({
+    fields,
+    stateValues: value.stateValues,
+    lastSettled: value.lastSettled,
+    turnCounters: value.turnCounters,
   });
   const effectGroupIds = new Set<string>();
   const effectGroups: EffectGroupDefinition[] = [];
@@ -730,6 +762,38 @@ export function assertMvuDatasetV3(value: unknown): asserts value is MvuDatasetV
     if (typeof instance.id !== "string" || activeEffectIds.has(instance.id)) fail("INVALID_MVU_V3_ACTIVE_EFFECT");
     assertActiveEffectInstanceShape(instance, fields);
     activeEffectIds.add(instance.id);
+  }
+}
+
+function assertRecordManifestShape(value: unknown): void {
+  if (!isRecord(value) || !Array.isArray(value.segments) ||
+    !isFiniteNumber(value.recordCount) || !Number.isInteger(value.recordCount) || value.recordCount < 0 ||
+    !isFiniteNumber(value.nextSegmentIndex) || !Number.isInteger(value.nextSegmentIndex) ||
+    value.nextSegmentIndex < 1) {
+    fail("MVU_V3_RECORD_MANIFEST_INVALID");
+  }
+  let total = 0;
+  let previousIndex = 0;
+  for (let position = 0; position < value.segments.length; position += 1) {
+    const segment = value.segments[position];
+    if (!isRecord(segment) || !isFiniteNumber(segment.index) || !Number.isInteger(segment.index) ||
+      segment.index <= previousIndex ||
+      segment.fileName !== `segment-${String(segment.index).padStart(6, "0")}.jsonl` ||
+      !isFiniteNumber(segment.committedLineCount) || !Number.isInteger(segment.committedLineCount) ||
+      segment.committedLineCount < 1 || segment.committedLineCount > 500 ||
+      (position < value.segments.length - 1 && segment.committedLineCount !== 500) ||
+      !isFiniteNumber(segment.firstOccurredAt) || !isFiniteNumber(segment.lastOccurredAt) ||
+      segment.firstOccurredAt > segment.lastOccurredAt ||
+      !isFiniteNumber(segment.firstRevision) || !Number.isInteger(segment.firstRevision) || segment.firstRevision < 0 ||
+      !isFiniteNumber(segment.lastRevision) || !Number.isInteger(segment.lastRevision) ||
+      segment.lastRevision < segment.firstRevision) {
+      fail("MVU_V3_RECORD_MANIFEST_INVALID");
+    }
+    total += segment.committedLineCount;
+    previousIndex = segment.index;
+  }
+  if (total !== value.recordCount || value.nextSegmentIndex <= previousIndex) {
+    fail("MVU_V3_RECORD_MANIFEST_INVALID");
   }
 }
 

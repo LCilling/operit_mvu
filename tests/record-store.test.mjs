@@ -1,0 +1,982 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { automationScopeKey } from "../dist/mvu/app/scope.js";
+import { createRuntime } from "../dist/mvu/app/index.js";
+import {
+  createEmptyRecordManifest,
+  SegmentedRecordStore,
+} from "../dist/mvu/app/record-store.js";
+import {
+  V3MvuStore,
+} from "../dist/mvu/app/store-v3.js";
+import {
+  FileMvuStore,
+  StaleRevisionError,
+} from "../dist/mvu/app/store.js";
+import {
+  createFakeMvuFileApi,
+  legacyDatasetFixture,
+} from "./helpers.mjs";
+
+const CONFIG_DIR = "/config";
+const V2_PATH = `${CONFIG_DIR}/operit_mvu.dataset.v2.json`;
+const V3_PATH = `${CONFIG_DIR}/operit_mvu.dataset.v3.json`;
+const RECORD_DIRECTORY = `${CONFIG_DIR}/operit_mvu.records.v3`;
+const NOW = Date.parse("2033-05-18T03:33:20.000Z");
+const HOUR = 3_600_000;
+
+function changeRecord(index, overrides = {}) {
+  return {
+    id: `record_${index}`,
+    scope: "character",
+    scopeKey: "character:T",
+    fieldId: "field_affinity",
+    fieldName: "Affinity",
+    actorId: "T",
+    actorName: "T",
+    chatId: "chat_main",
+    groupId: "group_main",
+    before: index,
+    after: index + 1,
+    requestedDelta: 1,
+    effectiveRequestedDelta: 1,
+    delta: 1,
+    stageBefore: "stage_low",
+    stageAfter: "stage_low",
+    reason: "record fixture",
+    source: "rule",
+    ruleIds: [],
+    effectIds: [],
+    confidence: null,
+    messageId: `message_${index}`,
+    variantId: null,
+    occurredAt: NOW + index,
+    ...overrides,
+  };
+}
+
+function legacyStore(files, initial = legacyDatasetFixture()) {
+  return new FileMvuStore({
+    getConfigDir: () => CONFIG_DIR,
+    files,
+    createInitialDataset: () => structuredClone(initial),
+  });
+}
+
+function v3Store(files, initial = legacyDatasetFixture()) {
+  return new V3MvuStore({
+    getConfigDir: () => CONFIG_DIR,
+    files,
+    legacyStore: legacyStore(files, initial),
+    createInitialDataset: () => structuredClone(initial),
+    now: () => NOW,
+  });
+}
+
+function filesWithV2(dataset = legacyDatasetFixture()) {
+  const serialized = JSON.stringify(dataset, null, 2);
+  return {
+    files: createFakeMvuFileApi({ [V2_PATH]: serialized }),
+    serialized,
+  };
+}
+
+function lineCount(content) {
+  if (content.length === 0) return 0;
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.length;
+}
+
+function installProductionHost(t, files, hostSnapshot, modelCalls, registrations, fileCalls) {
+  const previous = {
+    hasIcons: Object.prototype.hasOwnProperty.call(globalThis, "Icons"),
+    icons: globalThis.Icons,
+    hasToolPkg: Object.prototype.hasOwnProperty.call(globalThis, "ToolPkg"),
+    toolPkg: globalThis.ToolPkg,
+    hasTools: Object.prototype.hasOwnProperty.call(globalThis, "Tools"),
+    tools: globalThis.Tools,
+  };
+  t.after(() => {
+    if (previous.hasIcons) globalThis.Icons = previous.icons;
+    else delete globalThis.Icons;
+    if (previous.hasToolPkg) globalThis.ToolPkg = previous.toolPkg;
+    else delete globalThis.ToolPkg;
+    if (previous.hasTools) globalThis.Tools = previous.tools;
+    else delete globalThis.Tools;
+  });
+
+  const successful = (operation, path) => ({ operation, path, successful: true, details: "" });
+  globalThis.Icons = { Favorite: "favorite" };
+  globalThis.Tools = {
+    Files: {
+      async exists(path, environment) {
+        fileCalls.push({ operation: "exists", path, environment });
+        return { exists: await files.exists(path) };
+      },
+      async read(path) {
+        fileCalls.push({ operation: "read", path });
+        return { content: await files.readText(path) };
+      },
+      async readPart(path, startLine, endLine, environment) {
+        fileCalls.push({ operation: "readPart", path, startLine, endLine, environment });
+        return { content: await files.readTextPart(path, startLine, endLine) };
+      },
+      async write(path, content, append = false, environment) {
+        fileCalls.push({ operation: "write", path, content, append, environment });
+        if (append) await files.appendText(path, content);
+        else await files.writeText(path, content);
+        return successful(append ? "append" : "write", path);
+      },
+      async move(source, destination, environment) {
+        fileCalls.push({ operation: "move", source, destination, environment });
+        await files.move(source, destination);
+        return successful("move", destination);
+      },
+      async deleteFile(path, recursive, environment) {
+        fileCalls.push({ operation: "deleteFile", path, recursive, environment });
+        await files.deleteFile(path);
+        return successful("delete", path);
+      },
+      async mkdir(path, recursive, environment) {
+        fileCalls.push({ operation: "mkdir", path, recursive, environment });
+        await files.mkdir(path);
+        return successful("mkdir", path);
+      },
+    },
+  };
+  globalThis.ToolPkg = {
+    getConfigDir() { return CONFIG_DIR; },
+    chatContext: {
+      async snapshot() { return structuredClone(hostSnapshot); },
+    },
+    systemModel: {
+      async probe() { return { available: true, provider: "test", model: "test" }; },
+      async complete(request) {
+        modelCalls.push(structuredClone(request));
+        if (request.jsonSchema.name === "mvu_state_judgement") {
+          return { text: JSON.stringify({ changes: [{
+            fieldId: "field_affinity",
+            delta: 4,
+            reason: "state AI",
+            confidence: 0.9,
+          }] }) };
+        }
+        if (request.jsonSchema.name === "mvu_condition_judgement") {
+          return { text: JSON.stringify({ judgements: [{
+            predicateId: "predicate_character_event",
+            matched: true,
+            confidence: 0.95,
+          }] }) };
+        }
+        throw new Error(`UNEXPECTED_MODEL_SCHEMA:${request.jsonSchema.name}`);
+      },
+    },
+    ipc: {
+      on() { return () => {}; },
+      async call() { throw new Error("UNEXPECTED_IPC_CALL"); },
+    },
+    registerUiRoute(definition) { registrations.ui = definition; },
+    registerNavigationEntry(definition) { registrations.navigation = definition; },
+    registerAppLifecycleHook(definition) { registrations.lifecycle = definition; },
+    registerChatMessageHook(definition) { registrations.chat = definition; },
+    registerSystemPromptComposeHook(definition) { registrations.prompt = definition; },
+  };
+}
+
+test("rotates at 500 records and exposes only the supplied committed manifest", async () => {
+  const files = createFakeMvuFileApi();
+  const records = new SegmentedRecordStore({
+    getConfigDir: () => CONFIG_DIR,
+    files,
+  });
+  const uncommitted = createEmptyRecordManifest();
+
+  const staged = await records.stageAppend(
+    uncommitted,
+    Array.from({ length: 501 }, (_, index) => changeRecord(index)),
+    1,
+  );
+
+  const physical = files.snapshot();
+  assert.equal(lineCount(physical[`${RECORD_DIRECTORY}/segment-000001.jsonl`]), 500);
+  assert.equal(lineCount(physical[`${RECORD_DIRECTORY}/segment-000002.jsonl`]), 1);
+  assert.deepEqual(staged.manifest.segments.map((segment) => segment.committedLineCount), [500, 1]);
+  assert.equal(staged.manifest.recordCount, 501);
+  assert.equal(staged.manifest.nextSegmentIndex, 3);
+
+  const hidden = await records.queryRecords(uncommitted, {
+    offset: 0,
+    limit: 10,
+    direction: "asc",
+  });
+  assert.deepEqual(hidden.items, []);
+  assert.equal(hidden.totalCount, 0);
+
+  const visible = await records.queryRecords(staged.manifest, {
+    offset: 495,
+    limit: 10,
+    direction: "asc",
+  });
+  assert.deepEqual(visible.items.map((record) => record.id), [
+    "record_495", "record_496", "record_497", "record_498", "record_499", "record_500",
+  ]);
+  assert.equal(visible.totalCount, 501);
+  assert.equal(visible.hasMore, false);
+});
+
+test("repairs an orphan tail without parsing or exposing it", async () => {
+  const files = createFakeMvuFileApi();
+  const records = new SegmentedRecordStore({ getConfigDir: () => CONFIG_DIR, files });
+  const staged = await records.stageAppend(
+    createEmptyRecordManifest(),
+    [changeRecord(1), changeRecord(2)],
+    1,
+  );
+  const segmentPath = `${RECORD_DIRECTORY}/segment-000001.jsonl`;
+  await files.appendText(segmentPath, "{not committed json}\n");
+
+  await records.validateAndRepair(staged.manifest, 1);
+
+  assert.equal(lineCount(files.snapshot()[segmentPath]), 2);
+  const result = await records.queryRecords(staged.manifest, {
+    offset: 0,
+    limit: 10,
+    direction: "asc",
+  });
+  assert.deepEqual(result.items.map((record) => record.id), ["record_1", "record_2"]);
+});
+
+test("commits records and configuration together and rejects a stale CAS revision", async () => {
+  const { files } = filesWithV2();
+  const store = v3Store(files);
+  const status = await store.initialize();
+  assert.equal(status.mode, "v3");
+  const before = await store.readV3();
+  const next = structuredClone(before.dataset);
+  next.settings.aiEnabled = false;
+
+  const committed = await store.transactV3(before.revision, next, [changeRecord(1)]);
+
+  assert.equal(committed.revision, before.revision + 1);
+  assert.equal(committed.dataset.settings.aiEnabled, false);
+  assert.equal(committed.dataset.recordManifest.recordCount, 1);
+  const records = await store.queryRecords({ offset: 0, limit: 10, direction: "asc" });
+  assert.deepEqual(records.items.map((record) => record.id), ["record_1"]);
+  await assert.rejects(
+    store.transactV3(before.revision, structuredClone(committed.dataset), [changeRecord(2)]),
+    StaleRevisionError,
+  );
+  assert.deepEqual(
+    (await store.queryRecords({ offset: 0, limit: 10, direction: "asc" })).items.map((record) => record.id),
+    ["record_1"],
+  );
+});
+
+test("a failed config move leaves state and records uncommitted, then restart repairs and retries", async () => {
+  const { files } = filesWithV2();
+  const firstStore = v3Store(files);
+  await firstStore.initialize();
+  const before = await firstStore.readV3();
+  const interrupted = structuredClone(before.dataset);
+  interrupted.settings.aiEnabled = false;
+  interrupted.hourlyMessageBuckets["event:test"] = [{
+    startedAt: Math.floor(NOW / HOUR) * HOUR - HOUR,
+    messageCount: 7,
+  }];
+  files.failNext("move", ({ destination }) => destination === V3_PATH);
+
+  await assert.rejects(
+    firstStore.transactV3(before.revision, interrupted, [changeRecord(1)]),
+    /FAKE_MOVE_FAILED/,
+  );
+
+  const restarted = v3Store(files);
+  assert.equal((await restarted.initialize()).mode, "v3");
+  const recovered = await restarted.readV3();
+  assert.equal(recovered.revision, before.revision);
+  assert.equal(recovered.dataset.settings.aiEnabled, true);
+  assert.equal(recovered.dataset.hourlyMessageBuckets["event:test"], undefined);
+  assert.equal((await restarted.queryRecords({ offset: 0, limit: 10 })).totalCount, 0);
+  assert.equal(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`], undefined);
+
+  const retry = structuredClone(recovered.dataset);
+  retry.settings.aiEnabled = false;
+  const committed = await restarted.transactV3(recovered.revision, retry, [changeRecord(2)]);
+  assert.equal(committed.dataset.recordManifest.recordCount, 1);
+  assert.deepEqual(
+    (await restarted.queryRecords({ offset: 0, limit: 10, direction: "asc" })).items.map((record) => record.id),
+    ["record_2"],
+  );
+  assert.equal(lineCount(files.snapshot()[`${RECORD_DIRECTORY}/segment-000001.jsonl`]), 1);
+});
+
+test("startup migrates into new v3 paths, preserves v2 byte-for-byte, and prefers valid v3", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = [changeRecord(1), changeRecord(2)];
+  const { files, serialized } = filesWithV2(legacy);
+  const first = v3Store(files, legacy);
+
+  const migrated = await first.initialize();
+
+  assert.equal(migrated.mode, "v3");
+  assert.equal(migrated.source, "migrated");
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+  assert.equal((await first.readV3()).dataset.recordManifest.recordCount, 2);
+  assert.equal((await first.queryRecords({ offset: 0, limit: 10 })).totalCount, 2);
+
+  const changedV2 = structuredClone(legacy);
+  changedV2.settings.aiEnabled = false;
+  await files.writeText(V2_PATH, JSON.stringify(changedV2));
+  const restarted = v3Store(files, changedV2);
+  const preferred = await restarted.initialize();
+  assert.equal(preferred.mode, "v3");
+  assert.equal(preferred.source, "existing");
+  assert.equal((await restarted.readV3()).dataset.settings.aiEnabled, true);
+});
+
+test("failed migration retains structured v2 compatibility and a clean retry succeeds", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.records = [changeRecord(1)];
+  const { files, serialized } = filesWithV2(legacy);
+  files.failNext("move", ({ destination }) => destination === V3_PATH);
+  const store = v3Store(files, legacy);
+
+  const failed = await store.initialize();
+
+  assert.equal(failed.mode, "v2_compat");
+  assert.equal(typeof failed.error.code, "string");
+  assert.match(failed.error.message, /FAKE_MOVE_FAILED/);
+  assert.equal((await store.read()).dataset.formatVersion, 2);
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+
+  const retried = await store.retryMigration();
+  assert.equal(retried.mode, "v3");
+  assert.equal(retried.source, "migrated");
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+  assert.equal((await store.queryRecords({ offset: 0, limit: 10 })).totalCount, 1);
+});
+
+test("each invalid v3 reference and committed count falls back without overwriting either dataset", async () => {
+  const corruptions = [
+    (dataset) => { dataset.rules[0].conditionId = "missing_condition"; },
+    (dataset) => { dataset.recordManifest.recordCount = 9; },
+  ];
+  for (const corrupt of corruptions) {
+    const { files, serialized } = filesWithV2();
+    const initial = v3Store(files);
+    await initial.initialize();
+    const invalid = JSON.parse(files.snapshot()[V3_PATH]);
+    corrupt(invalid);
+    const invalidSerialized = JSON.stringify(invalid);
+    await files.writeText(V3_PATH, invalidSerialized);
+
+    const restarted = v3Store(files);
+    const status = await restarted.initialize();
+
+    assert.equal(status.mode, "v2_compat");
+    assert.equal((await restarted.read()).dataset.formatVersion, 2);
+    assert.equal(files.snapshot()[V2_PATH], serialized);
+    assert.equal(files.snapshot()[V3_PATH], invalidSerialized);
+    assert.equal((await restarted.retryMigration()).mode, "v3");
+    assert.equal(files.snapshot()[V2_PATH], serialized);
+  }
+});
+
+test("legacy compatibility writes preserve v3-only conditions, rules, and effects", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  configured.conditions.push({
+    id: "condition_v3_only",
+    name: "V3-only sender condition",
+    description: "",
+    enabled: true,
+    expression: { kind: "predicate", predicate: { kind: "sender", senders: ["character"] } },
+    createdAt,
+    updatedAt: createdAt,
+  });
+  configured.effectGroups.push({
+    id: "effect_group_v3_only",
+    name: "V3-only immediate effect",
+    description: "",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_v3_only",
+      fieldId: "field_affinity",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [{ kind: "immediate_delta", value: 2 }],
+    }],
+    defaultDuration: { expiresAt: null, remainingTurns: 2 },
+    createdAt,
+    updatedAt: createdAt,
+  });
+  configured.rules.push({
+    id: "rule_v3_only",
+    name: "V3-only activation rule",
+    description: "",
+    enabled: true,
+    triggerActorSelector: { kind: "current_actor" },
+    conditionId: "condition_v3_only",
+    actions: [{ kind: "activate_effect_group", effectGroupId: "effect_group_v3_only" }],
+    cooldownHours: 0,
+    executionOrder: 0,
+    createdAt,
+    updatedAt: createdAt,
+  });
+  await store.transactV3(before.revision, configured, []);
+
+  const runtime = createRuntime({ store });
+  const legacyRule = await runtime.service.addAutoRule({
+    name: "Legacy-compatible rule",
+    description: "",
+    enabled: true,
+    condition: { kind: "recentPositive", count: 1 },
+    effects: [{ fieldId: "field_affinity", delta: 1, temporaryEffectIds: [] }],
+    cooldownMs: 0,
+    order: 1,
+  });
+
+  const after = await store.readV3();
+  assert.equal(after.dataset.conditions.some(({ id }) => id === "condition_v3_only"), true);
+  assert.equal(after.dataset.rules.some(({ id }) => id === "rule_v3_only"), true);
+  assert.equal(after.dataset.effectGroups.some(({ id }) => id === "effect_group_v3_only"), true);
+  assert.equal(after.dataset.rules.some(({ id }) => id === legacyRule.id), true);
+});
+
+test("legacy temporary-effect writes preserve hidden v3 effect definitions", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+
+  const before = await store.readV3();
+  const configured = structuredClone(before.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  configured.effectGroups.push({
+    id: "effect_group_v3_hidden",
+    name: "V3-only hidden effect",
+    description: "",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_v3_hidden",
+      fieldId: "field_affinity",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [{ kind: "immediate_delta", value: 2 }],
+    }],
+    defaultDuration: { expiresAt: null, remainingTurns: 2 },
+    createdAt,
+    updatedAt: createdAt,
+  });
+  await store.transactV3(before.revision, configured, []);
+
+  const runtime = createRuntime({ store });
+  const legacyEffect = await runtime.service.addTemporaryEffect({
+    targets: [{
+      fieldId: "field_affinity",
+      scope: "character",
+      scopeKey: "character:actor_t",
+    }],
+    mode: "additive",
+    value: 1,
+    enabled: true,
+    expiresAt: null,
+    remainingTurns: 2,
+    reasonMode: "template",
+    reasonTemplate: "general",
+    reason: "",
+    createdAt: NOW,
+  });
+
+  const after = await store.readV3();
+  assert.equal(after.dataset.effectGroups.some(({ id }) => id === "effect_group_v3_hidden"), true);
+  assert.equal(after.dataset.effectGroups.some(({ id }) => id === `effect_group_${legacyEffect.id}`), true);
+});
+
+test("registered production chat hook commits legacy changes, v3 effects, AI rules, facts, and records atomically", async (t) => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  legacy.fields[0].bindingIds = ["T"];
+  legacy.fields[0].initialValue = 10;
+  legacy.fields[0].naturalChange = { enabled: true, unitMs: HOUR, amount: 2 };
+  legacy.fields[0].perTurnChange = {
+    enabled: true, intervalTurns: 1, amount: 3, countMode: "character",
+  };
+  legacy.fields[0].ai = { enabled: true, minConfidence: 0.5, maxDelta: 10, prompt: "Track affinity." };
+  legacy.fields[1].bindingIds = ["T"];
+  legacy.fields[1].initialValue = 0;
+  legacy.rules = [{
+    id: "link_affinity_excite",
+    sourceFieldId: "field_affinity",
+    operator: ">=",
+    sourceThreshold: 0,
+    targetFieldId: "field_excite",
+    effect: { kind: "delta", value: 5 },
+    enabled: true,
+  }];
+  legacy.stateValues = {
+    "character:T": { field_affinity: 10, field_excite: 0 },
+  };
+  legacy.lastSettled = {
+    "character:T": { field_affinity: NOW - HOUR },
+  };
+  const { files, serialized } = filesWithV2(legacy);
+  const seedStore = v3Store(files, legacy);
+  await seedStore.initialize();
+  const configured = await seedStore.readV3();
+  const next = structuredClone(configured.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  next.conditions = [
+    {
+      id: "condition_ai_character",
+      name: "AI character event",
+      description: "",
+      enabled: true,
+      expression: {
+        kind: "and",
+        children: [
+          { kind: "predicate", predicate: { kind: "sender", senders: ["character"] } },
+          { kind: "predicate", predicate: {
+            kind: "ai_semantic",
+            id: "predicate_character_event",
+            triggerType: "character event",
+            requirement: "The character event should activate focus.",
+            minimumConfidence: 0.7,
+          } },
+        ],
+      },
+      createdAt,
+      updatedAt: createdAt,
+    },
+    {
+      id: "condition_character",
+      name: "Character turn",
+      description: "",
+      enabled: true,
+      expression: { kind: "predicate", predicate: { kind: "sender", senders: ["character"] } },
+      createdAt,
+      updatedAt: createdAt,
+    },
+  ];
+  next.effectGroups = [
+    {
+      id: "effect_group_existing",
+      name: "Existing source-aware effect",
+      description: "",
+      enabled: true,
+      fieldEffects: [{
+        id: "field_effect_existing",
+        fieldId: "field_affinity",
+        actorSelector: { kind: "selected", actorIds: ["T"] },
+        operations: [
+          { kind: "fixed_adjustment", value: 1, sources: ["natural"] },
+          { kind: "positive_multiplier", value: 2, sources: ["ai"] },
+        ],
+      }],
+      createdAt,
+      updatedAt: createdAt,
+    },
+    {
+      id: "effect_group_focus",
+      name: "Focus",
+      description: "",
+      enabled: true,
+      fieldEffects: [{
+        id: "field_effect_focus",
+        fieldId: "field_affinity",
+        actorSelector: { kind: "trigger_actor" },
+        operations: [
+          { kind: "immediate_delta", value: -1 },
+          { kind: "positive_multiplier", value: 0.5, sources: ["rule"] },
+        ],
+      }],
+      defaultDuration: { expiresAt: null, remainingTurns: 2 },
+      createdAt,
+      updatedAt: createdAt,
+    },
+  ];
+  next.activeEffects = [{
+    id: "active_existing",
+    definitionId: "effect_group_existing",
+    triggerActorId: "T",
+    resolvedTargets: [{
+      fieldId: "field_affinity",
+      actorId: "T",
+      scope: "character",
+      scopeKey: "character:T",
+    }],
+    duration: { expiresAt: null, remainingTurns: 3 },
+    activatedAt: createdAt,
+    reason: { mode: "template", template: "general", text: "Existing source-aware effect" },
+  }];
+  next.rules = [
+    {
+      id: "rule_activate_focus",
+      name: "Activate focus",
+      description: "",
+      enabled: true,
+      triggerActorSelector: { kind: "current_actor" },
+      conditionId: "condition_ai_character",
+      actions: [{ kind: "activate_effect_group", effectGroupId: "effect_group_focus" }],
+      cooldownHours: 0,
+      executionOrder: 0,
+      createdAt,
+      updatedAt: createdAt,
+    },
+    {
+      id: "rule_focus_gain",
+      name: "Focused gain",
+      description: "",
+      enabled: true,
+      triggerActorSelector: { kind: "current_actor" },
+      conditionId: "condition_character",
+      actions: [{
+        kind: "change_field",
+        fieldId: "field_affinity",
+        target: { kind: "trigger_actor" },
+        delta: 10,
+        effectGroupIds: ["effect_group_focus"],
+      }],
+      cooldownHours: 0,
+      executionOrder: 1,
+      createdAt,
+      updatedAt: createdAt,
+    },
+  ];
+  await seedStore.transactV3(configured.revision, next, []);
+  const beforeMessage = await seedStore.readV3();
+
+  const character = { characterCardId: "T", name: "T", avatarUri: null };
+  const hostSnapshot = {
+    chatId: "chat_main",
+    activePrompt: { type: "character_card", id: "T", name: "T" },
+    activeCharacter: character,
+    activeGroup: null,
+    characters: [character],
+    groups: [],
+    members: [],
+    currentCharacter: character,
+  };
+  const modelCalls = [];
+  const registrations = {};
+  const fileCalls = [];
+  installProductionHost(t, files, hostSnapshot, modelCalls, registrations, fileCalls);
+  const main = await import("../dist/main.js");
+  assert.equal(main.registerToolPkg(), true);
+  assert.equal(typeof registrations.chat?.function, "function");
+  assert.deepEqual(await registrations.lifecycle.function(), { ok: true });
+
+  const hookResult = await registrations.chat.function({
+    eventName: "message_persisted",
+    eventPayload: {
+      chatId: "chat_main",
+      messageId: "message_production_hook",
+      variantId: null,
+      actorCharacterCardId: "T",
+      characterGroupId: null,
+      actorName: "T",
+      isComplete: true,
+      timestamp: NOW,
+      sender: "ai",
+      content: "A role-aware production event",
+    },
+  });
+
+  assert.equal(hookResult, null);
+  const committed = await seedStore.readV3();
+  assert.equal(committed.revision, beforeMessage.revision + 1);
+  assert.equal(committed.dataset.stateValues["character:T"].field_affinity, 28);
+  assert.equal(committed.dataset.stateValues["character:T"].field_excite, 10);
+  assert.equal(committed.dataset.activeEffects.length, 2);
+  assert.deepEqual(committed.dataset.activeEffects.map((effect) => effect.duration.remainingTurns), [2, 1]);
+  assert.equal(committed.dataset.processedMessageIds.length, 1);
+  assert.equal(Object.values(committed.dataset.messageFacts).flat().length, 1);
+  assert.equal(Object.values(committed.dataset.hourlyMessageBuckets).flat()
+    .reduce((sum, bucket) => sum + bucket.messageCount, 0), 1);
+  assert.equal(committed.dataset.recordManifest.recordCount, 7);
+  assert.equal(files.snapshot()[V2_PATH], serialized);
+
+  const conditionCall = modelCalls.find((call) => call.jsonSchema.name === "mvu_condition_judgement");
+  assert.deepEqual(JSON.parse(conditionCall.userPrompt), {
+    role: "character",
+    actorId: "T",
+    actorName: "T",
+    content: "A role-aware production event",
+  });
+  assert.equal(modelCalls.filter((call) => call.jsonSchema.name === "mvu_condition_judgement").length, 1);
+  assert.equal(modelCalls.filter((call) => call.jsonSchema.name === "mvu_state_judgement").length, 1);
+
+  const storedLines = Object.entries(files.snapshot())
+    .filter(([path]) => path.startsWith(`${RECORD_DIRECTORY}/segment-`))
+    .flatMap(([, content]) => content.trim().split("\n").filter(Boolean).map(JSON.parse));
+  assert.equal(storedLines.length, 7);
+  assert.equal(storedLines.every((line) => line.commitRevision === committed.revision), true);
+  assert.equal(fileCalls.filter((call) => call.operation === "move" && call.destination === V3_PATH).length, 1);
+  assert.equal(fileCalls.some((call) => call.operation === "write" && call.append === true), true);
+
+  const productionReader = createRuntime({ getConfigDir: () => CONFIG_DIR });
+  assert.equal((await productionReader.initialize()).mode, "v3");
+  const queried = await productionReader.store.queryRecords({ offset: 0, limit: 10, direction: "asc" });
+  assert.equal(queried.items.length, 7);
+  assert.equal(fileCalls.some((call) => call.operation === "readPart"), true);
+  const compatibility = await productionReader.snapshot({
+    chatId: "chat_main", actorId: "T", groupId: null, actorName: "T",
+  });
+  assert.equal(compatibility.fields.find((field) => field.definition.id === "field_affinity").currentValue, 28);
+  assert.equal(compatibility.records.length, 7);
+  assert.equal(compatibility.migrationStatus.mode, "v3");
+
+  const orphanPath = `${RECORD_DIRECTORY}/segment-${String(committed.dataset.recordManifest.nextSegmentIndex).padStart(6, "0")}.jsonl`;
+  await files.writeText(orphanPath, "orphan\n");
+  const repairRuntime = createRuntime({ getConfigDir: () => CONFIG_DIR });
+  assert.equal((await repairRuntime.initialize()).mode, "v3");
+  assert.equal(files.snapshot()[orphanPath], undefined);
+  assert.equal(fileCalls.some((call) => call.operation === "deleteFile" && call.path === orphanPath), true);
+});
+
+test("production runtime composes legacy field behavior with v3 rules in one committed transaction", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  legacy.fields[0].bindingIds = ["T"];
+  legacy.fields[0].initialValue = 10;
+  legacy.fields[0].naturalChange = { enabled: true, unitMs: HOUR, amount: 2 };
+  legacy.fields[0].perTurnChange = {
+    enabled: true, intervalTurns: 1, amount: 3, countMode: "character",
+  };
+  legacy.fields[0].ai = { enabled: true, minConfidence: 0.5, maxDelta: 10, prompt: "Track affinity." };
+  legacy.fields[1].bindingIds = ["T"];
+  legacy.fields[1].initialValue = 0;
+  legacy.rules = [{
+    id: "link_affinity_excite",
+    sourceFieldId: "field_affinity",
+    operator: ">=",
+    sourceThreshold: 0,
+    targetFieldId: "field_excite",
+    effect: { kind: "delta", value: 5 },
+    enabled: true,
+  }];
+  legacy.stateValues = {
+    "character:T": { field_affinity: 10, field_excite: 0 },
+  };
+  legacy.lastSettled = {
+    "character:T": { field_affinity: NOW - HOUR },
+  };
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const configured = await store.readV3();
+  const next = structuredClone(configured.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  next.conditions = [{
+    id: "condition_character",
+    name: "Character turn",
+    description: "",
+    enabled: true,
+    expression: { kind: "predicate", predicate: { kind: "sender", senders: ["character"] } },
+    createdAt,
+    updatedAt: createdAt,
+  }];
+  next.effectGroups = [{
+    id: "effect_group_focus",
+    name: "Focus",
+    description: "",
+    enabled: true,
+    fieldEffects: [{
+      id: "field_effect_focus",
+      fieldId: "field_affinity",
+      actorSelector: { kind: "trigger_actor" },
+      operations: [
+        { kind: "immediate_delta", value: -1 },
+        { kind: "positive_multiplier", value: 0.5, sources: ["rule"] },
+      ],
+    }],
+    defaultDuration: { expiresAt: null, remainingTurns: 2 },
+    createdAt,
+    updatedAt: createdAt,
+  }];
+  next.rules = [
+    {
+      id: "rule_activate_focus",
+      name: "Activate focus",
+      description: "",
+      enabled: true,
+      triggerActorSelector: { kind: "current_actor" },
+      conditionId: "condition_character",
+      actions: [{ kind: "activate_effect_group", effectGroupId: "effect_group_focus" }],
+      cooldownHours: 0,
+      executionOrder: 0,
+      createdAt,
+      updatedAt: createdAt,
+    },
+    {
+      id: "rule_focus_gain",
+      name: "Focused gain",
+      description: "",
+      enabled: true,
+      triggerActorSelector: { kind: "current_actor" },
+      conditionId: "condition_character",
+      actions: [{
+        kind: "change_field",
+        fieldId: "field_affinity",
+        target: { kind: "trigger_actor" },
+        delta: 10,
+        effectGroupIds: ["effect_group_focus"],
+      }],
+      cooldownHours: 0,
+      executionOrder: 1,
+      createdAt,
+      updatedAt: createdAt,
+    },
+  ];
+  next.activeEffects = [];
+  await store.transactV3(configured.revision, next, []);
+  const runtime = createRuntime({ store, initialActors: [{ characterId: "T", name: "T", enabled: true }] });
+  const beforeMessage = await store.readV3();
+
+  const result = await runtime.processPersistedMessage({
+    context: { chatId: "chat_main", actorId: "T", groupId: "group_main", actorName: "T" },
+    currentActorId: "T",
+    actorNamesById: { T: "T" },
+    messageId: "message_production",
+    variantId: null,
+    content: "A composed production turn",
+    role: "character",
+    occurredAt: NOW,
+    signals: {
+      recentPositiveCount: null,
+      userCareDetected: null,
+      lastInteractionAt: null,
+      messageCountInLast24Hours: null,
+      specialDayDetected: null,
+    },
+    aiChanges: [{
+      fieldId: "field_affinity",
+      delta: 4,
+      reason: "state AI",
+      confidence: 0.9,
+    }],
+    aiRuleJudgements: [],
+  });
+
+  const committed = await store.readV3();
+  assert.equal(committed.revision, beforeMessage.revision + 1);
+  assert.equal(committed.dataset.stateValues["character:T"].field_affinity, 23);
+  assert.equal(committed.dataset.stateValues["character:T"].field_excite, 10);
+  assert.deepEqual(result.matchedRuleIds, ["rule_activate_focus", "rule_focus_gain"]);
+  assert.equal(result.records.length, 7);
+  assert.equal(result.records.some((record) => record.source === "natural"), true);
+  assert.equal(result.records.some((record) => record.source === "per_turn"), true);
+  assert.equal(result.records.some((record) => record.source === "ai" && record.reason.includes("state AI")), true);
+  assert.equal(result.records.filter((record) => record.ruleIds.includes("link_affinity_excite")).length, 2);
+  assert.equal(committed.dataset.activeEffects.length, 1);
+  assert.equal(committed.dataset.activeEffects[0].triggerActorId, "T");
+  assert.equal(committed.dataset.activeEffects[0].duration.remainingTurns, 1);
+  assert.equal(committed.dataset.processedMessageIds.length, 1);
+  assert.equal(Object.values(committed.dataset.messageFacts).flat().length, 1);
+  assert.equal(Object.values(committed.dataset.hourlyMessageBuckets).flat()
+    .reduce((sum, bucket) => sum + bucket.messageCount, 0), 1);
+  assert.equal(committed.dataset.recordManifest.recordCount, 7);
+
+  const persistedRecords = await store.queryRecords({ offset: 0, limit: 10, direction: "asc" });
+  assert.deepEqual(persistedRecords.items.map((record) => record.id), result.records.map((record) => record.id));
+  const storedLines = Object.entries(files.snapshot())
+    .filter(([path]) => path.startsWith(`${RECORD_DIRECTORY}/segment-`))
+    .flatMap(([, content]) => content.trim().split("\n").filter(Boolean).map(JSON.parse));
+  assert.equal(storedLines.length, 7);
+  assert.equal(storedLines.every((line) => line.commitRevision === committed.revision), true);
+
+  const compatibility = await runtime.snapshot({
+    chatId: "chat_main", actorId: "T", groupId: "group_main", actorName: "T",
+  });
+  assert.equal(compatibility.fields.find((field) => field.definition.id === "field_affinity").currentValue, 23);
+  assert.equal(compatibility.records.length, 7);
+});
+
+test("hourly cleanup derives its horizon from every enabled condition window", async () => {
+  const legacy = legacyDatasetFixture();
+  legacy.autoRules = [];
+  legacy.temporaryEffects = [];
+  legacy.fields[0].bindingIds = ["T"];
+  const { files } = filesWithV2(legacy);
+  const store = v3Store(files, legacy);
+  await store.initialize();
+  const before = await store.readV3();
+  const next = structuredClone(before.dataset);
+  const createdAt = new Date(NOW).toISOString();
+  next.conditions = [
+    {
+      id: "condition_long_window",
+      name: "Long window",
+      description: "",
+      enabled: true,
+      expression: {
+        kind: "not",
+        child: {
+          kind: "predicate",
+          predicate: { kind: "high_frequency", messages: 999, windowHours: 10_000, bucketHours: 1 },
+        },
+      },
+      createdAt,
+      updatedAt: createdAt,
+    },
+    {
+      id: "condition_disabled_larger_window",
+      name: "Disabled larger window",
+      description: "",
+      enabled: false,
+      expression: {
+        kind: "predicate",
+        predicate: { kind: "high_frequency", messages: 999, windowHours: 20_000, bucketHours: 1 },
+      },
+      createdAt,
+      updatedAt: createdAt,
+    },
+  ];
+  next.rules = [];
+  const eventKey = automationScopeKey({
+    chatId: "chat_main", actorId: "T", groupId: "group_main", actorName: "T",
+  });
+  const currentHour = Math.floor(NOW / HOUR) * HOUR;
+  next.hourlyMessageBuckets[eventKey] = [
+    { startedAt: currentHour - 15_000 * HOUR, messageCount: 1 },
+    { startedAt: currentHour - 9_000 * HOUR, messageCount: 2 },
+  ];
+  await store.transactV3(before.revision, next, []);
+  const runtime = createRuntime({ store });
+
+  await runtime.processPersistedMessage({
+    context: { chatId: "chat_main", actorId: "T", groupId: "group_main", actorName: "T" },
+    currentActorId: "T",
+    messageId: "message_retention",
+    variantId: null,
+    content: "retention event",
+    role: "user",
+    occurredAt: NOW,
+    signals: {
+      recentPositiveCount: null,
+      userCareDetected: null,
+      lastInteractionAt: null,
+      messageCountInLast24Hours: null,
+      specialDayDetected: null,
+    },
+    aiChanges: [],
+    aiRuleJudgements: [],
+  });
+
+  assert.deepEqual((await store.readV3()).dataset.hourlyMessageBuckets[eventKey], [
+    { startedAt: currentHour - 9_000 * HOUR, messageCount: 2 },
+    { startedAt: currentHour, messageCount: 1 },
+  ]);
+});
