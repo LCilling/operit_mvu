@@ -117,7 +117,8 @@ interface CursorPayload {
   version: 1;
   entity: "fields" | "actors" | "groups";
   fingerprint: string;
-  offset: number;
+  anchorValue: Sortable;
+  anchorId: string;
 }
 
 type Sortable = string | number | boolean;
@@ -642,7 +643,16 @@ function queryCollection<T>(options: CollectionQueryOptions<T>): QueryResponse<T
   });
   const sort = options.request.sort ?? options.defaultSort;
   const sorted = [...filtered].sort(stableComparator(options.sortKeys[sort.key], sort.direction, options.id));
-  return sliceCollection(options.entity, sorted, options.request, options.pageSize, options.cursor, options.id);
+  return sliceCollection(
+    options.entity,
+    sorted,
+    options.request,
+    options.pageSize,
+    options.cursor,
+    options.sortKeys[sort.key],
+    sort.direction,
+    options.id,
+  );
 }
 
 function queryCollectionFromValidated<T>(
@@ -656,7 +666,7 @@ function queryCollectionFromValidated<T>(
   id: (item: T) => string,
 ): QueryResponse<T> {
   const sorted = [...items].sort(stableComparator(sortKeys[sort.key], sort.direction, id));
-  return sliceCollection(entity, sorted, request, pageSize, cursor, id);
+  return sliceCollection(entity, sorted, request, pageSize, cursor, sortKeys[sort.key], sort.direction, id);
 }
 
 function sliceCollection<T>(
@@ -665,23 +675,51 @@ function sliceCollection<T>(
   request: QueryRequest,
   pageSize: number,
   cursor: boolean,
-  _id: (item: T) => string,
+  sortValue: (item: T) => Sortable,
+  direction: "asc" | "desc",
+  id: (item: T) => string,
 ): QueryResponse<T> {
   const fingerprint = queryFingerprint(request);
-  const offset = cursor
-    ? request.cursor === undefined ? 0 : decodeCursor(request.cursor, entity, fingerprint).offset
-    : ((request.page ?? 1) - 1) * pageSize;
+  let offset = ((request.page ?? 1) - 1) * pageSize;
+  if (cursor) {
+    offset = 0;
+    if (request.cursor !== undefined) {
+      const anchor = decodeCursor(request.cursor, entity, fingerprint);
+      const next = sorted.findIndex((item) =>
+        compareToAnchor(item, anchor, sortValue, direction, id) > 0);
+      offset = next < 0 ? sorted.length : next;
+    }
+  }
   const items = sorted.slice(offset, offset + pageSize).map((item) => klona(item));
   const hasMore = offset + items.length < sorted.length;
+  const last = items.at(-1);
   return {
     items,
     loadedCount: items.length,
     totalCount: sorted.length,
     hasMore,
-    nextCursor: cursor && hasMore
-      ? encodeCursor({ version: 1, entity: entity as CursorPayload["entity"], fingerprint, offset: offset + items.length })
+    nextCursor: cursor && hasMore && last !== undefined
+      ? encodeCursor({
+          version: 1,
+          entity: entity as CursorPayload["entity"],
+          fingerprint,
+          anchorValue: sortValue(last),
+          anchorId: id(last),
+        })
       : null,
   };
+}
+
+function compareToAnchor<T>(
+  item: T,
+  anchor: CursorPayload,
+  sortValue: (item: T) => Sortable,
+  direction: "asc" | "desc",
+  id: (item: T) => string,
+): number {
+  const primary = compareSortable(sortValue(item), anchor.anchorValue);
+  if (primary !== 0) return direction === "asc" ? primary : -primary;
+  return compareText(id(item), anchor.anchorId);
 }
 
 function stableComparator<T>(
@@ -788,9 +826,13 @@ function decodeCursor(cursor: string, entity: string, fingerprint: string): Curs
     throw new Error("MVU_QUERY_CURSOR_INVALID");
   }
   const candidate = parsed as Partial<CursorPayload>;
-  if (Object.keys(parsed).length !== 4 || candidate.version !== 1 || candidate.entity !== entity ||
-    candidate.fingerprint !== fingerprint || !Number.isSafeInteger(candidate.offset) ||
-    (candidate.offset ?? -1) < 0) {
+  const anchorType = typeof candidate.anchorValue;
+  if (Object.keys(parsed).length !== 5 || candidate.version !== 1 || candidate.entity !== entity ||
+    candidate.fingerprint !== fingerprint ||
+    (anchorType !== "string" && anchorType !== "number" && anchorType !== "boolean") ||
+    (anchorType === "number" && !Number.isFinite(candidate.anchorValue)) ||
+    typeof candidate.anchorId !== "string" || candidate.anchorId.length === 0 ||
+    candidate.anchorId.length > 256) {
     throw new Error("MVU_QUERY_CURSOR_INVALID");
   }
   return candidate as CursorPayload;
