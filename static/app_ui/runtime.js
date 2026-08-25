@@ -33,6 +33,8 @@
   const PICKER_WINDOW_OVERSCAN = 4;
   const PICKER_WINDOW_MAX_ROWS = 24;
   const PICKER_RETAINED_PAGE_LIMIT = 128;
+  const MODEL_BUDGET_DIAGNOSTIC_LIMIT = 32;
+  const MODEL_BUDGET_DIAGNOSTIC_MAX_CODE_POINTS = 256;
   const QUERY_RESPONSE_POLICIES = {
     fields: { method: "queryFields", pageSize: 5, pickerPageSize: 30, maxTotal: Number.MAX_SAFE_INTEGER },
     actors: { method: "queryActors", pageSize: 30, cursor: true, maxTotal: Number.MAX_SAFE_INTEGER },
@@ -84,6 +86,9 @@
     conditionListRecovery: null,
     managementDeleteDialog: null,
     managementRecoveries: { rules: null, effectGroups: null },
+    advancedExport: { busy: false, result: null, error: "" },
+    advancedDialog: null,
+    advancedImportOpener: null,
     statusMode: "character",
     selectedFieldId: queryState.get("field") || "",
     selectedEntityId: "",
@@ -154,6 +159,11 @@
     resetRuleEditorDraft,
     resetEffectEditorDraft,
     validateCompactSnapshot,
+    validateExportDatasetResponse,
+    validateDatasetImportPreview,
+    validateDatasetImportResult,
+    validateDefaultConditionPreview,
+    validateDefaultConditionResult,
     validateQueryResponse,
     escapeHtml,
     formatNumber,
@@ -780,7 +790,7 @@
     if (!isRecord(snapshot.activeContext) || !isRecord(snapshot.counts) ||
         !isRecord(snapshot.selected) || !isRecord(snapshot.contextLabels) ||
         !isRecord(snapshot.pages) || !isRecord(snapshot.settings) ||
-        !isRecord(snapshot.migrationStatus)) {
+        !isRecord(snapshot.migrationStatus) || !isRecord(snapshot.modelBudget)) {
       throw new Error("MVU_PAGE_SNAPSHOT_SHAPE_INVALID");
     }
     requireString(snapshot.activeContext.chatId, "MVU_CONTEXT_CHAT_INVALID", true);
@@ -793,6 +803,7 @@
     requireBoolean(snapshot.contextLabels.truncated, "MVU_CONTEXT_LABEL_INVALID");
     requireBoolean(snapshot.settings.aiEnabled, "MVU_SETTINGS_INVALID");
     validateMigrationStatus(snapshot.migrationStatus);
+    validateModelBudget(snapshot.modelBudget);
     ["fields", "actors", "groups", "rules", "conditions", "effectGroups", "records"].forEach(function (key) {
       if (!nonNegativeInteger(snapshot.counts[key])) throw new Error("MVU_PAGE_COUNT_INVALID:" + key);
     });
@@ -805,6 +816,108 @@
       if (!nonNegativeInteger(snapshot.returnedCount[key])) throw new Error("MVU_PAGE_RETURNED_COUNT_INVALID:" + key);
     });
     return snapshot;
+  }
+
+  function validateModelBudget(budget) {
+    if (!isRecord(budget)) throw new Error("MVU_MODEL_BUDGET_INVALID");
+    const values = [budget.used, budget.total, budget.limit, budget.referencedIncluded, budget.referencedTotal];
+    if (!values.every(nonNegativeInteger) || budget.used > budget.limit ||
+        budget.referencedIncluded > budget.referencedTotal || typeof budget.overflow !== "boolean" ||
+        !Array.isArray(budget.diagnostics) || budget.diagnostics.length > MODEL_BUDGET_DIAGNOSTIC_LIMIT ||
+        budget.diagnostics.some(function (diagnostic) {
+          return typeof diagnostic !== "string" || Array.from(diagnostic).length > MODEL_BUDGET_DIAGNOSTIC_MAX_CODE_POINTS;
+        })) {
+      throw new Error("MVU_MODEL_BUDGET_INVALID");
+    }
+  }
+
+  function validateExportDatasetResponse(value) {
+    if (!isRecord(value)) throw new Error("MVU_EXPORT_RESPONSE_INVALID");
+    requireString(value.fileName, "MVU_EXPORT_RESPONSE_INVALID");
+    requireString(value.savedPath, "MVU_EXPORT_RESPONSE_INVALID");
+    validateBackupSummary(value.summary, true);
+    return value;
+  }
+
+  function validateBackupSummary(summary, includeBytes) {
+    if (!isRecord(summary)) throw new Error("MVU_BACKUP_SUMMARY_INVALID");
+    const keys = ["fieldCount", "conditionCount", "ruleCount", "effectGroupCount", "activeEffectCount", "recordCount"];
+    if (includeBytes) keys.push("sourceRevision", "byteCount");
+    if (!keys.every(function (key) { return nonNegativeInteger(summary[key]); })) {
+      throw new Error("MVU_BACKUP_SUMMARY_INVALID");
+    }
+  }
+
+  function validateWarnings(value, code) {
+    if (!isRecord(value) || !Array.isArray(value.items) || value.items.length > 100 ||
+        value.items.some(function (item) { return typeof item !== "string" || Array.from(item).length > 4096; }) ||
+        !nonNegativeInteger(value.totalCount) || value.totalCount < value.items.length ||
+        typeof value.truncated !== "boolean" || value.truncated !== (value.totalCount > value.items.length)) {
+      throw new Error(code);
+    }
+  }
+
+  function validateDatasetImportPreview(value) {
+    if (!isRecord(value) || value.valid !== true || !["full_v3", "legacy_v2"].includes(value.kind) ||
+        ![2, 3].includes(value.sourceFormatVersion) || !nonNegativeInteger(value.sourceRevision) ||
+        !nonNegativeInteger(value.previewRevision) || !nonNegativeInteger(value.expectedRevision) ||
+        value.previewRevision !== value.expectedRevision || typeof value.replacementWarning !== "string" ||
+        value.replacementWarning.length === 0 || typeof value.confirmationValue !== "string" ||
+        value.confirmationValue.length === 0) {
+      throw new Error("MVU_DATASET_IMPORT_PREVIEW_INVALID");
+    }
+    if (value.kind === "full_v3") {
+      if (value.sourceFormatVersion !== 3 || value.schemaVersion !== 1 || typeof value.exportedAt !== "string") {
+        throw new Error("MVU_DATASET_IMPORT_PREVIEW_INVALID");
+      }
+    } else if (value.sourceFormatVersion !== 2 || value.schemaVersion !== null || value.exportedAt !== null) {
+      throw new Error("MVU_DATASET_IMPORT_PREVIEW_INVALID");
+    }
+    validateBackupSummary(value.summary, false);
+    validateWarnings(value.migrationWarnings, "MVU_DATASET_IMPORT_PREVIEW_INVALID");
+    return value;
+  }
+
+  function validateDatasetImportResult(value) {
+    if (!isRecord(value) || !nonNegativeInteger(value.revision) ||
+        !["full_v3", "legacy_v2"].includes(value.kind) || ![2, 3].includes(value.sourceFormatVersion) ||
+        !nonNegativeInteger(value.sourceRevision) || !nonNegativeInteger(value.recordCount)) {
+      throw new Error("MVU_DATASET_IMPORT_RESULT_INVALID");
+    }
+    validateWarnings(value.migrationWarnings, "MVU_DATASET_IMPORT_RESULT_INVALID");
+    return value;
+  }
+
+  function validateDefaultConditionPreview(value) {
+    if (!isRecord(value) || !nonNegativeInteger(value.expectedRevision) || value.totalCount !== 5 ||
+        !Array.isArray(value.items) || value.items.length !== 5 || !Array.isArray(value.defaultSelectedMissingIds)) {
+      throw new Error("MVU_DEFAULT_CONDITION_PREVIEW_INVALID");
+    }
+    const ids = new Set();
+    value.items.forEach(function (item) {
+      if (!isRecord(item) || typeof item.id !== "string" || typeof item.name !== "string" ||
+          typeof item.description !== "string" || !["missing", "existing", "conflict"].includes(item.status) ||
+          !(item.currentName === null || typeof item.currentName === "string") || ids.has(item.id)) {
+        throw new Error("MVU_DEFAULT_CONDITION_PREVIEW_INVALID");
+      }
+      ids.add(item.id);
+    });
+    if (new Set(value.defaultSelectedMissingIds).size !== value.defaultSelectedMissingIds.length ||
+        value.defaultSelectedMissingIds.some(function (id) {
+          const item = value.items.find(function (candidate) { return candidate.id === id; });
+          return !item || item.status !== "missing";
+        })) {
+      throw new Error("MVU_DEFAULT_CONDITION_PREVIEW_INVALID");
+    }
+    return value;
+  }
+
+  function validateDefaultConditionResult(value) {
+    if (!isRecord(value) || ![value.revision, value.addedCount, value.replacedCount, value.unchangedCount].every(nonNegativeInteger) ||
+        value.addedCount + value.replacedCount + value.unchangedCount !== 5) {
+      throw new Error("MVU_DEFAULT_CONDITION_RESULT_INVALID");
+    }
+    return value;
   }
 
   function validateMigrationStatus(status) {
@@ -1623,7 +1736,70 @@
     if (method === "exportFieldTemplate") return Promise.resolve(demoExportFieldTemplate(demo, params));
     if (method === "previewFieldTemplateImport") return Promise.resolve(demoPreviewFieldTemplate(demo, params.json));
     if (method === "importFieldTemplate") return Promise.resolve(demoImportFieldTemplate(demo, params));
-    if (method === "exportDataset") return Promise.resolve({ formatVersion: 3, demo: true });
+    if (method === "exportDataset") {
+      return Promise.resolve({
+        fileName: "operit-mvu-full-backup-v3-schema1-20330518-033320000Z-r" + state.demoStore.revision + "-0123456789ab.json",
+        savedPath: "/sdcard/Download/Operit/exports/operit-mvu-full-backup-demo.json",
+        summary: {
+          sourceRevision: state.demoStore.revision,
+          fieldCount: demo.fields.length,
+          conditionCount: demo.conditionEntities.length,
+          ruleCount: demo.ruleEntities.length,
+          effectGroupCount: demo.effectEntities.length,
+          activeEffectCount: 3,
+          recordCount: demo.records.length,
+          byteCount: 2048,
+        },
+      });
+    }
+    if (method === "previewDatasetImport") {
+      return Promise.resolve({
+        valid: true,
+        kind: "full_v3",
+        sourceFormatVersion: 3,
+        schemaVersion: 1,
+        exportedAt: "2033-05-18T03:33:20.000Z",
+        sourceRevision: 22,
+        previewRevision: state.demoStore.revision,
+        expectedRevision: state.demoStore.revision,
+        summary: { fieldCount: 12, conditionCount: 5, ruleCount: 6, effectGroupCount: 4, activeEffectCount: 3, recordCount: 321 },
+        migrationWarnings: { items: ["旧条件已迁移"], totalCount: 3, truncated: true },
+        replacementWarning: "导入会替换全部当前 MVU 数据。",
+        confirmationValue: "REPLACE_ALL_MVU_DATA",
+      });
+    }
+    if (method === "importDataset") {
+      if (params.expectedRevision !== state.demoStore.revision) {
+        return Promise.reject(new Error("MVU_STALE_REVISION:" + params.expectedRevision + ":" + state.demoStore.revision));
+      }
+      if (params.confirmation !== "REPLACE_ALL_MVU_DATA") return Promise.reject(new Error("MVU_IMPORT_CONFIRMATION_REQUIRED"));
+      state.demoStore.revision += 1;
+      return Promise.resolve({ revision: state.demoStore.revision, kind: "full_v3", sourceFormatVersion: 3,
+        sourceRevision: 22, recordCount: 321, migrationWarnings: { items: ["旧条件已迁移"], totalCount: 3, truncated: true } });
+    }
+    if (method === "previewDefaultConditions") {
+      return Promise.resolve({
+        expectedRevision: state.demoStore.revision,
+        totalCount: 5,
+        defaultSelectedMissingIds: ["condition_auto_positive", "condition_auto_special"],
+        items: [
+          { id: "condition_auto_positive", name: "连续积极互动", description: "最近对话持续积极互动。", status: "missing", currentName: null },
+          { id: "condition_auto_inactive", name: "长时间未交流", description: "超过一天没有交流。", status: "existing", currentName: "长时间未交流" },
+          { id: "condition_auto_care", name: "主动关心", description: "用户主动关心角色。", status: "conflict", currentName: "自定义关心" },
+          { id: "condition_auto_special", name: "特别的日子", description: "角色的重要纪念日。", status: "missing", currentName: null },
+          { id: "condition_auto_high_frequency", name: "高频互动", description: "一天内产生大量消息。", status: "existing", currentName: "高频互动" },
+        ],
+      });
+    }
+    if (method === "restoreDefaultConditions") {
+      if (params.expectedRevision !== state.demoStore.revision) {
+        return Promise.reject(new Error("MVU_STALE_REVISION:" + params.expectedRevision + ":" + state.demoStore.revision));
+      }
+      state.demoStore.revision += 1;
+      return Promise.resolve({ revision: state.demoStore.revision, addedCount: params.selectedMissingIds.length,
+        replacedCount: params.replaceConflictIds.length,
+        unchangedCount: 5 - params.selectedMissingIds.length - params.replaceConflictIds.length });
+    }
     return Promise.resolve(null);
   }
 
@@ -2473,6 +2649,8 @@
         activeContext: { chatId: "chat-a", actorId: activeActor ? activeActor.characterId : null,
           groupId: requestedGroup.characterGroupId, actorName: activeActor ? activeActor.name : requestedGroup.name, truncated: false },
         settings: { aiEnabled: true }, migrationStatus: { mode: "v3", source: "existing", truncated: false },
+        modelBudget: { used: 4, total: 12, limit: 40, referencedIncluded: 2, referencedTotal: 3,
+          overflow: false, diagnostics: ["1 个引用字段未纳入本轮上下文"] },
         counts: { fields: allFields.length, actors: pickerActors.length, groups: pickerGroups.length, rules: allRuleEntities.length,
           conditions: allConditionEntities.length, effectGroups: allEffectEntities.length, records: allRecords.length },
         selected: { actor: activeActor ? { characterId: activeActor.characterId, name: activeActor.name,

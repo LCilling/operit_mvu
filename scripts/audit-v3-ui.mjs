@@ -330,6 +330,22 @@ requireMatch(files["app.js"], /BACKGROUND_MAX_EDGE\s*=\s*1600[\s\S]*?toDataURL\(
   "custom backgrounds must retain the bounded 1600px JPEG 0.88 pipeline");
 requireMatch(files["app.js"], /data-stop-close[\s\S]*?drawer-layer/,
   "drawer content clicks must not bubble into the overlay close action");
+requireMatch(files["pages-advanced.js"], /data-advanced-primary="appearance"[\s\S]*?data-advanced-primary="backup"/,
+  "advanced root must keep appearance and complete backup as its two primary sections");
+requireMatch(files["pages-advanced.js"], /data-model-budget-summary[\s\S]*?本轮使用[\s\S]*?共[\s\S]*?个字段/,
+  "advanced maintenance must expose the model field budget in readable copy");
+requireMatch(files["runtime.js"], /validateCompactSnapshot[\s\S]*?snapshot\.modelBudget[\s\S]*?validateModelBudget/,
+  "compact snapshot must strictly validate modelBudget before rendering");
+requireMatch(files["runtime.js"], /budget\.used\s*>\s*budget\.limit[\s\S]*?budget\.referencedIncluded\s*>\s*budget\.referencedTotal[\s\S]*?MODEL_BUDGET_DIAGNOSTIC_LIMIT/,
+  "modelBudget validation must enforce numeric relationships and bounded diagnostics");
+requireMatch(files["app.js"], /previewDatasetImportText[\s\S]*?native\.call\("previewDatasetImport"[\s\S]*?commitDatasetImport[\s\S]*?expectedRevision:\s*dialog\.preview\.expectedRevision[\s\S]*?confirmation:\s*dialog\.preview\.confirmationValue/,
+  "complete dataset import must preview through the service before revisioned confirmation");
+requireMatch(files["app.js"], /previewDefaultConditions[\s\S]*?native\.call\("previewDefaultConditions"[\s\S]*?commitDefaultConditions[\s\S]*?native\.call\("restoreDefaultConditions"/,
+  "default conditions must use a previewed atomic production contract");
+rejectMatch(files["pages-advanced.js"], /恢复默认条件<\/button>[\s\S]{0,80}disabled|disabled[^>]*>恢复默认条件/,
+  "default-condition recovery must not remain a disabled placeholder");
+requireMatch(styles, /\.advanced-dialog-layer[\s\S]*?\.advanced-dialog[\s\S]*?max-height:[\s\S]*?overflow-x:\s*hidden/,
+  "advanced backup dialogs must remain bounded and horizontally overflow-safe");
 requireMatch(files["app.js"], /data-new-entity[\s\S]*?rule-editor[\s\S]*?condition-editor[\s\S]*?effect-editor/,
   "new rule, condition, and effect actions must open their owning child editor");
 

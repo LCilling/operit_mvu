@@ -73,6 +73,7 @@ function installProductionMainHost(t, files, hostSnapshot, registrations, system
   } };
   globalThis.ToolPkg = {
     getConfigDir() { return CONFIG_DIR; },
+    readResource() { return ""; },
     chatContext: {
       async snapshot() { return structuredClone(hostSnapshot); },
     },
@@ -783,6 +784,7 @@ test("typed IPC exposes every query and v3 condition effect-group and rule opera
     "createEffectGroup", "updateEffectGroup", "copyEffectGroup", "toggleEffectGroup",
     "deleteEffectGroup", "getEffectGroupReferences",
     "createRule", "updateRule", "copyRule", "toggleRule", "deleteRule", "getRuleReferences",
+    "previewDefaultConditions", "restoreDefaultConditions",
   ];
   for (const method of methods) {
     assert.equal(typeof MVU_IPC[method], "string", `${method} channel`);
@@ -796,6 +798,44 @@ test("typed IPC exposes every query and v3 condition effect-group and rule opera
   assert.throws(
     () => MVU_REQUEST_PARSERS.getEntityById({ entityType: "record", id: "record_1" }),
     /MVU_ENTITY_TYPE_INVALID/,
+  );
+});
+
+test("default-condition IPC accepts only revisioned explicit restore decisions", () => {
+  assert.deepEqual(MVU_REQUEST_PARSERS.previewDefaultConditions({}), {});
+  assert.deepEqual(MVU_REQUEST_PARSERS.restoreDefaultConditions({
+    expectedRevision: 7,
+    selectedMissingIds: ["condition_auto_positive"],
+    replaceConflictIds: ["condition_auto_care"],
+  }), {
+    expectedRevision: 7,
+    selectedMissingIds: ["condition_auto_positive"],
+    replaceConflictIds: ["condition_auto_care"],
+  });
+  assert.throws(
+    () => MVU_REQUEST_PARSERS.restoreDefaultConditions({
+      expectedRevision: 7,
+      selectedMissingIds: ["condition_auto_positive", "condition_auto_positive"],
+      replaceConflictIds: [],
+    }),
+    /MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID/,
+  );
+  assert.throws(
+    () => MVU_REQUEST_PARSERS.restoreDefaultConditions({
+      expectedRevision: 7,
+      selectedMissingIds: ["condition_not_a_template"],
+      replaceConflictIds: [],
+    }),
+    /MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID/,
+  );
+  assert.throws(
+    () => MVU_REQUEST_PARSERS.restoreDefaultConditions({
+      expectedRevision: 7,
+      selectedMissingIds: [],
+      replaceConflictIds: [],
+      force: true,
+    }),
+    /MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID/,
   );
 });
 
@@ -1587,4 +1627,154 @@ test("query response contract remains exact for empty committed history", async 
     hasMore: false,
     nextCursor: null,
   });
+});
+
+test("default-condition preview classifies all five templates without treating timestamps as conflicts", async () => {
+  const dataset = makeDataset();
+  dataset.conditions = [
+    {
+      id: "condition_auto_inactive",
+      name: "长时间未交流",
+      description: "超过一天没有交流。",
+      enabled: true,
+      expression: { kind: "predicate", predicate: { kind: "long_inactive", hours: 24 } },
+      createdAt: "2029-01-01T00:00:00.000Z",
+      updatedAt: "2029-01-02T00:00:00.000Z",
+    },
+    {
+      id: "condition_auto_care",
+      name: "我的主动关心规则",
+      description: "用户已经自定义过该 ID。",
+      enabled: false,
+      expression: { kind: "predicate", predicate: { kind: "keywords", keywords: ["关心"] } },
+      createdAt: "2029-01-01T00:00:00.000Z",
+      updatedAt: "2029-01-02T00:00:00.000Z",
+    },
+  ];
+  dataset.rules = [];
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  const service = new MvuQueryService(fixture.source, fixture.options);
+
+  const preview = await service.previewDefaultConditions({});
+  assert.equal(preview.expectedRevision, dataset.revision);
+  assert.equal(preview.totalCount, 5);
+  assert.deepEqual(
+    preview.items.map((item) => [item.id, item.status, item.currentName]),
+    [
+      ["condition_auto_positive", "missing", null],
+      ["condition_auto_inactive", "existing", "长时间未交流"],
+      ["condition_auto_care", "conflict", "我的主动关心规则"],
+      ["condition_auto_special", "missing", null],
+      ["condition_auto_high_frequency", "missing", null],
+    ],
+  );
+  assert.deepEqual(preview.defaultSelectedMissingIds, [
+    "condition_auto_positive",
+    "condition_auto_special",
+    "condition_auto_high_frequency",
+  ]);
+});
+
+test("default-condition restore adds selected missing templates and replaces only explicitly selected conflicts atomically", async () => {
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.conditions = [{
+    id: "condition_auto_care",
+    name: "冲突条件",
+    description: "不得静默覆盖",
+    enabled: false,
+    expression: { kind: "predicate", predicate: { kind: "user_care" } },
+    createdAt: "2029-01-01T00:00:00.000Z",
+    updatedAt: "2029-01-02T00:00:00.000Z",
+  }];
+  dataset.rules = [];
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  let writes = 0;
+  const sourceTransact = fixture.source.transactV3;
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async transactV3(...args) {
+      writes += 1;
+      return sourceTransact(...args);
+    },
+  }, fixture.options);
+
+  const result = await service.restoreDefaultConditions({
+    expectedRevision: dataset.revision,
+    selectedMissingIds: ["condition_auto_positive"],
+    replaceConflictIds: ["condition_auto_care"],
+  });
+  assert.deepEqual(result, {
+    revision: dataset.revision + 1,
+    addedCount: 1,
+    replacedCount: 1,
+    unchangedCount: 3,
+  });
+  assert.equal(writes, 1);
+  const committed = fixture.current();
+  assert.equal(committed.conditions.length, 2);
+  assert.deepEqual(
+    committed.conditions.map((item) => item.id).sort(),
+    ["condition_auto_care", "condition_auto_positive"],
+  );
+  assert.equal(committed.conditions.find((item) => item.id === "condition_auto_care").name, "主动关心");
+  assert.deepEqual(
+    committed.conditions.find((item) => item.id === "condition_auto_positive").expression,
+    { kind: "predicate", predicate: { kind: "recent_positive", count: 6 } },
+  );
+});
+
+test("default-condition restore rejects stale or mismatched decisions without writing", async () => {
+  const dataset = makeDataset();
+  dataset.activeEffects = [];
+  dataset.conditions = [];
+  dataset.rules = [];
+  const fixture = createSource(dataset, {
+    queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+  });
+  let writes = 0;
+  const sourceTransact = fixture.source.transactV3;
+  const service = new MvuQueryService({
+    ...fixture.source,
+    async transactV3(...args) {
+      writes += 1;
+      return sourceTransact(...args);
+    },
+  }, fixture.options);
+
+  await assert.rejects(service.restoreDefaultConditions({
+    expectedRevision: dataset.revision + 1,
+    selectedMissingIds: ["condition_auto_positive"],
+    replaceConflictIds: [],
+  }), /MVU_STALE_REVISION/);
+  await assert.rejects(service.restoreDefaultConditions({
+    expectedRevision: dataset.revision,
+    selectedMissingIds: [],
+    replaceConflictIds: ["condition_auto_positive"],
+  }), /MVU_DEFAULT_CONDITION_DECISION_INVALID/);
+  assert.equal(writes, 0);
+  assert.deepEqual(fixture.current().conditions, []);
+});
+
+test("compact snapshot rejects internally inconsistent model-budget DTOs", async () => {
+  const invalidBudgets = [
+    { used: 41, total: 41, limit: 40, referencedIncluded: 0, referencedTotal: 0, overflow: true, diagnostics: [] },
+    { used: 1, total: 1, limit: 40, referencedIncluded: 2, referencedTotal: 1, overflow: false, diagnostics: [] },
+    { used: 1, total: 1, limit: 40, referencedIncluded: 0, referencedTotal: 0, overflow: "no", diagnostics: [] },
+    { used: 1, total: 1, limit: 40, referencedIncluded: 0, referencedTotal: 0, overflow: false, diagnostics: ["x".repeat(513)] },
+  ];
+  for (const modelBudget of invalidBudgets) {
+    const fixture = createSource(makeDataset(), {
+      queryCommittedRecords: async () => ({ items: [], loadedCount: 0, totalCount: 0, hasMore: false, nextOffset: null }),
+    });
+    fixture.source.modelBudget = async () => modelBudget;
+    await assert.rejects(
+      new MvuQueryService(fixture.source, fixture.options).pageSnapshot(),
+      /MVU_MODEL_BUDGET_INVALID/,
+    );
+  }
 });

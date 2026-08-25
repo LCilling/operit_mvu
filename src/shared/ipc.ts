@@ -42,6 +42,7 @@ import {
   QUERY_SEARCH_MAX_LENGTH,
   type ConditionInput,
   type ConditionPatch,
+  type DefaultConditionRestorePreview,
   type DeleteMutationResponse,
   type EffectGroupInput,
   type EffectGroupPatch,
@@ -55,6 +56,8 @@ import {
   type QueryRequest,
   type QueryResponse,
   type ReferenceQueryRequest,
+  type RestoreDefaultConditionsRequest,
+  type RestoreDefaultConditionsResult,
   type RevisionedIdRequest,
   type RuleInput,
   type RulePatch,
@@ -148,6 +151,8 @@ export const MVU_IPC = {
   toggleRule: "operit_mvu:toggle_rule_v3",
   deleteRule: "operit_mvu:delete_rule_v3",
   getRuleReferences: "operit_mvu:get_rule_references",
+  previewDefaultConditions: "operit_mvu:preview_default_conditions",
+  restoreDefaultConditions: "operit_mvu:restore_default_conditions",
 } as const;
 
 export type EmptyRequest = Record<string, never>;
@@ -376,6 +381,44 @@ function parseEmptyRequest(value: unknown): EmptyRequest {
   const record = requireRecord(value, "MVU_EMPTY_REQUEST_INVALID");
   assertKeys(record, [], [], "MVU_EMPTY_REQUEST_INVALID");
   return {};
+}
+
+const DEFAULT_CONDITION_TEMPLATE_IDS = new Set([
+  "condition_auto_positive",
+  "condition_auto_inactive",
+  "condition_auto_care",
+  "condition_auto_special",
+  "condition_auto_high_frequency",
+]);
+
+function parseDefaultConditionIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > DEFAULT_CONDITION_TEMPLATE_IDS.size) {
+    fail("MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+  }
+  const ids = value.map((entry) => {
+    if (typeof entry !== "string" || !DEFAULT_CONDITION_TEMPLATE_IDS.has(entry)) {
+      fail("MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+    }
+    return entry;
+  });
+  if (new Set(ids).size !== ids.length) fail("MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+  return ids;
+}
+
+function parseRestoreDefaultConditionsRequest(value: unknown): RestoreDefaultConditionsRequest {
+  const record = requireRecord(value, "MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+  assertKeys(record, ["expectedRevision", "selectedMissingIds", "replaceConflictIds"], [],
+    "MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+  const selectedMissingIds = parseDefaultConditionIds(record.selectedMissingIds);
+  const replaceConflictIds = parseDefaultConditionIds(record.replaceConflictIds);
+  if (selectedMissingIds.some((id) => replaceConflictIds.includes(id))) {
+    fail("MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID");
+  }
+  return {
+    expectedRevision: requireExpectedRevision(record, "MVU_RESTORE_DEFAULT_CONDITIONS_REQUEST_INVALID"),
+    selectedMissingIds,
+    replaceConflictIds,
+  };
 }
 
 function parseSnapshotRequest(value: unknown): SnapshotRequest {
@@ -1554,6 +1597,8 @@ export const MVU_REQUEST_PARSERS = {
   toggleRule: (value: unknown) => parseToggleRequest(value, "RULE"),
   deleteRule: (value: unknown) => parseRevisionedIdRequest(value, "MVU_DELETE_RULE_REQUEST_INVALID"),
   getRuleReferences: parseIdRequest,
+  previewDefaultConditions: parseEmptyRequest,
+  restoreDefaultConditions: parseRestoreDefaultConditionsRequest,
 } as const;
 
 function guarded<TRequest, TResult>(
@@ -1815,6 +1860,16 @@ export function installMvuIpc(runtime: MvuRuntime, deps: MvuIpcDependencies): ()
       MVU_IPC.getConditionReferences,
       guarded("getConditionReferences", MVU_REQUEST_PARSERS.getConditionReferences, (request) => deps.queries.getConditionReferences(request))
     ),
+    ToolPkg.ipc.on<unknown, DefaultConditionRestorePreview>(
+      MVU_IPC.previewDefaultConditions,
+      guarded("previewDefaultConditions", MVU_REQUEST_PARSERS.previewDefaultConditions,
+        (request) => deps.queries.previewDefaultConditions(request))
+    ),
+    ToolPkg.ipc.on<unknown, RestoreDefaultConditionsResult>(
+      MVU_IPC.restoreDefaultConditions,
+      guarded("restoreDefaultConditions", MVU_REQUEST_PARSERS.restoreDefaultConditions,
+        (request) => deps.queries.restoreDefaultConditions(request))
+    ),
     ToolPkg.ipc.on<unknown, MutationResponse<EffectGroupDefinition>>(
       MVU_IPC.createEffectGroup,
       guarded("createEffectGroup", MVU_REQUEST_PARSERS.createEffectGroup, (request) => deps.queries.createEffectGroup(request))
@@ -1988,6 +2043,12 @@ export const mvuIpcClient = {
   },
   getConditionReferences(request: ReferenceQueryRequest): Promise<QueryResponse<EntityReferenceSummary>> {
     return call<ReferenceQueryRequest, QueryResponse<EntityReferenceSummary>>(MVU_IPC.getConditionReferences, request);
+  },
+  previewDefaultConditions(request: EmptyRequest): Promise<DefaultConditionRestorePreview> {
+    return call<EmptyRequest, DefaultConditionRestorePreview>(MVU_IPC.previewDefaultConditions, request);
+  },
+  restoreDefaultConditions(request: RestoreDefaultConditionsRequest): Promise<RestoreDefaultConditionsResult> {
+    return call<RestoreDefaultConditionsRequest, RestoreDefaultConditionsResult>(MVU_IPC.restoreDefaultConditions, request);
   },
   createEffectGroup(request: CreateEffectGroupRequest): Promise<MutationResponse<EffectGroupDefinition>> {
     return call<CreateEffectGroupRequest, MutationResponse<EffectGroupDefinition>>(MVU_IPC.createEffectGroup, request);

@@ -25,6 +25,7 @@ import {
   type ImportFieldTemplateRequest,
   type PreviewFieldTemplateImportRequest,
 } from "./field-template";
+import { buildDefaultConditionLibrary } from "./seed";
 
 export const QUERY_SEARCH_MAX_LENGTH = 120;
 export const QUERY_CURSOR_MAX_LENGTH = 96;
@@ -123,6 +124,35 @@ export type EffectGroupInput = Omit<EffectGroupDefinition, "id" | "createdAt" | 
 export type EffectGroupPatch = Partial<EffectGroupInput>;
 export type RuleInput = Omit<RuleDefinitionV3, "id" | "createdAt" | "updatedAt">;
 export type RulePatch = Partial<RuleInput>;
+
+export type DefaultConditionStatus = "missing" | "existing" | "conflict";
+
+export interface DefaultConditionPreviewItem {
+  id: string;
+  name: string;
+  description: string;
+  status: DefaultConditionStatus;
+  currentName: string | null;
+}
+
+export interface DefaultConditionRestorePreview {
+  expectedRevision: number;
+  totalCount: number;
+  defaultSelectedMissingIds: string[];
+  items: DefaultConditionPreviewItem[];
+}
+
+export interface RestoreDefaultConditionsRequest extends RevisionedRequest {
+  selectedMissingIds: string[];
+  replaceConflictIds: string[];
+}
+
+export interface RestoreDefaultConditionsResult {
+  revision: number;
+  addedCount: number;
+  replacedCount: number;
+  unchangedCount: number;
+}
 
 export interface MvuQuerySource {
   readV3(): Promise<V3MvuStoreSnapshot>;
@@ -691,6 +721,60 @@ export class MvuQueryService {
     fitSnapshotToByteBound(result);
     requireSnapshotByteBound(result);
     return result;
+  }
+
+  async previewDefaultConditions(_request: Record<string, never> = {}): Promise<DefaultConditionRestorePreview> {
+    const snapshot = await this.source.readV3();
+    return buildDefaultConditionPreview(snapshot.dataset, snapshot.revision, this.now());
+  }
+
+  async restoreDefaultConditions(request: RestoreDefaultConditionsRequest): Promise<RestoreDefaultConditionsResult> {
+    requireExpectedRevision(request.expectedRevision);
+    requireDefaultConditionIdSelection(request.selectedMissingIds);
+    requireDefaultConditionIdSelection(request.replaceConflictIds);
+    if (request.selectedMissingIds.some((id) => request.replaceConflictIds.includes(id))) {
+      throw new Error("MVU_DEFAULT_CONDITION_DECISION_INVALID");
+    }
+    const snapshot = await this.source.readV3();
+    if (snapshot.revision !== request.expectedRevision) {
+      throw new Error(`MVU_STALE_REVISION:${request.expectedRevision}:${snapshot.revision}`);
+    }
+    const timestamp = new Date(this.now()).toISOString();
+    const templates = buildDefaultConditionLibrary(timestamp);
+    const preview = classifyDefaultConditions(snapshot.dataset, templates);
+    const statusById = new Map(preview.map((item) => [item.template.id, item.status]));
+    if (request.selectedMissingIds.some((id) => statusById.get(id) !== "missing") ||
+      request.replaceConflictIds.some((id) => statusById.get(id) !== "conflict")) {
+      throw new Error("MVU_DEFAULT_CONDITION_DECISION_INVALID");
+    }
+    const addedIds = new Set(request.selectedMissingIds);
+    const replacedIds = new Set(request.replaceConflictIds);
+    if (addedIds.size === 0 && replacedIds.size === 0) {
+      return { revision: snapshot.revision, addedCount: 0, replacedCount: 0, unchangedCount: templates.length };
+    }
+    const draft = klona(snapshot.dataset);
+    for (const item of preview) {
+      if (addedIds.has(item.template.id)) {
+        draft.conditions.push(klona(item.template));
+        continue;
+      }
+      if (!replacedIds.has(item.template.id)) continue;
+      const index = draft.conditions.findIndex((condition) => condition.id === item.template.id);
+      if (index < 0) throw new Error("MVU_DEFAULT_CONDITION_DECISION_INVALID");
+      draft.conditions[index] = {
+        ...klona(item.template),
+        createdAt: draft.conditions[index].createdAt,
+        updatedAt: timestamp,
+      };
+    }
+    assertMvuDatasetV3(draft);
+    const committed = await this.source.transactV3(request.expectedRevision, draft, []);
+    return {
+      revision: committed.revision,
+      addedCount: addedIds.size,
+      replacedCount: replacedIds.size,
+      unchangedCount: templates.length - addedIds.size - replacedIds.size,
+    };
   }
 
   createCondition(request: RevisionedRequest & { condition: ConditionInput }): Promise<MutationResponse<ConditionDefinition>> {
@@ -1538,6 +1622,13 @@ function summarizeModelBudget(stats: ModelFieldBudgetStats): ModelFieldBudgetSta
   ]) {
     if (!Number.isSafeInteger(value) || value < 0) throw new Error("MVU_MODEL_BUDGET_INVALID");
   }
+  if (stats.used > stats.limit || stats.referencedIncluded > stats.referencedTotal ||
+    typeof stats.overflow !== "boolean" || !Array.isArray(stats.diagnostics) ||
+    stats.diagnostics.length > SNAPSHOT_MODEL_DIAGNOSTIC_LIMIT ||
+    stats.diagnostics.some((diagnostic) => typeof diagnostic !== "string" ||
+      Array.from(diagnostic).length > SNAPSHOT_MODEL_DIAGNOSTIC_MAX_CODE_POINTS)) {
+    throw new Error("MVU_MODEL_BUDGET_INVALID");
+  }
   return {
     used: stats.used,
     total: stats.total,
@@ -1545,12 +1636,64 @@ function summarizeModelBudget(stats: ModelFieldBudgetStats): ModelFieldBudgetSta
     referencedIncluded: stats.referencedIncluded,
     referencedTotal: stats.referencedTotal,
     overflow: stats.overflow,
-    diagnostics: stats.diagnostics.slice(0, SNAPSHOT_MODEL_DIAGNOSTIC_LIMIT)
-      .map((diagnostic) => boundedText(
-        diagnostic,
-        SNAPSHOT_MODEL_DIAGNOSTIC_MAX_CODE_POINTS,
-      ).value),
+    diagnostics: [...stats.diagnostics],
   };
+}
+
+const DEFAULT_CONDITION_IDS = new Set([
+  "condition_auto_positive",
+  "condition_auto_inactive",
+  "condition_auto_care",
+  "condition_auto_special",
+  "condition_auto_high_frequency",
+]);
+
+function buildDefaultConditionPreview(
+  dataset: MvuDatasetV3,
+  revision: number,
+  now: number,
+): DefaultConditionRestorePreview {
+  const classified = classifyDefaultConditions(dataset, buildDefaultConditionLibrary(now));
+  return {
+    expectedRevision: revision,
+    totalCount: classified.length,
+    defaultSelectedMissingIds: classified.filter((item) => item.status === "missing")
+      .map((item) => item.template.id),
+    items: classified.map((item) => ({
+      id: item.template.id,
+      name: item.template.name,
+      description: item.template.description,
+      status: item.status,
+      currentName: item.current?.name ?? null,
+    })),
+  };
+}
+
+function classifyDefaultConditions(dataset: MvuDatasetV3, templates: ConditionDefinition[]): Array<{
+  template: ConditionDefinition;
+  current: ConditionDefinition | null;
+  status: DefaultConditionStatus;
+}> {
+  return templates.map((template) => {
+    const current = dataset.conditions.find((condition) => condition.id === template.id) ?? null;
+    const status: DefaultConditionStatus = current === null
+      ? "missing"
+      : sameDefaultCondition(current, template) ? "existing" : "conflict";
+    return { template, current, status };
+  });
+}
+
+function sameDefaultCondition(current: ConditionDefinition, template: ConditionDefinition): boolean {
+  return current.name === template.name && current.description === template.description &&
+    current.enabled === template.enabled &&
+    JSON.stringify(current.expression) === JSON.stringify(template.expression);
+}
+
+function requireDefaultConditionIdSelection(ids: readonly string[]): void {
+  if (!Array.isArray(ids) || ids.length > DEFAULT_CONDITION_IDS.size ||
+    new Set(ids).size !== ids.length || ids.some((id) => !DEFAULT_CONDITION_IDS.has(id))) {
+    throw new Error("MVU_DEFAULT_CONDITION_DECISION_INVALID");
+  }
 }
 
 function summarizeMigrationStatus(status: MigrationStatus): SnapshotMigrationStatus {

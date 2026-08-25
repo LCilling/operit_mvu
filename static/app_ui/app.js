@@ -17,6 +17,7 @@
   ui.patchManagementList = patchManagementList;
   ui.switchStatusMode = switchStatusMode;
   ui.importDatasetText = importDataset;
+  ui.previewDatasetImportText = previewDatasetImportText;
   ui.exportDataset = exportDataset;
   ui.importFieldTemplateText = importFieldTemplateText;
   ui.validateFieldRangeDraft = validateFieldRangeDraft;
@@ -311,7 +312,8 @@
     if (!actionButton) return;
     if (target.closest("[data-stop-close]") &&
         (actionButton.classList.contains("drawer-layer") || actionButton.classList.contains("picker-layer") ||
-          actionButton.classList.contains("field-template-layer") || actionButton.classList.contains("management-delete-layer"))) return;
+          actionButton.classList.contains("field-template-layer") || actionButton.classList.contains("management-delete-layer") ||
+          actionButton.classList.contains("advanced-dialog-layer"))) return;
     await handleAction(actionButton.dataset.action, actionButton);
   }
 
@@ -335,9 +337,23 @@
       applyBackground();
       showToast("已恢复默认背景");
     } else if (action === "choose-dataset-import") {
+      ui.state.advancedImportOpener = element;
+      datasetImportPicker.value = "";
       datasetImportPicker.click();
     } else if (action === "export-dataset") {
       await exportDataset();
+    } else if (action === "retry-export-dataset") {
+      await exportDataset();
+    } else if (action === "close-advanced-dialog") {
+      closeAdvancedDialog();
+    } else if (action === "repreview-dataset-import") {
+      await repreviewDatasetImport();
+    } else if (action === "commit-dataset-import") {
+      await commitDatasetImport();
+    } else if (action === "preview-default-conditions") {
+      await previewDefaultConditions(element);
+    } else if (action === "commit-default-conditions") {
+      await commitDefaultConditions();
     } else if (action === "save-field-range") {
       await saveFieldRange(element);
     } else if (action === "new-field") {
@@ -1958,6 +1974,18 @@
   }
 
   function handleAppKeydown(event) {
+    if (ui.state.advancedDialog) {
+      const advancedDialog = appRoot.querySelector(".advanced-dialog");
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeAdvancedDialog();
+        return;
+      }
+      if (event.key === "Tab" && advancedDialog) {
+        trapFocus(advancedDialog, event);
+        return;
+      }
+    }
     if (ui.state.entityPicker) {
       const picker = appRoot.querySelector(".entity-picker");
       if (event.key === "Escape") {
@@ -2115,6 +2143,23 @@
   function handleAppChange(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.hasAttribute("data-confirm-dataset-replacement") && ui.state.advancedDialog?.kind === "dataset-import") {
+      ui.state.advancedDialog.confirmed = target.checked;
+      ui.state.advancedDialog.error = "";
+      render();
+      return;
+    }
+    if (target.hasAttribute("data-default-condition-choice") && ui.state.advancedDialog?.kind === "default-conditions") {
+      const dialog = ui.state.advancedDialog;
+      const collection = target.dataset.defaultConditionChoice === "conflict" ? "replaceConflictIds" : "selectedMissingIds";
+      const id = target.dataset.defaultConditionChoiceId;
+      dialog[collection] = target.checked
+        ? Array.from(new Set(dialog[collection].concat(id)))
+        : dialog[collection].filter(function (candidate) { return candidate !== id; });
+      dialog.error = "";
+      render();
+      return;
+    }
     if (target.closest('[data-form="rule-editor"]')) {
       captureRuleEditorControl(target);
       if (target.name === "ruleActorKind" || target.hasAttribute("data-rule-target-kind")) render();
@@ -3146,16 +3191,22 @@
   }
 
   async function exportDataset() {
-    setBusy(true);
+    const state = ui.state.advancedExport;
+    if (state.busy) return;
+    state.busy = true;
+    state.error = "";
+    render();
     try {
-      const result = await ui.native.call("exportDataset", {});
-      if (!result || typeof result.fileName !== "string" || typeof result.savedPath !== "string") {
-        throw new Error("MVU_EXPORT_RESPONSE_INVALID");
-      }
+      const result = ui.validateExportDatasetResponse(await ui.native.call("exportDataset", {}));
+      state.result = result;
       showToast("已导出到 " + result.savedPath);
       return result;
+    } catch (error) {
+      state.error = "导出失败：" + errorMessage(error);
+      return null;
     } finally {
-      setBusy(false);
+      state.busy = false;
+      render();
     }
   }
 
@@ -3202,9 +3253,22 @@
 
   datasetImportPicker.addEventListener("change", function () {
     const file = datasetImportPicker.files && datasetImportPicker.files[0];
+    const opener = ui.state.advancedImportOpener;
+    ui.state.advancedImportOpener = null;
+    datasetImportPicker.value = "";
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = function () { void importDataset(String(reader.result || "")); };
+    reader.onload = function () { void previewDatasetImportText(String(reader.result || ""), file.name, opener); };
+    reader.onerror = function () {
+      ui.state.advancedDialog = createDatasetImportDialog({
+        fileName: file.name,
+        json: "",
+        error: "无法读取文件“" + file.name + "”。请检查文件权限后重新选择。",
+        opener,
+      });
+      render();
+      focusAdvancedDialog();
+    };
     reader.readAsText(file);
   });
 
@@ -3234,19 +3298,192 @@
     });
   }
 
-  async function importDataset(source) {
-    setBusy(true);
+  function importDataset(source) {
+    return previewDatasetImportText(source, "导入的数据集.json", null);
+  }
+
+  async function previewDatasetImportText(source, fileName, opener) {
+    const existing = ui.state.advancedDialog?.kind === "dataset-import" ? ui.state.advancedDialog : null;
+    const dialog = existing || createDatasetImportDialog({ fileName, json: source, opener });
+    dialog.fileName = fileName || dialog.fileName;
+    dialog.json = source;
+    dialog.loading = true;
+    dialog.busy = false;
+    dialog.error = "";
+    dialog.stale = false;
+    dialog.confirmed = false;
+    dialog.result = null;
+    if (!existing) dialog.preview = null;
+    ui.state.advancedDialog = dialog;
+    render();
+    focusAdvancedDialog();
     try {
-      JSON.parse(source);
-      await ui.native.call("importDataset", { json: source });
-      await ui.loadSnapshot();
-      render();
-      showToast("数据已导入");
+      dialog.preview = ui.validateDatasetImportPreview(await ui.native.call("previewDatasetImport", { json: source }));
     } catch (error) {
-      showToast("导入失败，请检查备份文件");
+      dialog.error = datasetImportErrorMessage(error);
     } finally {
-      setBusy(false);
+      if (ui.state.advancedDialog === dialog) {
+        dialog.loading = false;
+        render();
+        focusAdvancedDialog();
+      }
     }
+    return dialog.preview;
+  }
+
+  function createDatasetImportDialog(options) {
+    return {
+      kind: "dataset-import",
+      fileName: options.fileName || "备份文件.json",
+      json: options.json || "",
+      loading: false,
+      busy: false,
+      preview: null,
+      result: null,
+      confirmed: false,
+      stale: false,
+      error: options.error || "",
+      restoreFocusDescriptor: { action: "choose-dataset-import" },
+      restoreFocus: options.opener || null,
+    };
+  }
+
+  function repreviewDatasetImport() {
+    const dialog = ui.state.advancedDialog;
+    if (!dialog || dialog.kind !== "dataset-import" || dialog.busy || !dialog.json) return Promise.resolve();
+    return previewDatasetImportText(dialog.json, dialog.fileName, dialog.restoreFocus);
+  }
+
+  async function commitDatasetImport() {
+    const dialog = ui.state.advancedDialog;
+    if (!dialog || dialog.kind !== "dataset-import" || !dialog.preview || !dialog.confirmed || dialog.busy || dialog.stale || dialog.result) return;
+    dialog.busy = true;
+    dialog.error = "";
+    render();
+    try {
+      const result = ui.validateDatasetImportResult(await ui.native.call("importDataset", {
+        json: dialog.json,
+        expectedRevision: dialog.preview.expectedRevision,
+        confirmation: dialog.preview.confirmationValue,
+      }));
+      dialog.result = result;
+      dialog.confirmed = false;
+      try {
+        await ui.loadSnapshot();
+      } catch (refreshError) {
+        dialog.error = "数据已经恢复到 r" + result.revision + "，但页面刷新失败：" + errorMessage(refreshError) + "。请关闭后重新加载。";
+      }
+      showToast("完整数据已恢复");
+    } catch (error) {
+      const message = errorMessage(error);
+      dialog.stale = /STALE_REVISION|stale revision|revision mismatch/i.test(message);
+      dialog.confirmed = false;
+      dialog.error = dialog.stale
+        ? "预览后本地数据已变化。文件和原预览已保留，请点击“重新预览”；系统不会自动再次导入。"
+        : "导入失败：" + message + "。请修正后重试。";
+    } finally {
+      if (ui.state.advancedDialog === dialog) {
+        dialog.busy = false;
+        render();
+        focusAdvancedDialog();
+      }
+    }
+  }
+
+  async function previewDefaultConditions(opener) {
+    const existing = ui.state.advancedDialog?.kind === "default-conditions" ? ui.state.advancedDialog : null;
+    const dialog = existing || {
+      kind: "default-conditions", loading: true, busy: false, preview: null, result: null, error: "",
+      selectedMissingIds: [], replaceConflictIds: [], restoreFocus: opener || null,
+      restoreFocusDescriptor: { action: "preview-default-conditions" },
+    };
+    dialog.loading = true;
+    dialog.busy = false;
+    dialog.error = "";
+    dialog.result = null;
+    ui.state.advancedDialog = dialog;
+    render();
+    focusAdvancedDialog();
+    try {
+      const preview = ui.validateDefaultConditionPreview(await ui.native.call("previewDefaultConditions", {}));
+      dialog.preview = preview;
+      dialog.selectedMissingIds = preview.defaultSelectedMissingIds.slice();
+      dialog.replaceConflictIds = [];
+    } catch (error) {
+      dialog.error = "预览失败：" + errorMessage(error) + "。";
+    } finally {
+      if (ui.state.advancedDialog === dialog) {
+        dialog.loading = false;
+        render();
+        focusAdvancedDialog();
+      }
+    }
+  }
+
+  async function commitDefaultConditions() {
+    const dialog = ui.state.advancedDialog;
+    if (!dialog || dialog.kind !== "default-conditions" || !dialog.preview || dialog.busy || dialog.result ||
+        dialog.selectedMissingIds.length + dialog.replaceConflictIds.length === 0) return;
+    dialog.busy = true;
+    dialog.error = "";
+    render();
+    try {
+      const result = ui.validateDefaultConditionResult(await ui.native.call("restoreDefaultConditions", {
+        expectedRevision: dialog.preview.expectedRevision,
+        selectedMissingIds: dialog.selectedMissingIds.slice(),
+        replaceConflictIds: dialog.replaceConflictIds.slice(),
+      }));
+      dialog.result = result;
+      try {
+        await ui.loadSnapshot();
+      } catch (refreshError) {
+        dialog.error = "条件已经恢复到 r" + result.revision + "，但页面刷新失败：" + errorMessage(refreshError) + "。请关闭后重新加载。";
+      }
+      showToast("默认条件已更新");
+    } catch (error) {
+      const message = errorMessage(error);
+      dialog.error = /STALE_REVISION|stale revision|revision mismatch/i.test(message)
+        ? "预览后本地数据已变化，请重新预览默认条件后再提交。"
+        : "恢复失败：" + message + "。";
+    } finally {
+      if (ui.state.advancedDialog === dialog) {
+        dialog.busy = false;
+        render();
+        focusAdvancedDialog();
+      }
+    }
+  }
+
+  function closeAdvancedDialog() {
+    const dialog = ui.state.advancedDialog;
+    if (!dialog || dialog.busy) return;
+    ui.state.advancedDialog = null;
+    render();
+    Promise.resolve().then(function () {
+      const target = appRoot.querySelector('[data-action="' + dialog.restoreFocusDescriptor.action + '"]');
+      if (target) target.focus();
+    });
+  }
+
+  function focusAdvancedDialog() {
+    Promise.resolve().then(function () {
+      const dialog = appRoot.querySelector(".advanced-dialog");
+      if (!dialog) return;
+      const first = dialog.querySelector("button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])");
+      if (first) first.focus();
+    });
+  }
+
+  function datasetImportErrorMessage(error) {
+    const message = errorMessage(error);
+    if (/MAX_BYTES|SIZE_LIMIT|too large|oversize/i.test(message)) return "备份文件过大，超过完整备份导入的大小上限。";
+    if (/UNKNOWN_VERSION|FORMAT_VERSION|SCHEMA_VERSION|unsupported/i.test(message)) return "备份版本未知或暂不支持，请选择 v2 数据或完整 v3 备份。";
+    if (/JSON|PARSE|SYNTAX/i.test(message)) return "文件不是有效的 MVU JSON 备份。";
+    return "备份校验失败：" + message + "。";
+  }
+
+  function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error || "未知错误");
   }
 
   function applyBackground() {
