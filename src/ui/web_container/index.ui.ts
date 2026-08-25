@@ -159,6 +159,8 @@ async function dispatch(method: string, params: JsonParams): Promise<unknown> {
       return mvuIpcClient.judgeState(MVU_REQUEST_PARSERS.judgeState(params));
     case "exportDataset":
       return mvuIpcClient.exportDataset(MVU_REQUEST_PARSERS.exportDataset(params));
+    case "previewDatasetImport":
+      return mvuIpcClient.previewDatasetImport(MVU_REQUEST_PARSERS.previewDatasetImport(params));
     case "importDataset":
       return mvuIpcClient.importDataset(MVU_REQUEST_PARSERS.importDataset(params));
     case "exportFieldTemplate":

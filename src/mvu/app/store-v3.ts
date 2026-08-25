@@ -1,4 +1,14 @@
 import { klona } from "../port/util";
+import {
+  FULL_BACKUP_MAX_RECORDS,
+  FULL_BACKUP_REPLACEMENT_CONFIRMATION,
+  createDatasetImportPreview,
+  parseDatasetImport,
+  type DatasetImportPreview,
+  type DatasetImportRestoreRequest,
+  type DatasetImportRestoreResult,
+  type FullBackupSourceSnapshot,
+} from "./full-backup";
 import { migrateDatasetV2ToV3 } from "./migration-v3";
 import { hydrateLegacyActiveEffectSnapshots } from "./effect-engine";
 import type {
@@ -205,17 +215,76 @@ export class V3MvuStore implements MvuStore {
   }
 
   /**
-   * Explicit, potentially expensive export read. Ordinary compatibility reads
-   * remain capped; export walks committed manifest pages while holding the
-   * dataset queue so a replacement cleanup cannot remove a segment mid-read.
+   * Explicit complete read for full-dataset backup. The path queue is held from
+   * config read through the final committed record page, so config and history
+   * always describe one revision. This path deliberately has no compatibility
+   * record cap.
    */
-  async readForExport(): Promise<MvuStoreSnapshot> {
+  async readFullBackup(): Promise<FullBackupSourceSnapshot> {
     const status = await this.initialize();
-    if (status.mode === "v2_compat") return this.legacyStore.read();
+    if (status.mode !== "v3") throw new V3UnavailableError(status);
     return this.enqueuePath(async () => {
       const current = await this.loadV3Config();
+      await this.recoverIfRequired(current);
+      if (current.dataset.recordManifest.recordCount > FULL_BACKUP_MAX_RECORDS) {
+        throw new Error("MVU_FULL_BACKUP_RECORD_LIMIT");
+      }
       const committedRecords = await this.readAllCommittedRecords(current.dataset);
-      return compatibilitySnapshot(current.dataset, committedRecords);
+      return {
+        revision: current.revision,
+        dataset: klona(current.dataset),
+        records: klona(committedRecords),
+      };
+    });
+  }
+
+  async previewDatasetImport(json: string): Promise<DatasetImportPreview> {
+    const status = await this.initialize();
+    if (status.mode !== "v3") throw new V3UnavailableError(status);
+    return this.enqueuePath(async () => {
+      const current = await this.loadV3Config();
+      return createDatasetImportPreview(json, current.revision, this.now());
+    });
+  }
+
+  /** Reparse, validate, stage, and publish one exact replacement under the path queue. */
+  async restoreDatasetImport(request: DatasetImportRestoreRequest): Promise<DatasetImportRestoreResult> {
+    if (request.confirmation !== FULL_BACKUP_REPLACEMENT_CONFIRMATION) {
+      throw new Error("MVU_FULL_BACKUP_CONFIRMATION_INVALID");
+    }
+    const status = await this.initialize();
+    if (status.mode !== "v3") throw new V3UnavailableError(status);
+    return this.enqueuePath(async () => {
+      // The restore endpoint never trusts a prior preview object. The exact JSON
+      // supplied for this call is parsed and checksummed again while serialized.
+      const parsed = parseDatasetImport(request.json, this.now());
+      const current = await this.loadV3Config();
+      if (request.expectedRevision !== current.revision) {
+        throw new StaleRevisionError(request.expectedRevision, current.revision);
+      }
+      await this.recoverIfRequired(current);
+      const next: MvuDatasetV3 = {
+        ...klona(parsed.config),
+        revision: current.revision,
+        recordManifest: klona(current.dataset.recordManifest),
+      };
+      assertMvuDatasetV3(next);
+      const committed = await this.commitLoaded(current, request.expectedRevision, next, {
+        kind: "replace",
+        records: parsed.records,
+      });
+      return {
+        revision: committed.revision,
+        kind: parsed.kind,
+        sourceFormatVersion: parsed.sourceFormatVersion,
+        sourceRevision: parsed.sourceRevision,
+        recordCount: parsed.records.length,
+        migrationWarnings: {
+          items: [...parsed.warnings],
+          totalCount: parsed.warningCount,
+          truncated: parsed.warningCount > parsed.warnings.length,
+        },
+      };
     });
   }
 
