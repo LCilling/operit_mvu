@@ -285,3 +285,154 @@ The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICA
 - The pre-Task-6 v2 compatibility snapshot intentionally exposes only the newest 500 records. Full history remains available through v3 paged `queryRecords`; Task 6 should keep UI history on that API.
 - Atomic durability still depends on the host's documented same-directory `replaceAtomically` implementation. The adapter fails closed and the fake tests observable contract/failure behavior, not device-filesystem internals.
 - No subagent/code-review dispatch tool was available in this session. A direct diff and acceptance audit was performed; this is a process limitation, not an unreported independent review.
+
+## Review round 2 fix — 2026-08-25
+
+### Starting WIP and host-boundary findings
+
+- Round-2 starting `HEAD`: `9424d63d42d1eb352eaaad151842f99a05e1cef2`; the requested branch/worktree were clean and unchanged.
+- The complete round-2 review was read. All five findings were reproduced or verified against the implementation. Existing commits and ignored SDD artifacts were preserved; `progress.md` was not edited.
+- OperitAI has no package-visible file lock or conditional-write primitive. Its documented boundary instead gives ordinary ToolPkg hooks one persistent engine at `toolpkg_main:<container>` (`PackageManagerToolPkgFacade.resolveToolPkgExecutionContextKey` plus `ToolPkgManager.getToolPkgExecutionEngine`), and MVU UI IPC already targets `main` with `toolpkg_main:com.lcilling.operit_mvu`.
+- OperitAI durable invalidation events are exactly `chat_deleted` and `chat_history_reset`; they execute in fresh `toolpkg_invalidation:<package>:<uuid>` engines. MVU's production hook was verified to return for both names before `ensureRuntime`, `ToolPkg.getConfigDir`, or store access.
+- OperitAI owner isolation prevents another package from resolving the MVU package's private config root. The manifest now makes this production dependency explicit instead of claiming an impossible cross-process CAS property from unconditional atomic replacement.
+- The existing exact IPC target and invalidation early-return behavior were already correct. Their newly added tests passed in the first RED run, so no artificial RED or unnecessary production change was made for those two subcontracts. The external-writer reproduction also passed before the fix and deliberately demonstrates the documented out-of-scope boundary.
+
+### Honest round-2 RED evidence
+
+Initial host-contract regressions against `9424d63`:
+
+```text
+Command: node --test tests/host-boundary.test.mjs
+Result: exit 1; tests 4; pass 2; fail 2
+Failures:
+- root manifest requires the complete Operit ToolPkg API-v3 host contract
+  actual `host_requirements`: undefined
+- the package audit enforces the manifest host contract
+  actual audit command: `node scripts/audit-web-ui.mjs`
+Already GREEN: exact UI main target; both fresh durable invalidations return before ToolPkg access.
+```
+
+Initial persistence regressions against `9424d63`:
+
+```text
+Command: node --test tests/record-store.test.mjs
+Result: exit 1; tests 23; pass 13; fail 10
+Failures:
+- segment staging: `0 !== 2` transaction staging writes
+- orphan bound: `Missing expected rejection`
+- replacement allocation bound: `Missing expected rejection`
+- MAX_SAFE_INTEGER pre-delete: orphan bytes were already deleted
+- rule action addition: `1 !== 2`
+- rule reorder: `INVALID_MVU_V3_RULE_EFFECT_REFERENCE`
+- representable removal: `MVU_V3_COMPAT_RULE_ACTION_MISSING:auto_positive:1`
+- ambiguous removal returned the old ACTION_MISSING error instead of fail-closed ambiguity
+- expired non-first instance survived
+- added effect target had no matching field-effect definition
+Already GREEN: external writers are outside the generic store CAS boundary.
+```
+
+The first GREEN integration exposed one stale test barrier, not a production regression: the cross-instance test still paused direct append even though new segments now publish from unique staging via atomic replacement. Moving that barrier to the actual segment atomic-publication boundary restored the deterministic interleaving proof.
+
+A final side-effect-order review found one additional real RED:
+
+```text
+Command: node --test --test-name-pattern="orphan recovery has a hard probe bound" tests/record-store.test.mjs
+Result: exit 1; tests 1; pass 0; fail 1
+Failure: `true !== false` — recovery deleted part of an oversized orphan run before rejecting its bound.
+```
+
+Recovery now collects and bounds the complete contiguous run, including safe successor checks, before performing any deletion.
+
+### Round-2 invariants and fixes
+
+- Root `manifest.json` declares API `operit-toolpkg-host`, version `3`, and exactly seven unique lexically sorted capabilities: actor identity, immutable chat history, durable chat invalidation, atomic file replace, IPC owner isolation, structured system model, and bounded async runtime.
+- `scripts/audit-manifest.mjs` validates the exact host contract and package/manifest version equality. The normal `audit`, `build`, `check`, and `pack` paths now transitively enforce it.
+- `V3MvuStore` documents its actual guarantee: crash-safe atomic publication and path-serialized CAS across store instances in one persistent ToolPkg main JavaScript runtime. It explicitly excludes external writers and cross-process safety.
+- Every new record segment is written to a transaction-owned unique `.stage.<operation>.<ordinal>` path and atomically published before config publication. Failed in-process staging cleans only its own path; stale crash leftovers cannot collide with later transactions.
+- Replacement collision probing and startup/recovery orphan probing are hard-bounded at 1,024 candidates. Oversized runs and unsafe successor indexes fail before deletion; the MAX_SAFE_INTEGER orphan is never removed.
+- Broad recursive record-directory deletion was removed. Normal writes still never clean or overwrite a colliding uncommitted segment; destructive orphan cleanup occurs only during exclusive startup/recovery.
+- Legacy rule actions are reconciled by visible action identity, not array slot. Exact reorders retain targets and hidden effect references; true additions use migrated trigger-actor defaults; unambiguous representable removals succeed; edits that cannot safely identify hidden semantics reject with `MVU_V3_COMPAT_RULE_ACTIONS_AMBIGUOUS`.
+- Effect expiry projects the earliest instance deadline and settles every instance against its own absolute deadline. Reusable definitions remain enabled, surviving instances retain IDs, trigger actors, targets, durations, activation timestamps, and distinct reason snapshots, and mixed reasons project neutrally rather than borrowing `instances[0]`.
+- A newly represented target field receives the matching migrated field-effect definition and honest all-source legacy semantics. Existing actor selectors and source filters remain untouched; multi-instance target/lifetime/reason edits still fail closed when v2 cannot identify an instance.
+
+### Files in the round-2 code/test commit
+
+- `manifest.json`
+- `package.json`
+- `scripts/audit-manifest.mjs`
+- `src/mvu/app/record-store.ts`
+- `src/mvu/app/store-v3.ts`
+- `tests/host-boundary.test.mjs`
+- `tests/record-store-hardening.test.mjs`
+- `tests/record-store.test.mjs`
+
+Focused implementation commit:
+
+```text
+8eb12301643fc03b56cf7d67adebfcd44418df4c fix: close v3 persistence review gaps
+8 files changed, 759 insertions(+), 45 deletions(-)
+```
+
+### Exact round-2 GREEN verification
+
+```text
+Command: node --test tests/host-boundary.test.mjs
+Result: exit 0; tests 4; pass 4; fail 0; skipped 0; todo 0
+```
+
+```text
+Command: pnpm run typecheck; node --test tests/record-store-hardening.test.mjs tests/record-store.test.mjs
+Result: exit 0; tests 36; pass 36; fail 0; skipped 0; todo 0
+```
+
+```text
+Command: node --test --test-name-pattern="legacy effect writes|expiry settles|expired non-first|adding a legacy effect target" tests/record-store-hardening.test.mjs tests/record-store.test.mjs
+Result: exit 0; tests 4; pass 4; fail 0; skipped 0; todo 0
+```
+
+Final verification on committed code:
+
+```text
+Command: pnpm run check
+Result: exit 0
+- Manifest audit: PASS (`operit-toolpkg-host`, API 3, 7 capabilities)
+- UI audit: PASS (15 screens, 42 declared actions, 48 handled actions, 20 native methods)
+- TypeScript: PASS
+- Temporary-effect audit: PASS
+- Node tests: 85 total, 85 pass, 0 fail, 0 skipped, 0 todo
+```
+
+```text
+Command: pnpm run pack
+Result: exit 0
+- Manifest/UI/type/effect audits: PASS
+- Web build: `dist/app.html` 9,323,226 bytes
+- Package: `release/operit_mvu-2.0.1.toolpkg`, 54 entries, 9,933,792 bytes data
+```
+
+```text
+Command: git diff --check
+Result: exit 0; no output
+```
+
+The expected `MVU persisted message processing failed Error: FAKE_REPLACEATOMICALLY_FAILED` diagnostic remains part of the asserted production failure-order test; it does not represent a suite failure.
+
+### Round-2 acceptance matrix
+
+- [x] **API-v3 manifest requirements.** Root manifest, executable audit, package scripts, and tests require `files.atomic_replace` plus every currently used host capability; entries are exact, unique, and sorted.
+- [x] **Actual single-writer host boundary.** OperitAI source evidence proves one persistent ordinary main engine per package context; all 20 UI IPC methods target its exact key; both fresh durable invalidation names return before runtime/store access; owner-isolation and durable-invalidation capabilities are required. No external-writer or cross-process CAS claim remains.
+- [x] **Bounded, owned recovery staging.** Segment/config staging identifiers are transaction-owned and unique in the runtime; allocation and orphan probes are bounded; all bound/safe-integer checks complete before orphan deletion; broad directory cleanup is gone.
+- [x] **Legacy rule add/remove/reorder.** Additions, unambiguous removals, exact reorders, hidden target/reference preservation, rule selector preservation, and ambiguous fail-closed behavior have deterministic regressions. Existing shared-condition isolation remains green.
+- [x] **Independent active-effect settlement.** A non-first expired instance is removed independently while a future instance, its reason/actor/duration/targets, reusable definition, actor selectors, and source filters remain exact. Newly added target fields gain matching definitions; ambiguous multi-instance edits fail closed.
+- [x] **Safe side-effect ordering.** Revision/count/index validation remains safe-integer strict. MAX_SAFE_INTEGER and oversized orphan runs reject before any affected deletion; collision scanning completes before staging writes.
+- [x] **Reviewer reproduction coverage.** Tests cover the external-writer scope boundary, true action addition, expired non-first instance, added effect target, bounded always-present segment probes, and MAX_SAFE_INTEGER pre-delete behavior.
+- [x] **Required verification.** Focused RED/GREEN commands, `pnpm run check`, manifest/package audits, packaging, and `git diff --check` are all recorded above and green.
+- [x] **Original Task 5 acceptance remains intact.** The 500-line committed-count store, orphan-tail repair, checked atomic config/records ordering, raw whole-segment JSONL reads, safe v2→v3 fallback/retry, real production hook transaction/composition, bounded 100k compatibility read, pre-Task-6 adapter, hourly retention, role-aware AI/caps/validation, and byte-identical v2 preservation all remain covered in the 85-test suite.
+
+### Residual limitations after round 2
+
+- External OS/process writers are outside the proven contract. Correctness relies on OperitAI's one persistent package-main engine plus owner-isolated private storage; the external-writer reproduction intentionally shows that unconditional atomic replacement alone cannot provide interprocess CAS.
+- The host file API exposes no directory listing. A process crash after writing a unique `.stage` file but before atomic publication can leave an invisible staging file; uniqueness prevents collision or accidental commitment, but storage reclamation requires a future bounded listing/GC capability.
+- Recovery fails closed when a contiguous orphan/allocation run reaches the 1,024-path bound. It performs no orphan deletion in that case and may require host/operator cleanup rather than risking unbounded or partial destructive work.
+- The v2 compatibility projection cannot faithfully represent several distinct active-instance reasons or identify arbitrary multi-instance lifetime/target edits. It preserves the v3 instances and uses a neutral projection or explicit ambiguity error instead of silently collapsing data.
+- No subagent dispatcher was available for the requested independent code-review skill. A direct full-diff/acceptance audit found and fixed the partial-deletion ordering issue above; the lack of an independent reviewer remains a process limitation.
