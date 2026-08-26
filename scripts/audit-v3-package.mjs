@@ -63,6 +63,12 @@ assert.equal(entries.filter((entry) => entry === "app.html").length, 1,
 assert.equal(entries.includes("dist/app.html"), false, "dist/app.html must not duplicate root app.html");
 assert.ok(entries.includes("manifest.json"), "release archive is missing manifest.json");
 assert.ok(entries.includes("dist/main.js"), "release archive is missing dist/main.js");
+const allowedReleaseEntry = (entry) =>
+  ["manifest.json", "README.md", "LICENSE", "app.html", "docs/THIRD_PARTY_NOTICES.md"].includes(entry) ||
+  entry.startsWith("dist/") ||
+  entry.startsWith("third_party/");
+assert.deepEqual(entries.filter((entry) => !allowedReleaseEntry(entry)), [],
+  "release archive may contain only runtime files, user-facing package metadata, and license notices");
 assert.equal(entries.some((entry) => /(^|\/)(?:tests?|qa|artifacts?|\.superpowers)(\/|$)/i.test(entry)), false,
   "release archive contains tests, QA evidence, artifacts, or internal reports");
 assert.equal(entries.some((entry) => /(?:^|\/)(?:node_modules|\.git)(?:\/|$)/.test(entry)), false,
