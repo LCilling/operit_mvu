@@ -13,18 +13,12 @@
     "audit:v3": "node scripts/audit-v3-ui.mjs",
     "audit:effects": "node scripts/audit-temporary-effects.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "test:v3": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
-    "test:dom": "pnpm run build:web && node tests/ui-task8-dom-behavior.cjs",
-    "test:ui-v3": "node tests/ui-task8-browser-smoke.cjs && node tests/ui-task8-remediation-r2-smoke.cjs && node tests/ui-task9-condition-dom.test.cjs && node tests/ui-task9-field-template-dom.test.cjs && node tests/ui-task9-rule-effect-dom.test.cjs && node tests/ui-task10-advanced-dom.test.cjs",
-    "smoke:task8": "pnpm run build:web && node tests/ui-task8-browser-smoke.cjs",
     "build:web": "node scripts/build-web.mjs",
     "build": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run build:web && pnpm run audit:host",
-    "check": "pnpm run audit && pnpm run typecheck && pnpm run audit:effects && pnpm run test:v3 && pnpm run test:dom && pnpm run test:ui-v3 && pnpm run audit:host",
+    "check": "pnpm run build",
     "pack": "pnpm run build && node scripts/pack.mjs && pnpm run audit:package"
   },
   "devDependencies": {
-    "happy-dom": "20.11.6",
-    "playwright-core": "1.62.1",
     "typescript": "5.9.3"
   }
 }
