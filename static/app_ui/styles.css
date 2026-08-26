@@ -453,8 +453,8 @@ h1, h2, h3 { font-weight: 500; letter-spacing: normal; }
 .stage-marker.edge-end .stage-name, .stage-marker.edge-end .stage-threshold { text-align: end; }
 .stage-marker.active { color: var(--stage-color); font-weight: 650; }
 .stage-marker .stage-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transform: translateY(calc(-1 * var(--stage-lane-offset, 0px))); }
-.stage-marker i { width: 9px; height: 9px; margin-top: 17px; border: 2px solid white; border-radius: 50%; background: var(--stage-color); box-shadow: 0 1px 4px rgba(45,40,80,.18); }
-.stage-marker .stage-threshold { margin-top: 5px; font-variant-numeric: tabular-nums; transform: translateY(var(--stage-lane-offset, 0px)); }
+.stage-marker i { width: 2px; height: 8px; position: absolute; top: 34px; left: 50%; border: 0; border-radius: 0 0 2px 2px; background: var(--stage-color); box-shadow: none; transform: translateX(-50%); }
+.stage-marker .stage-threshold { width: 100%; position: absolute; top: 46px; left: 0; margin-top: 0; font-variant-numeric: tabular-nums; transform: translateY(var(--stage-lane-offset, 0px)); }
 .stage-current { width: 11px; height: 11px; position: absolute; top: 50%; left: var(--stage-position); border: 3px solid white; border-radius: 50%; background: var(--primary); box-shadow: 0 2px 6px rgba(70,55,140,.26); transform: translate(-50%, -50%); }
 .trend-canvas { width: 100%; height: 146px; display: block; }
 .trend-range { display: flex; justify-content: space-between; color: var(--ink-soft); font-size: 11px; }

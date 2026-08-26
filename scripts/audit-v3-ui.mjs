@@ -365,6 +365,10 @@ rejectMatch(styles, /\.field-detail-stack[\s\S]{0,1000}margin-(?:top|bottom):\s*
   "field detail stack may not collapse card seams with negative margins");
 rejectMatch(styles, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/,
   "stage collision handling must not move the shared normalized marker anchor");
+requireMatch(styles, /\.stage-marker i\s*\{(?=[^}]*position:\s*absolute;)(?=[^}]*top:\s*34px;)(?=[^}]*width:\s*2px;)(?=[^}]*height:\s*8px;)(?=[^}]*border:\s*0;)(?=[^}]*box-shadow:\s*none;)[^}]*\}/,
+  "stage thresholds must use short vertical ticks attached below the track");
+rejectMatch(styles, /\.stage-marker i\s*\{[^}]*border-radius:\s*50%/,
+  "stage threshold ticks must not fall back to detached circular dots");
 requireMatch(files["app.js"], /trim\(\)\.length\s*===\s*0[\s\S]*?Number\.NaN/,
   "range validation must reject whitespace before numeric conversion");
 
