@@ -2,7 +2,8 @@
  * MVU ToolPkg 打包脚本（版本取自 manifest.json）。
  *
  * 生成 release/operit_mvu-{version}.toolpkg（标准 ZIP，版本取自 manifest.json）。
- * 条目布局：dist/**（不重复收录 app.html）、根 app.html、manifest.json、README.md、LICENSE、docs/**、third_party/**。
+ * 条目布局：dist/**（不重复收录 app.html）、根 app.html、manifest.json、README.md、LICENSE、
+ * docs/THIRD_PARTY_NOTICES.md、third_party/**。设计、测试、实施计划和宿主开发文档只保留在源码仓库。
  * 所有条目使用正斜杠路径；manifest 保持 UTF-8 无 BOM。
  * 注意：manifest.resources.app_html 指向根目录 app.html；dist/app.html 仅作为打包源，不重复入包。
  *
@@ -55,7 +56,7 @@ function collectEntries() {
   add("dist");
   // 根目录 app.html（资源 resource.path=app.html，与 desire 资源同层布局）
   entries.push({ source: "dist/app.html", name: "app.html" });
-  add("docs");
+  add("docs/THIRD_PARTY_NOTICES.md");
   add("third_party");
   return entries;
 }
