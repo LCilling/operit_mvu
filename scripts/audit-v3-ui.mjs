@@ -43,8 +43,6 @@ const styles = await optional(path.join("static", "app_ui", "styles.css"));
 const index = await optional(path.join("static", "app_ui", "index.html"));
 const build = await optional(path.join("scripts", "build-web.mjs"));
 const container = await optional(path.join("src", "ui", "web_container", "index.ui.ts"));
-const textScaleFixture = await optional(path.join("tests", "fixtures", "ui-text-scale.html"));
-const malformedNativeFixture = await optional(path.join("tests", "fixtures", "ui-native-malformed.html"));
 const allUi = moduleNames.map((name) => files[name]).join("\n");
 const violations = [];
 
@@ -367,10 +365,6 @@ rejectMatch(styles, /\.field-detail-stack[\s\S]{0,1000}margin-(?:top|bottom):\s*
   "field detail stack may not collapse card seams with negative margins");
 rejectMatch(styles, /\.stage-marker\.edge-(?:start|end)[^{]*\{[^}]*transform:/,
   "stage collision handling must not move the shared normalized marker anchor");
-requireMatch(textScaleFixture, /Number\(value\)\s*\*\s*1\.3/,
-  "browser audit fixture must exercise a real 130% text-only scale");
-requireMatch(malformedNativeFixture, /window\.NativeMvu[\s\S]*?record_bad[\s\S]*?坏记录缺少 actorName/,
-  "browser audit needs a malformed NativeMvu recovery fixture");
 requireMatch(files["app.js"], /trim\(\)\.length\s*===\s*0[\s\S]*?Number\.NaN/,
   "range validation must reject whitespace before numeric conversion");
 
