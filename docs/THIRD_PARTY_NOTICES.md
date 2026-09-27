@@ -40,10 +40,9 @@
 - 许可：Apache License 2.0
 - 用途：插件前端的标准操作与状态图标；构建时内联进 `app.html`，真机离线可用。
 
-## MVU 角色视觉资产
+## 默认背景
 
 - `character-state-theme.png`：项目内参考设计的原始银发角色背景。
-- `avatars/*.png`：依据用户提供的角色栏参考图，通过 OpenAI 内置 ImageGen 生成，供本插件界面使用。
 
 ## 许可合规
 

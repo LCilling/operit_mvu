@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,6 +74,23 @@ assert.equal(entries.some((entry) => /(^|\/)(?:tests?|qa|artifacts?|\.superpower
   "release archive contains tests, QA evidence, artifacts, or internal reports");
 assert.equal(entries.some((entry) => /(?:^|\/)(?:node_modules|\.git)(?:\/|$)/.test(entry)), false,
   "release archive contains development dependencies or Git metadata");
+assert.equal(entries.some((entry) => /(?:^|\/)avatars?(?:\/|$)|\.(?:png|jpe?g|webp|gif|avif)$/i.test(entry)), false,
+  "release archive contains reference avatars or standalone images");
+
+const appHtml = readStoredEntry(archive, "app.html").toString("utf8");
+const notices = readStoredEntry(archive, "docs/THIRD_PARTY_NOTICES.md").toString("utf8");
+assert.doesNotMatch(appHtml, /assets\/avatars\/|avatars\/[^\s"']+\.png/i,
+  "release app.html contains a reference avatar path");
+assert.doesNotMatch(notices, /avatars\/|参考头像|头像参考/i,
+  "release license notices contain reference avatar documentation");
+const imageDataUris = [...appHtml.matchAll(/data:image\/([a-z0-9.+-]+);base64,([a-z0-9+/=]+)/gi)];
+assert.equal(imageDataUris.length, 1, "release app.html must inline exactly one image");
+assert.equal(imageDataUris[0][1].toLowerCase(), "png", "the one release image must be PNG");
+const actualImageHash = createHash("sha256").update(Buffer.from(imageDataUris[0][2], "base64")).digest("hex");
+const expectedImageHash = createHash("sha256")
+  .update(await readFile(path.join(root, "static/app_ui/assets/character-state-theme.png")))
+  .digest("hex");
+assert.equal(actualImageHash, expectedImageHash, "the one release image must be the default background");
 
 console.log(JSON.stringify({
   result: "v3 package audit: PASS",
@@ -112,4 +130,26 @@ function readCentralDirectoryEntries(buffer) {
   }
   assert.equal(entries.length, entryCount, "ZIP central directory entry count mismatch");
   return entries;
+}
+
+function readStoredEntry(buffer, wantedName) {
+  const localSignature = 0x04034b50;
+  let offset = 0;
+  while (offset + 30 <= buffer.length && buffer.readUInt32LE(offset) === localSignature) {
+    const method = buffer.readUInt16LE(offset + 8);
+    const size = buffer.readUInt32LE(offset + 18);
+    const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const nameEnd = offset + 30 + nameLength;
+    const dataStart = nameEnd + extraLength;
+    const dataEnd = dataStart + size;
+    assert.ok(dataEnd <= buffer.length, "ZIP local entry is out of bounds");
+    const name = buffer.subarray(offset + 30, nameEnd).toString("utf8");
+    if (name === wantedName) {
+      assert.equal(method, 0, `release entry must be stored: ${wantedName}`);
+      return buffer.subarray(dataStart, dataEnd);
+    }
+    offset = dataEnd;
+  }
+  assert.fail(`release archive is missing ${wantedName}`);
 }

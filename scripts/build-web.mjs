@@ -36,11 +36,6 @@ function dataUri(relativePath, mimeType) {
 function inlineAssetReferences(source) {
   const assets = [
     ["./assets/character-state-theme.png", "assets/character-state-theme.png", "image/png"],
-    ["./assets/avatars/ayane.png", "assets/avatars/ayane.png", "image/png"],
-    ["./assets/avatars/ailin.png", "assets/avatars/ailin.png", "image/png"],
-    ["./assets/avatars/nora.png", "assets/avatars/nora.png", "image/png"],
-    ["./assets/avatars/kalian.png", "assets/avatars/kalian.png", "image/png"],
-    ["./assets/avatars/xiaoye.png", "assets/avatars/xiaoye.png", "image/png"],
     ["./assets/fonts/material-symbols-rounded.woff2", "assets/fonts/material-symbols-rounded.woff2", "font/woff2"],
   ];
   let output = source;
